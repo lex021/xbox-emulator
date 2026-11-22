@@ -63,6 +63,7 @@ pub struct Span {
     pub hi: u64,
     pub kind: Kind,
     pub heap: usize,
+    heap_flags: u32,
     pub retired: bool,
     pub live: HashSet<usize>,
 }
@@ -74,15 +75,23 @@ pub struct Spans {
 
 impl Spans {
     pub fn find(&self, kind: Kind, va: u64, len: u64, align: u64) -> Option<(u64, usize)> {
+        self.find_matching(kind, va, len, align, |_| true)
+    }
+
+    fn find_matching(&self, kind: Kind, va: u64, len: u64, align: u64, matches: impl Fn(&Span) -> bool) -> Option<(u64, usize)> {
         let end = va.checked_add(len.max(1))?;
         for (lo, v) in self.by_lo.range(..=va).rev().take(64) {
             for (i, s) in v.iter().enumerate() {
-                if s.kind == kind && !s.retired && end <= s.hi && (va - lo) % align.max(1) == 0 {
+                if s.kind == kind && !s.retired && end <= s.hi && (va - lo) % align.max(1) == 0 && matches(s) {
                     return Some((*lo, i));
                 }
             }
         }
         None
+    }
+
+    fn find_local(&self, va: u64, len: u64, align: u64, heap_class: u32) -> Option<(u64, usize)> {
+        self.find_matching(Kind::Local, va, len, align, |span| span.heap_flags == 0 || span.heap_flags == heap_class)
     }
 
     pub fn get(&self, key: (u64, usize)) -> &Span {
@@ -379,7 +388,19 @@ unsafe fn open_title_heap(real: *mut c_void, base: u64) -> Option<(*mut c_void, 
     Some((h, size))
 }
 
-unsafe fn create_local_heap(real: *mut c_void, size: u64, msaa: bool) -> Option<*mut c_void> {
+const HEAP_ONLY_BUFFERS: u32 = 0xc0;
+const HEAP_ONLY_RT_DS_TEXTURES: u32 = 0x84;
+const HEAP_ONLY_NON_RT_DS_TEXTURES: u32 = 0x44;
+
+unsafe fn mixed_heap_supported(real: *mut c_void) -> bool {
+    // D3D12_FEATURE_D3D12_OPTIONS: ResourceHeapTier is the last DWORD.
+    let mut options = [0u32; 15];
+    let hr = unsafe { vcall!(real, 13, fn(u32, *mut u32, u32) -> i32,
+        0, options.as_mut_ptr(), core::mem::size_of_val(&options) as u32) };
+    hr >= 0 && options[14] >= 2
+}
+
+unsafe fn create_local_heap(real: *mut c_void, size: u64, msaa: bool, heap_flags: u32) -> Option<*mut c_void> {
     let (size, heap_align) = crate::msaa_place::heap_layout(size, msaa);
     let mut d = [0u8; 0x30];
     d[0..8].copy_from_slice(&size.to_le_bytes());
@@ -387,12 +408,13 @@ unsafe fn create_local_heap(real: *mut c_void, size: u64, msaa: bool) -> Option<
     d[8..12].copy_from_slice(&1u32.to_le_bytes());
     d[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
     d[0x18..0x1c].copy_from_slice(&1u32.to_le_bytes());
+    d[0x28..0x2c].copy_from_slice(&heap_flags.to_le_bytes());
     let mut h: *mut c_void = core::ptr::null_mut();
     let hr = unsafe { vcall!(real, 28, fn(*const u8, *const Guid, *mut *mut c_void) -> i32, d.as_ptr(), &IID_HEAP, &mut h) };
     if hr < 0 || h.is_null() {
         static N: AtomicUsize = AtomicUsize::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 8 {
-            record("d3d12_xs", "alias", &format!("CreateHeap({size:#x}) for a GPU-local placement hr={hr:#010x}; placement falls back to a committed resource"));
+            record("d3d12_xs", "alias", &format!("CreateHeap({size:#x}, flags={heap_flags:#x}) for a GPU-local placement hr={hr:#010x}; placement falls back to a committed resource"));
         }
         return None;
     }
@@ -442,7 +464,7 @@ pub fn tick() {
 unsafe fn migrate_shadow(real: *mut c_void, sp: &mut Spans, va: u64, size: u64) -> bool {
     let Some(k) = sp.find(Kind::Shadow, va, size, 1) else { return false };
     let (lo, hi, shadow) = { let s = sp.get(k); (s.lo, s.hi, s.heap) };
-    let Some(h) = (unsafe { create_local_heap(real, hi - lo, false) }) else { return false };
+    let Some(h) = (unsafe { create_local_heap(real, hi - lo, false, 0) }) else { return false };
     if !unsafe { crate::title_shadow::migrate(real, shadow, h as usize) } {
         crate::msaa_place::forget_heap(h as usize);
         unsafe { vcall!(h, 2, fn() -> u32) };
@@ -483,7 +505,7 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
                 Some(k) if sp.get(k).lo == base => Some((k, false)),
                 _ => unsafe { open_title_heap(real, base) }.filter(|(_, size)| base + size >= va + width).map(|(h, size)| {
                     STATS.heaps.fetch_add(1, Ordering::Relaxed);
-                    (sp.insert(Span { lo: base, hi: base + size, kind: Kind::Title, heap: h as usize, retired: false, live: HashSet::new() }), true)
+                    (sp.insert(Span { lo: base, hi: base + size, kind: Kind::Title, heap: h as usize, heap_flags: HEAP_ONLY_BUFFERS, retired: false, live: HashSet::new() }), true)
                 }),
             };
             if let Some((k, fresh)) = key {
@@ -496,7 +518,7 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
     }
     if chosen.is_none() && dim == 1 && va % PLACEMENT_ALIGN == 0 && crate::title_shadow::enabled() {
         let width = u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap());
-        let local_covers = local_enabled() && sp.find(Kind::Local, va, width, PLACEMENT_ALIGN).is_some();
+        let local_covers = local_enabled() && sp.find_local(va, width, PLACEMENT_ALIGN, HEAP_ONLY_BUFFERS).is_some();
         if let Some(r) = reservation(va).filter(|_| !local_covers) {
             let key = match sp.find(Kind::Shadow, va, width, PLACEMENT_ALIGN) {
                 Some(k) => Some((k, false)),
@@ -504,7 +526,7 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
                     let (lo, hi) = local_span(va, width, Some(r));
                     unsafe { crate::title_shadow::create_heap(real, lo, hi) }.map(|h| {
                         STATS.heaps.fetch_add(1, Ordering::Relaxed);
-                        (sp.insert(Span { lo, hi, kind: Kind::Shadow, heap: h, retired: false, live: HashSet::new() }), true)
+                        (sp.insert(Span { lo, hi, kind: Kind::Shadow, heap: h, heap_flags: 0, retired: false, live: HashSet::new() }), true)
                     })
                 }
             };
@@ -530,18 +552,21 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
         }
         let (size, align) = info;
         if size != 0 && size != u64::MAX && align != 0 && align <= crate::msaa_place::max_align(samples) && va % align.min(PLACEMENT_ALIGN) == 0 {
-            if samples <= 1 {
+            let resource_class = if dim == 1 { HEAP_ONLY_BUFFERS } else if flags & 0x3 != 0 { HEAP_ONLY_RT_DS_TEXTURES } else { HEAP_ONLY_NON_RT_DS_TEXTURES };
+            let mixed_heap = unsafe { mixed_heap_supported(real) };
+            if mixed_heap && samples <= 1 {
                 unsafe { migrate_shadow(real, sp, va, size) };
             }
-            let key = match sp.find(Kind::Local, va, size, align) {
+            let key = match sp.find_local(va, size, align, resource_class) {
                 Some(k) if samples > 1 && !crate::msaa_place::capable(sp.get(k).heap) => None,
                 Some(k) => Some((k, false)),
                 None => {
                     let (lo, hi) = local_span(va, size.max(xbox_size), reservation(va));
                     let fits = crate::msaa_place::span_fits(samples, va, lo, align);
-                    if fits { unsafe { create_local_heap(real, hi - lo, samples > 1) } } else { None }.map(|h| {
+                    let heap_flags = if mixed_heap { 0 } else { resource_class };
+                    if fits { unsafe { create_local_heap(real, hi - lo, samples > 1, heap_flags) } } else { None }.map(|h| {
                         STATS.heaps.fetch_add(1, Ordering::Relaxed);
-                        (sp.insert(Span { lo, hi, kind: Kind::Local, heap: h as usize, retired: false, live: HashSet::new() }), true)
+                        (sp.insert(Span { lo, hi, kind: Kind::Local, heap: h as usize, heap_flags, retired: false, live: HashSet::new() }), true)
                     })
                 }
             };
@@ -640,7 +665,7 @@ mod tests {
     }
 
     fn span(lo: u64, hi: u64, kind: Kind, heap: usize) -> Span {
-        Span { lo, hi, kind, heap, retired: false, live: HashSet::new() }
+        Span { lo, hi, kind, heap, heap_flags: 0, retired: false, live: HashSet::new() }
     }
 
     #[test]
@@ -869,7 +894,20 @@ mod tests {
             let mut c: *mut c_void = core::ptr::null_mut();
             let mc = create_placed_x(dev, va + 0x1_0000, &other, 0x2_0000, 0x4, core::ptr::null(), &mut c).expect("inner placed");
             assert_eq!((mc.heap, mc.offset), (ma.heap, 0x1_0000));
-            for r in [a, b, c] {
+            let sampled = tex_desc(128, 128, 28, 0);
+            let mut srv_only: *mut c_void = core::ptr::null_mut();
+            let sample_heap = create_placed_x(dev, va, &sampled, 0x2_0000, 0, core::ptr::null(), &mut srv_only)
+                .expect("sampled texture placed");
+            if mixed_heap_supported(dev) {
+                assert_eq!(sample_heap.heap, ma.heap);
+            } else {
+                assert_ne!(sample_heap.heap, ma.heap, "heap tier 1 separates RT/DS and sampled textures");
+            }
+            let mut next_target: *mut c_void = core::ptr::null_mut();
+            let target = create_placed_x(dev, va, &rt, 0x4_0000, 0x4, core::ptr::null(), &mut next_target)
+                .expect("a later render target still finds the compatible heap");
+            assert_eq!(target.heap, ma.heap);
+            for r in [a, b, c, srv_only, next_target] {
                 vcall!(r, 2, fn() -> u32);
             }
             let mut d: *mut c_void = core::ptr::null_mut();
