@@ -1136,6 +1136,10 @@ impl<'a> Emitter<'a> {
     }
 
     fn root_param_at(&self, sgpr: u8, base: usize) -> Option<(usize, u32)> {
+        if sgpr >= rootmem::RM_TABLE {
+            let p = (sgpr & !rootmem::RM_TABLE) as usize;
+            return (p < self.ex.root_sig.as_ref()?.params.len()).then_some((p, 0));
+        }
         if let Some(r) = self.dg_slot(sgpr) {
             return r;
         }

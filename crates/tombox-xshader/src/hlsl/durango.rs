@@ -20,7 +20,7 @@ pub(super) fn layout(ex: &ShaderExtract) -> Result<Option<Vec<(u32, u32)>>, Stri
         return Ok(None);
     }
     let Some(rs) = ex.root_sig.as_ref() else { return Ok(None) };
-    let mut u = FIRST_USER;
+    let mut u = if ex.stage == crate::Stage::Pixel { SGPR_END } else { FIRST_USER };
     let mut out = Vec::with_capacity(rs.params.len());
     for p in &rs.params {
         let n = size_of(&p.kind);
@@ -74,15 +74,15 @@ impl Emitter<'_> {
 
     pub(super) fn dg_mem(&self, dword: u32) -> Option<(usize, u32)> {
         let l = self.dg()?;
-        let u = dword.checked_add(SGPR_END)?;
+        let u = if dword >= SGPR_END { dword } else { dword.checked_add(SGPR_END)? };
         l.iter().position(|&(a, n)| a >= SGPR_END && u >= a && u < a + n).map(|p| (p, u - l[p].0))
     }
 
     pub(super) fn dg_table_ptr(&self, table: u8, off: u32, k: u32) -> Option<u8> {
-        if self.dg().is_none() || !self.rm_ptr(table) || off & BINDLESS != 0 || off % 4 != 0 {
+        if !self.rm_ptr(table) || off & BINDLESS != 0 || off % 4 != 0 {
             return None;
         }
-        let (p, 0) = self.dg_mem(off / 4 + k)? else { return None };
+        let (p, 0) = self.rm_param(off / 4 + k)? else { return None };
         match self.ex.root_sig.as_ref()?.params.get(p).map(|x| &x.kind) {
             Some(RootParamKind::Table(_)) => Some(RM_TABLE | p as u8),
             _ => None,
@@ -312,5 +312,80 @@ mod ssharp_tests {
         assert_eq!((d.filter, d.max_aniso, d.lod), (Some(0x55), Some(16), Some((0, 0xff))));
         let d = decode_ssharp(0x92 | (1 << 29), None, None, false);
         assert_eq!(d.reduction, 2);
+    }
+
+    #[test]
+    fn durango_descriptor_indirection_pixel_shader_resource_binding_succeeds() {
+        use crate::meta::{RootParam, RootParamKind, RootRange, RootSig, SigElement};
+        use crate::Stage;
+        use crate::hlsl::translate;
+
+        let words: [u32; 16] = [
+            0xf404_0100, // s_load_dwordx2 s4, s0 [off=64]
+            0xfa00_0040,
+            0xf40c_0202, // s_load_dwordx8 s8, s4 [off=0]
+            0xfa00_0000,
+            0x7e00_0280, // v_mov_b32 v0, 0
+            0x7e02_0280, // v_mov_b32 v1, 0
+            0xf000_1108, // image_load v0 <- 2D texture, coords v0..
+            0x0002_0000,
+            0x3604_0081, // v_and_b32 v2, 1, v0
+            0xbf80_0000, // s_nop
+            0xbf80_0000, // s_nop
+            0x5e00_0502, // v_cvt_pkrtz_f16_f32 v0, v2, v2
+            0x5e02_0502, // v_cvt_pkrtz_f16_f32 v1, v2, v2
+            0xf800_1c0f, // exp mrt0
+            0x0000_0100,
+            0xbf81_0000, // s_endpgm
+        ];
+        let root = Some(RootSig {
+            version: 2,
+            flags: 1,
+            params: vec![RootParam {
+                visibility: 5,
+                kind: RootParamKind::Table(vec![RootRange {
+                    range_type: 0,
+                    num: 64,
+                    base_register: 0,
+                    space: 0,
+                    offset_in_table: u32::MAX,
+                }]),
+            }],
+            num_static_samplers: 0,
+            static_samplers: Vec::new(),
+        });
+        let sig = SigElement {
+            name: "SV_Target".to_string(),
+            index: 0,
+            sysval: 64,
+            comp_type: 3,
+            register: 0,
+            mask: 0xf,
+            rw_mask: 0xf,
+        };
+        let isa: Vec<u8> = words.iter().flat_map(|&w| w.to_le_bytes()).collect();
+        let ex = crate::ShaderExtract {
+            stage: Stage::Pixel,
+            shader_model: (6, 0),
+            bitcode_stripped: true,
+            fssm: Vec::new(),
+            entry: Some("main".into()),
+            isa_data: isa.clone(),
+            isa,
+            isa_offset_in_fssm: 0,
+            isa_preamble: [0; 4],
+            has_input_sig: true,
+            has_output_sig: true,
+            has_psv0: false,
+            has_root_sig: true,
+            input_sig: vec![],
+            output_sig: vec![sig],
+            resources: vec![],
+            gs_info: None,
+            root_sig: root,
+        };
+        let t = translate(&ex).expect("Durango PS level-2 descriptor indirection translation should succeed");
+        assert!(t.hlsl.contains("tex0 : register(t0);"), "{}", t.hlsl);
+        assert!(t.hlsl.contains("SV_Target"), "{}", t.hlsl);
     }
 }

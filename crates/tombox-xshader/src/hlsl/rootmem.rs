@@ -26,7 +26,7 @@ impl Emitter<'_> {
     }
 
     fn detect_rootmem(&self) -> bool {
-        if !self.is_cs || self.ex.root_sig.as_ref().map_or(true, |r| r.params.is_empty()) {
+        if self.ex.root_sig.as_ref().map_or(true, |r| r.params.is_empty()) {
             return false;
         }
         let mut ptr: Vec<u8> = vec![0];
@@ -65,14 +65,14 @@ impl Emitter<'_> {
         (table as usize) < self.user_base() && self.rootmem()
     }
 
-    fn rm_param(&self, dword: u32) -> Option<(usize, u32)> {
+    pub(super) fn rm_param(&self, dword: u32) -> Option<(usize, u32)> {
         if self.dg().is_some() {
             return self.dg_mem(dword);
         }
-        let mut at = dword;
+        let mut at = if dword >= super::durango::SGPR_END { dword - super::durango::SGPR_END } else { dword };
         for (i, p) in self.ex.root_sig.as_ref()?.params.iter().enumerate() {
             let n = match &p.kind {
-                RootParamKind::Table(_) => return None,
+                RootParamKind::Table(_) => 2,
                 RootParamKind::Descriptor { .. } => 2,
                 RootParamKind::Constants { num32, .. } => *num32,
             };

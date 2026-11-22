@@ -177,6 +177,7 @@ fn mesh_scalar_buffer_load_uses_root_descriptor_for_aliased_register() {
             kind: RootParamKind::Descriptor { kind: 2, register: 7, space: 2 },
         }],
         num_static_samplers: 0,
+        static_samplers: Vec::new(),
     });
     let translated = translate(&shader).expect("explicit CBV root descriptor");
     assert!(translated.hlsl.contains("register(b7, space2)"), "{}", translated.hlsl);
@@ -210,6 +211,7 @@ fn mesh_typed_buffer_load_uses_root_table_range() {
             }]),
         }],
         num_static_samplers: 0,
+        static_samplers: Vec::new(),
     });
     let translated = translate(&shader).expect("explicit SRV descriptor range");
     assert!(translated.hlsl.contains("Buffer<"), "{}", translated.hlsl);

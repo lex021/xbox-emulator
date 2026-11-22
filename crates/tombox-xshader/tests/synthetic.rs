@@ -300,7 +300,7 @@ fn loops_translate_deterministically() {
 }
 
 #[test]
-fn durango_pixel_shader_resource_binding_fails_before_fix() {
+fn durango_pixel_shader_resource_binding_succeeds() {
     // Synthetic minimal Durango Pixel Shader:
     // Durango passes root table pointer in s[0:1].
     // Instruction 0 (0x0): s_load_dwordx2 s[4:5], s[0:1], 64  (loads descriptor table pointer at root offset 64)
@@ -331,13 +331,9 @@ fn durango_pixel_shader_resource_binding_fails_before_fix() {
         num_static_samplers: 0, static_samplers: Vec::new(),
     });
     let ex = shader(Stage::Pixel, &words, vec![], vec![sig("SV_Target", 64, 3, 0, 0xf)], root);
-    let Err(err) = translate(&ex) else {
-        panic!("translation unexpectedly succeeded before fix");
-    };
-    assert_eq!(
-        err,
-        "s_load at 0x8: base s4 is not a root table pointer (Some(Desc { table: 0, off: 64, k: 0 }))"
-    );
+    let t = translate(&ex).expect("Durango PS resource binding should succeed");
+    assert!(t.hlsl.contains("tex0 : register(t0);"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("o.o0"), "{}", t.hlsl);
 }
 
 
@@ -612,4 +608,40 @@ fn pixel_attribute_past_the_interpolants_reads_the_layer_sysval() {
     let ex = shader(Stage::Pixel, &words, vec![pos, layer], vec![sig("SV_Target", 64, 3, 0, 1)], None);
     let t = translate(&ex).expect("v_interp_mov of the layer attribute translates");
     assert!(t.hlsl.contains("(uint)(i.i1.x)"), "{}", t.hlsl);
+}
+
+#[test]
+fn durango_vertex_shader_sgpr_layout_investigation() {
+    // Synthetic minimal Durango Vertex Shader:
+    // Every Durango VS variant starts with s_swappc_b64 s[0:1], s[0:1] (calling fetch shader).
+    // Followed by loading descriptors or buffers from descriptor tables s[0:3].
+    // If Table 3 is bound to s3 (e.g. CBV table):
+    // Instruction 0 (0x0): s_swappc_b64 s[0:1], s[0:1]
+    // Instruction 1 (0x4): s_load_dwordx4 s[4:7], s[2:3], 0   (loads from CBV descriptor table in s[2:3] or s3)
+    // Instruction 3: export position
+    // Instruction 4: s_endpgm
+    let words = [
+        0xbe80_2100, // s_swappc_b64 s[0:1], s[0:1]
+        0xf408_0101, // s_load_dwordx4 s4, s2 [off=0]
+        0xfa00_0000,
+        0x7e00_0280, // v_mov_b32 v0, 0
+        0xf800_00cf, // exp pos0 v0, v0, v0, v0
+        0x0000_0000,
+        S_ENDPGM,
+    ];
+    let root = Some(RootSig {
+        version: 2,
+        flags: 1,
+        params: vec![
+            table(0, 64, 1), // Param 0: SRV table
+            table(3, 16, 1), // Param 1: Sampler table
+            table(2, 16, 1), // Param 2: CBV table
+            table(2, 16, 1), // Param 3: CBV table
+        ],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    });
+    let ex = shader(Stage::Vertex, &words, vec![], vec![sig("SV_Position", 1, 3, 0, 0xf)], root);
+    let res = translate(&ex);
+    println!("Translation result: {:?}", res.as_ref().map(|t| &t.hlsl).map_err(|e| e));
 }
