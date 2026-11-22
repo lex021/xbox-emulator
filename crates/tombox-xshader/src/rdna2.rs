@@ -155,7 +155,7 @@ fn ssrc_is_lit(field: u32) -> bool {
     field == 255
 }
 
-/// Decode a full ISA blob into instructions (to the end of the input).
+/// Decode the complete instructions in an ISA blob. An incomplete tail is omitted.
 pub fn disassemble(isa: &[u8]) -> Vec<Insn> {
     let words: Vec<u32> = isa
         .chunks_exact(4)
@@ -169,7 +169,10 @@ pub fn disassemble(isa: &[u8]) -> Vec<Insn> {
         let enc = classify(w);
         // Determine instruction length (in dwords) and whether a trailing literal follows.
         let (base_len, lit) = instr_len(enc, w, words.get(i + 1).copied());
-        let total = (base_len + if lit { 1 } else { 0 }).min(words.len() - i).max(1);
+        let total = base_len + if lit { 1 } else { 0 };
+        if total > words.len() - i {
+            break;
+        }
         let raw: Vec<u32> = words[i..i + total].to_vec();
         let op = opcode_field(enc, w) | if enc == Enc::Mtbuf { ((words.get(i + 1).copied().unwrap_or(0) >> 21) & 1) << 3 } else { 0 };
         let mnemonic = mnemonic_for(enc, op);

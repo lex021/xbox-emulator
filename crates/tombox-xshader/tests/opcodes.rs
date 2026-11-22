@@ -116,6 +116,38 @@ fn mnemonic(words: &[u32]) -> (String, Opnd) {
 }
 
 #[test]
+fn disassemble_stops_before_incomplete_instructions() {
+    let long = vop3(0x146, 2, [v(0), 0, v(1)], 0, 0);
+    let literal = vop1(1, 2, LIT);
+    let prefix = sop1(3, 0, 128);
+    for incomplete in [long[0], literal] {
+        let isa: Vec<_> = [prefix, incomplete].into_iter().flat_map(u32::to_le_bytes).collect();
+        let decoded = disassemble(&isa);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].raw, vec![prefix]);
+    }
+    let isa: Vec<_> = [long[0], long[1], literal, 0x3f80_0000]
+        .into_iter().flat_map(u32::to_le_bytes).collect();
+    let decoded = disassemble(&isa);
+    assert_eq!(decoded.len(), 2);
+    assert_eq!((decoded[0].dwords, decoded[1].offset, decoded[1].dwords), (2, 8, 2));
+}
+
+#[test]
+fn translate_reports_incomplete_instruction_offset() {
+    let words = program(&[]);
+    let offset = words.len() * 4;
+    let mut shader = shader(&words, None);
+    assert!(translate(&shader).is_ok());
+    let expected = format!("truncated RDNA2 instruction at byte offset {offset:#x}");
+    shader.isa.extend_from_slice(&vop1(1, 2, LIT).to_le_bytes());
+    assert_eq!(translate(&shader).err().as_deref(), Some(expected.as_str()));
+    shader.isa.truncate(offset);
+    shader.isa.extend_from_slice(&[1, 2, 3]);
+    assert_eq!(translate(&shader).err().as_deref(), Some(expected.as_str()));
+}
+
+#[test]
 fn vopc_gfx10_compare_table() {
     let cases: &[(u32, &str, bool)] = &[
         (0x10, "v_cmpx_f_f32", true),

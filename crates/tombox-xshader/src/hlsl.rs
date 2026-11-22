@@ -880,6 +880,10 @@ fn translate_with(ex: &ShaderExtract, user_base_override: Option<usize>, uav_for
         other => return Err(format!("stage {other:?} not supported yet")),
     };
     let mut insns = disassemble(&ex.isa);
+    let decoded_bytes = insns.last().map_or(0, |ins| ins.offset + ins.dwords * 4);
+    if decoded_bytes != ex.isa.len() {
+        return Err(format!("truncated RDNA2 instruction at byte offset {decoded_bytes:#x}"));
+    }
     lower_wave_scans(&mut insns)?;
     lower_wave_reductions(&mut insns)?;
     lower_lane_spills(&mut insns)?;
