@@ -701,6 +701,7 @@ pub fn extract_durango(
         isa: lowered.isa[..lowered.code_len].to_vec(),
         isa_offset_in_fssm: d.code_start,
         isa_preamble: thread_group(&d, stage),
+        psv_numthreads: if stage == crate::Stage::Compute { body(b"PSV0").and_then(crate::meta::parse_psv0_cs_threads) } else { None },
         isa_data: lowered.isa,
         has_input_sig: container.chunk(b"ISG1").is_some() || container.chunk(b"ISGN").is_some(),
         has_output_sig: container.chunk(b"OSG1").is_some() || container.chunk(b"OSGN").is_some(),

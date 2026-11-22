@@ -5382,6 +5382,8 @@ impl<'a> Emitter<'a> {
             1 => ("point", 1usize),
             2 => ("line", 2),
             3 => ("triangle", 3),
+            6 => ("lineadj", 4),
+            7 => ("triangleadj", 6),
             other => return Err(format!("GS input primitive {other} unsupported")),
         };
         let stream = match gi.output_topology {
@@ -6401,7 +6403,11 @@ impl<'a> Emitter<'a> {
             // thread-group id in the three SGPRs following the user-data (root-parameter)
             // registers, thread-group size in the ISA preamble dwords 1..3.
             let p = ex.isa_preamble;
-            let (tx, ty_, tz) = (p[1].max(1), p[2].max(1), p[3].max(1));
+            let (tx, ty_, tz) = if p[1] != 0 || p[2] != 0 || p[3] != 0 {
+                (p[1].max(1), p[2].max(1), p[3].max(1))
+            } else {
+                ex.psv_numthreads.map(|t| (t[0], t[1], t[2])).unwrap_or((1, 1, 1))
+            };
             let nparams = ex.root_sig.as_ref().map(|r| r.params.len()).unwrap_or(4);
             let g = self.cs_tgid_base(nparams);
             let _ = writeln!(h, "[numthreads({tx}, {ty_}, {tz})]
@@ -6509,7 +6515,17 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             for rname in ["s3", "v0", "v1"] {
                 self.regs.insert(rname.to_string());
             }
-            let _ = writeln!(init, "    s3 = 0x100u; v0 = 0x04000000u; v1 = 0x800u;");
+            let _ = if nv <= 3 {
+                writeln!(init, "    s3 = 0x100u; v0 = 0x04000000u; v1 = 0x800u;")
+            } else {
+                let pack = |a: u32, b: u32| (a * 0x400) | ((b * 0x400) << 16);
+                if nv > 4 {
+                    self.regs.insert("v2".to_string());
+                    writeln!(init, "    s3 = 0x100u; v0 = {:#x}u; v1 = {:#x}u; v2 = {:#x}u;", pack(0, 1), pack(2, 3), pack(4, 5))
+                } else {
+                    writeln!(init, "    s3 = 0x100u; v0 = {:#x}u; v1 = {:#x}u;", pack(0, 1), pack(2, 3))
+                }
+            };
         }
         if !is_ps && !self.is_gs {
             let is_durango = self.durango.is_some() || crate::gcn::is_durango(&self.ex.fssm);
