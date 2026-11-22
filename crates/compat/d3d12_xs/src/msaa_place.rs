@@ -33,8 +33,12 @@ pub fn max_align(samples: u32) -> u64 {
     if samples > 1 { MSAA_ALIGN } else { 0x1_0000 }
 }
 
-pub fn span_fits(samples: u32, va: u64, lo: u64, align: u64) -> bool {
-    samples <= 1 || (align != 0 && (va - lo) % align == 0)
+pub fn span_start(samples: u32, va: u64, lo: u64, align: u64) -> u64 {
+    if samples > 1 {
+        lo + (va - lo) % align
+    } else {
+        lo
+    }
 }
 
 #[cfg(test)]
@@ -48,9 +52,9 @@ mod tests {
         assert_eq!(heap_layout(0x41_0000, false), (0x80_0000, MSAA_ALIGN));
         assert_eq!(max_align(1), 0x1_0000);
         assert_eq!(max_align(4), MSAA_ALIGN);
-        assert!(span_fits(1, 0x1_2345_0000, 0x1_0000_0000, 0x1_0000));
-        assert!(span_fits(4, 0x1_0080_0000, 0x1_0000_0000, MSAA_ALIGN));
-        assert!(!span_fits(4, 0x1_0081_0000, 0x1_0000_0000, MSAA_ALIGN));
+        assert_eq!(span_start(1, 0x1_2345_0000, 0x1_0000_0000, 0x1_0000), 0x1_0000_0000);
+        assert_eq!(span_start(4, 0x1_0080_0000, 0x1_0000_0000, MSAA_ALIGN), 0x1_0000_0000);
+        assert_eq!(span_start(4, 0x1_0081_0000, 0x1_0000_0000, MSAA_ALIGN), 0x1_0001_0000);
         note_heap(0x1234, MSAA_ALIGN);
         note_heap(0x5678, 0);
         assert!(capable(0x1234) && !capable(0x5678));

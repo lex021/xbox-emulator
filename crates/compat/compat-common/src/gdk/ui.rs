@@ -42,6 +42,24 @@ pub fn message_dialog(title: String, content: String, buttons: Vec<String>, defa
     }
 }
 
+pub(super) fn manage_space(bytes: u64, directory: &std::path::Path, cancel: &Arc<Cancel>) -> i32 {
+    if cancel.is_set() {
+        return E_ABORT;
+    }
+    let result = show(Dialog {
+        title: "Manage storage".into(),
+        text: format!(
+            "Use Windows Storage settings to free up {} MiB on the drive below. Select Continue when you're ready to retry.\n\n{}",
+            bytes.div_ceil(1024 * 1024),
+            directory.display()
+        ),
+        buttons: vec!["Continue".into(), "Cancel".into()],
+        cancel: Some(1),
+        ..Default::default()
+    }, cancel);
+    if !cancel.is_set() && result.button == Some(0) { S_OK } else { E_ABORT }
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe extern "system" fn message_async(
     _t: This, block: *mut c_void, title: *const u8, content: *const u8, b1: *const u8, b2: *const u8, b3: *const u8, default: u32, cancel: u32,

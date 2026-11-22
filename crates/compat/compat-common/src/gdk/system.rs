@@ -1,4 +1,4 @@
-use super::{cstr, data_root, log, put_str, setting, title, xasync, Guid, Iface, This, E_ABORT, E_FAIL, E_INVALIDARG, S_OK};
+use super::{cstr, data_root, log, put_str, setting, title, xasync, Guid, Iface, This, E_FAIL, E_INVALIDARG, S_OK};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -254,22 +254,21 @@ unsafe extern "system" fn pls_get_path(_t: This, size: usize, buf: *mut u8, used
     put_str(&pls_path(), size, buf, used)
 }
 
-fn pls_space() -> (u64, u64, u64) {
+fn query_pls_space() -> Result<(u64, u64, u64), i32> {
     let p: Vec<u16> = pls_path().encode_utf16().chain(Some(0)).collect();
     let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
     if unsafe { GetDiskFreeSpaceExW(p.as_ptr(), &mut avail, &mut total, &mut free) } == 0 {
-        avail = 16 << 30;
-        free = avail;
-        total = avail;
+        let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        return Err(if error == 0 { E_FAIL } else { super::win::hr_from_win32(error as u32) });
     }
-    (avail, free, total)
+    Ok((avail, free, total))
 }
 
 unsafe extern "system" fn pls_space_info(_t: This, out: *mut u64) -> i32 {
     if out.is_null() {
         return E_INVALIDARG;
     }
-    let (avail, free, total) = pls_space();
+    let (avail, free, total) = query_pls_space().unwrap_or((16 << 30, 16 << 30, 16 << 30));
     *out = avail;
     *out.add(1) = free;
     *out.add(2) = 0;
@@ -278,10 +277,6 @@ unsafe extern "system" fn pls_space_info(_t: This, out: *mut u64) -> i32 {
 }
 
 const OP_PLS_PROMPT: &[u8] = b"XPersistentLocalStoragePromptUserForSpaceAsync\0";
-
-pub fn pls_prompt_result(requested: u64, available: u64) -> i32 {
-    if available >= requested { S_OK } else { E_ABORT }
-}
 
 pub const PLS_PROMPT_MIN_BYTES: u64 = 0xa0_0000;
 
@@ -294,7 +289,10 @@ pub fn pls_prompt_check(requested: u64, total: u64) -> i32 {
 }
 
 unsafe extern "system" fn pls_prompt_async(_t: This, requested: u64, block: *mut core::ffi::c_void) -> i32 {
-    let (_, _, total) = pls_space();
+    let (_, free, total) = match query_pls_space() {
+        Ok(space) => space,
+        Err(hr) => return hr,
+    };
     let hr = pls_prompt_check(requested, total);
     if hr < 0 {
         return hr;
@@ -302,10 +300,10 @@ unsafe extern "system" fn pls_prompt_async(_t: This, requested: u64, block: *mut
     xasync::run_with(
         block,
         OP_PLS_PROMPT,
-        Box::new(move |_c| {
-            let (avail, free, _) = pls_space();
-            let hr = pls_prompt_result(requested, avail);
-            log("XPersistentLocalStoragePromptUserForSpaceAsync", &format!("requested {requested} bytes, free {free}, manage-space ask {} bytes, available {avail} -> {hr:#010x} (no manage-space UI on PC)", pls_prompt_needed(requested, free)));
+        Box::new(move |cancel| {
+            let needed = pls_prompt_needed(requested, free);
+            let hr = super::ui::manage_space(needed, &pls_dir(), &cancel);
+            log("XPersistentLocalStoragePromptUserForSpaceAsync", &format!("requested {requested} bytes, free {free}, manage-space ask {needed} bytes -> {hr:#010x}"));
             xasync::Payload::status(hr)
         }),
     )

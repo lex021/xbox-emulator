@@ -64,6 +64,7 @@ pub struct Span {
     pub kind: Kind,
     pub heap: usize,
     heap_flags: u32,
+    shifted_msaa_alignment: Option<u64>,
     pub retired: bool,
     pub live: HashSet<usize>,
 }
@@ -90,8 +91,12 @@ impl Spans {
         None
     }
 
-    fn find_local(&self, va: u64, len: u64, align: u64, heap_class: u32) -> Option<(u64, usize)> {
-        self.find_matching(Kind::Local, va, len, align, |span| span.heap_flags == 0 || span.heap_flags == heap_class)
+    fn find_local(&self, va: u64, len: u64, align: u64, heap_class: u32, msaa: bool) -> Option<(u64, usize)> {
+        self.find_matching(Kind::Local, va, len, align, |span| {
+            (span.heap_flags == 0 || span.heap_flags == heap_class)
+                && span.shifted_msaa_alignment.is_none_or(|required| msaa && align == required)
+                && (!msaa || crate::msaa_place::capable(span.heap))
+        })
     }
 
     pub fn get(&self, key: (u64, usize)) -> &Span {
@@ -505,7 +510,7 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
                 Some(k) if sp.get(k).lo == base => Some((k, false)),
                 _ => unsafe { open_title_heap(real, base) }.filter(|(_, size)| base + size >= va + width).map(|(h, size)| {
                     STATS.heaps.fetch_add(1, Ordering::Relaxed);
-                    (sp.insert(Span { lo: base, hi: base + size, kind: Kind::Title, heap: h as usize, heap_flags: HEAP_ONLY_BUFFERS, retired: false, live: HashSet::new() }), true)
+                    (sp.insert(Span { lo: base, hi: base + size, kind: Kind::Title, heap: h as usize, heap_flags: HEAP_ONLY_BUFFERS, shifted_msaa_alignment: None, retired: false, live: HashSet::new() }), true)
                 }),
             };
             if let Some((k, fresh)) = key {
@@ -518,7 +523,7 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
     }
     if chosen.is_none() && dim == 1 && va % PLACEMENT_ALIGN == 0 && crate::title_shadow::enabled() {
         let width = u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap());
-        let local_covers = local_enabled() && sp.find_local(va, width, PLACEMENT_ALIGN, HEAP_ONLY_BUFFERS).is_some();
+        let local_covers = local_enabled() && sp.find_local(va, width, PLACEMENT_ALIGN, HEAP_ONLY_BUFFERS, false).is_some();
         if let Some(r) = reservation(va).filter(|_| !local_covers) {
             let key = match sp.find(Kind::Shadow, va, width, PLACEMENT_ALIGN) {
                 Some(k) => Some((k, false)),
@@ -526,7 +531,7 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
                     let (lo, hi) = local_span(va, width, Some(r));
                     unsafe { crate::title_shadow::create_heap(real, lo, hi) }.map(|h| {
                         STATS.heaps.fetch_add(1, Ordering::Relaxed);
-                        (sp.insert(Span { lo, hi, kind: Kind::Shadow, heap: h, heap_flags: 0, retired: false, live: HashSet::new() }), true)
+                        (sp.insert(Span { lo, hi, kind: Kind::Shadow, heap: h, heap_flags: 0, shifted_msaa_alignment: None, retired: false, live: HashSet::new() }), true)
                     })
                 }
             };
@@ -538,11 +543,13 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
     if chosen.is_none() && local_enabled() && (samples <= 1 || dim >= 2) && (dim >= 2 || va % PLACEMENT_ALIGN == 0) {
         let flags = u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap());
         let mut info = (0u64, 0u64);
-        if dim >= 2 && flags & 0x3 == 0 && va % 0x1000 == 0 {
+        let msaa = samples > 1;
+        let small_alignment = if msaa { PLACEMENT_ALIGN } else { 0x1000 };
+        if dim >= 2 && flags & 0x3 == 0 && va % small_alignment == 0 {
             let mut small = desc;
-            small[8..16].copy_from_slice(&0x1000u64.to_le_bytes());
+            small[8..16].copy_from_slice(&small_alignment.to_le_bytes());
             let si = unsafe { allocation_info(real, &small) };
-            if si.1 == 0x1000 && si.0 != u64::MAX {
+            if si.1 == small_alignment && si.0 != u64::MAX {
                 desc = small;
                 info = si;
             }
@@ -557,16 +564,20 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
             if mixed_heap && samples <= 1 {
                 unsafe { migrate_shadow(real, sp, va, size) };
             }
-            let key = match sp.find_local(va, size, align, resource_class) {
-                Some(k) if samples > 1 && !crate::msaa_place::capable(sp.get(k).heap) => None,
+            let key = match sp.find_local(va, size, align, resource_class, msaa) {
                 Some(k) => Some((k, false)),
                 None => {
                     let (lo, hi) = local_span(va, size.max(xbox_size), reservation(va));
-                    let fits = crate::msaa_place::span_fits(samples, va, lo, align);
+                    // A host offset is relative to the heap, so anchor a new
+                    // MSAA span at the required residue of the title address.
+                    let start = crate::msaa_place::span_start(samples, va, lo, align);
+                    // Shifted heaps cannot share the original span's layout.
+                    // They must not replace an existing heap with a different alignment.
+                    let shifted_msaa_alignment = (start != lo).then_some(align);
                     let heap_flags = if mixed_heap { 0 } else { resource_class };
-                    if fits { unsafe { create_local_heap(real, hi - lo, samples > 1, heap_flags) } } else { None }.map(|h| {
+                    unsafe { create_local_heap(real, hi - start, msaa, heap_flags) }.map(|h| {
                         STATS.heaps.fetch_add(1, Ordering::Relaxed);
-                        (sp.insert(Span { lo, hi, kind: Kind::Local, heap: h as usize, heap_flags, retired: false, live: HashSet::new() }), true)
+                        (sp.insert(Span { lo: start, hi, kind: Kind::Local, heap: h as usize, heap_flags, shifted_msaa_alignment, retired: false, live: HashSet::new() }), true)
                     })
                 }
             };
@@ -665,7 +676,7 @@ mod tests {
     }
 
     fn span(lo: u64, hi: u64, kind: Kind, heap: usize) -> Span {
-        Span { lo, hi, kind, heap, heap_flags: 0, retired: false, live: HashSet::new() }
+        Span { lo, hi, kind, heap, heap_flags: 0, shifted_msaa_alignment: None, retired: false, live: HashSet::new() }
     }
 
     #[test]
@@ -686,6 +697,58 @@ mod tests {
         s.resource_gone(8);
         assert_eq!(s.take_idle(), vec![0xaa]);
         assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn msaa_lookup_skips_an_incompatible_heap_at_the_same_address() {
+        let va = 0x20_0000;
+        let mut spans = Spans::default();
+        let ordinary = spans.insert(span(va, va + PLACEMENT_ALIGN, Kind::Local, 0x5679));
+        assert_eq!(spans.find_local(va, PLACEMENT_ALIGN, PLACEMENT_ALIGN, HEAP_ONLY_NON_RT_DS_TEXTURES, true), None);
+        let multisampled = spans.insert(span(va, va + PLACEMENT_ALIGN, Kind::Local, 0x567a));
+        crate::msaa_place::note_heap(0x567a, crate::msaa_place::MSAA_ALIGN);
+        let single = spans.find_local(va, PLACEMENT_ALIGN, PLACEMENT_ALIGN, HEAP_ONLY_NON_RT_DS_TEXTURES, false);
+        let multi = spans.find_local(va, PLACEMENT_ALIGN, PLACEMENT_ALIGN, HEAP_ONLY_NON_RT_DS_TEXTURES, true);
+        crate::msaa_place::forget_heap(0x567a);
+        assert_eq!(single, Some(ordinary));
+        assert_eq!(multi, Some(multisampled));
+    }
+
+    #[test]
+    fn small_msaa_uses_the_host_placement_grant() {
+        unsafe {
+            let dev = device();
+            let mut desc = tex_desc(32, 32, 28, 0);
+            desc[0x24..0x28].copy_from_slice(&4u32.to_le_bytes());
+            let mut small = desc;
+            small[8..16].copy_from_slice(&PLACEMENT_ALIGN.to_le_bytes());
+            let (size, align) = allocation_info(dev, &small);
+            if align != PLACEMENT_ALIGN || size == 0 || size == u64::MAX {
+                vcall!(dev, 2, fn() -> u32);
+                eprintln!("small MSAA placement unavailable on this adapter");
+                return;
+            }
+            let reservation = VirtualAlloc(core::ptr::null_mut(), 0x20_0000, 0x2000, 0x01);
+            assert!(!reservation.is_null());
+            let va = reservation as u64 + PLACEMENT_ALIGN;
+            let mut first = core::ptr::null_mut();
+            let mut second = core::ptr::null_mut();
+            let a = create_placed_x(dev, va, &desc, size, 4, core::ptr::null(), &mut first);
+            let b = create_placed_x(dev, va, &desc, size, 4, core::ptr::null(), &mut second);
+            for resource in [first, second] {
+                if !resource.is_null() {
+                    vcall!(resource, 2, fn() -> u32);
+                }
+            }
+            flush();
+            VirtualFree(reservation, 0, 0x8000);
+            vcall!(dev, 2, fn() -> u32);
+            let a = a.expect("small MSAA placement");
+            let b = b.expect("second small MSAA placement");
+            assert_eq!(a.kind, Kind::Local);
+            assert_eq!(a.offset, PLACEMENT_ALIGN);
+            assert_eq!((a.heap, a.offset), (b.heap, b.offset));
+        }
     }
 
     #[test]

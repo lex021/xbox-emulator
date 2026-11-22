@@ -252,6 +252,35 @@ pub unsafe fn back_committed_texture(desc: &[u8]) -> Option<u64> {
     unsafe { alloc_texture_backing(desc) }
 }
 
+pub unsafe fn free_backing(va: u64) -> bool {
+    extern "system" {
+        fn VirtualFree(addr: *mut c_void, size: usize, free_type: u32) -> i32;
+    }
+    if va == 0 || va >= SYNTHETIC_TEXTURE_BASE {
+        return false;
+    }
+    unsafe { VirtualFree(va as *mut c_void, 0, 0x8000) != 0 }
+}
+
+pub unsafe fn free_texture_backing(res: usize) -> bool {
+    let va = with(|t| {
+        let va = t.texture_va.remove(&res);
+        if let Some(v) = va {
+            t.ranges.remove(&v);
+        }
+        t.state.remove(&res);
+        t.width.remove(&res);
+        va
+    });
+    COMMITTED_TEX.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(|m| m.remove(&res));
+    if let Some(va) = va {
+        if va < SYNTHETIC_TEXTURE_BASE {
+            return unsafe { free_backing(va) };
+        }
+    }
+    false
+}
+
 pub unsafe fn adopt_backing(res: *mut c_void, va: u64, xdesc: [u8; 0x38], init_state: u32) {
     let addref: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(*(*(res as *const *const usize)).add(1)) };
     unsafe { addref(res) };
@@ -384,5 +413,105 @@ mod tests {
         set_state(0xabc, 0x4);
         note_barriers(2, b.as_ptr());
         assert_eq!(state(0xabc), 0x400);
+    }
+
+    #[test]
+    fn synthetic_terraria_texture_cpu_path_and_backing_lifecycle() {
+        #[repr(C)]
+        #[derive(Default)]
+        struct Mbi {
+            base: usize,
+            alloc_base: usize,
+            alloc_protect: u32,
+            partition: u16,
+            pad0: u16,
+            size: usize,
+            state: u32,
+            protect: u32,
+            kind: u32,
+            pad1: u32,
+        }
+        extern "system" {
+            fn VirtualQuery(addr: *const c_void, mbi: *mut Mbi, len: usize) -> usize;
+        }
+        const MEM_COMMIT: u32 = 0x1000;
+
+        // 1. Terraria texture descriptor: 2048x2048, DXGI_FORMAT_R8G8B8A8_UNORM (28), 1 mip, 2D
+        let desc = tex2d(2048, 2048, 28, 1);
+        assert!(is_texture_desc(&desc));
+
+        // 2. Size calculation:
+        // Raw uncompressed linear size is 2048 * 2048 * 4 = 16 MiB (0x100_0000).
+        // Xbox One GCN tiling requires console size to cover the XG tile mode requirements.
+        let base_size = console_texture_size(&desc);
+        assert!(base_size >= 2048 * 2048 * 4, "size {base_size:#x} must at least cover linear texels");
+        let aligned_size = (base_size + 0xffff) & !0xffff;
+        assert_eq!(aligned_size & 0xffff, 0, "size must be 64 KiB aligned");
+
+        // 3. Address allocation & CPU accessibility:
+        let va = unsafe { alloc_backing(aligned_size) }.expect("backing allocation failed");
+        assert_ne!(va, 0, "backing address must not be NULL");
+        assert_eq!(va & 0xffff, 0, "backing address must be 64 KiB aligned");
+        assert!(va < SYNTHETIC_TEXTURE_BASE, "backing address must be a user-space CPU address, not synthetic");
+
+        // Verify CPU write: Unity worker thread writes tiled texel data to this address.
+        // If this address is unmapped, it causes an Access Violation (Segfault).
+        unsafe {
+            let ptr = va as *mut u8;
+            core::ptr::write_bytes(ptr, 0x5a, aligned_size as usize);
+            assert_eq!(*ptr, 0x5a);
+            assert_eq!(*ptr.add((aligned_size - 1) as usize), 0x5a);
+        }
+
+        // Verify VirtualQuery confirms memory is committed:
+        let mut mbi = Mbi::default();
+        let q = unsafe { VirtualQuery(va as *const c_void, &mut mbi, core::mem::size_of::<Mbi>()) };
+        assert_ne!(q, 0);
+        assert_eq!(mbi.state, MEM_COMMIT);
+
+        // 4. Trace why Terraria hangs in WaitOnAddress when unbacked vs backed:
+        let fake_vt: [usize; 16] = [0; 16];
+        let mock_backed_box = Box::new(fake_vt.as_ptr());
+        let mock_res = Box::into_raw(mock_backed_box) as *mut c_void;
+
+        let mock_unbacked_box = Box::new(fake_vt.as_ptr());
+        let mock_unbacked = Box::into_raw(mock_unbacked_box) as *mut c_void;
+
+        // When unbacked: assign_texture_va without placed_va generates a synthetic VA >= SYNTHETIC_TEXTURE_BASE
+        let unbacked_va = assign_texture_va(mock_unbacked as usize, aligned_size, None);
+        assert!(unbacked_va >= SYNTHETIC_TEXTURE_BASE);
+        // get_gpu_va_x filters out synthetic VAs and returns 0:
+        assert_eq!(unsafe { get_gpu_va_x(mock_unbacked) }, 0);
+        // Result: Unity receives 0, takes error branch (+0x442bbe), drops async load without setting
+        // completion flag (texture+0xe9), causing main thread in +0x4873c0 to hang indefinitely in WaitOnAddress.
+
+        // When backed: assign_texture_va with placed_va (from VirtualAlloc)
+        let backed_va = assign_texture_va(mock_res as usize, aligned_size, Some(va));
+        assert_eq!(backed_va, va);
+        // If expose_texture_va() is true, get_gpu_va_x returns the real CPU backing address
+        if expose_texture_va() {
+            assert_eq!(unsafe { get_gpu_va_x(mock_res) }, va);
+        }
+
+        // 5. Cleanup:
+        // Free backing and ensure memory is returned to the OS:
+        let freed = unsafe { free_texture_backing(mock_res as usize) };
+        assert!(freed, "free_texture_backing must succeed");
+
+        // Verify with VirtualQuery that backing memory is no longer MEM_COMMIT:
+        let mut mbi_after = Mbi::default();
+        let q_after = unsafe { VirtualQuery(va as *const c_void, &mut mbi_after, core::mem::size_of::<Mbi>()) };
+        assert_ne!(q_after, 0);
+        assert_ne!(mbi_after.state, MEM_COMMIT, "backing memory must be decommitted / released");
+
+        // Clean up unbacked test resource and drop heap boxes:
+        with(|t| {
+            t.texture_va.remove(&(mock_unbacked as usize));
+            t.ranges.remove(&unbacked_va);
+        });
+        unsafe {
+            drop(Box::from_raw(mock_res as *mut *const usize));
+            drop(Box::from_raw(mock_unbacked as *mut *const usize));
+        }
     }
 }

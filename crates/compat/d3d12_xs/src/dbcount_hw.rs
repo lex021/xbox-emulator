@@ -786,3 +786,107 @@ fn hw_db_count_pause_lifts_and_restores_a_predicate_set_by_buffer_and_advance() 
         assert_eq!(got, 1024, "zfail samples of the draw under the nonzero predicate only: 2048 means the zero predicate at buffer+8 was not restored after the counting pause, less means the partial result copy was not lifted out of predication");
     }
 }
+
+#[test]
+#[ignore = "needs a D3D12 GPU: TOMBOX_EXEC_HW=1 cargo test -p d3d12_xs --lib hw_db_count -- --ignored"]
+fn hw_query_x_depth_stencil_and_nested_occlusion() {
+    if std::env::var_os("TOMBOX_EXEC_HW").is_none() {
+        return;
+    }
+    let _g = crate::cl2_state::TEST_PREV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let saved_mine: Vec<usize> = PREV.iter().map(|p| p.load(Ordering::Relaxed)).collect();
+    unsafe {
+        let mut k = kit(1);
+        let lvt = *(k.list as *const *const usize);
+        let saved = crate::cl2_state::test_install(&k.vt);
+        crate::query_x::install(&k.vt, lvt);
+        let p = psos(&k, 1);
+        let l = k.list as *mut c_void;
+
+        let begin: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) = x(&k, X_BEGIN_QUERY);
+        let end: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) = x(&k, X_END_QUERY);
+        let resolve: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut c_void, u64) = x(&k, X_RESOLVE_QUERY);
+
+        // Control point scene:
+        // 64x64 buffer (4096 pixels).
+        // Wall: X [-1, 0], Y [-1, 1], depth 0.5 (2048 px)
+        // Mark: X [-1, 1], Y [0, 1], stencil 1 (2048 px)
+        // Probe: X [-1, 1], Y [-1, 1], depth 0.75, depth func LESS, stencil func EQUAL 1.
+        // Exactly 1024 pixels pass (Top-Right quadrant: depth 0.75 < 1.0, stencil 1 == 1).
+        // 1024 pixels fail depth test only (Top-Left quadrant: depth 0.75 >= 0.5, stencil 1 == 1).
+        // 1024 pixels fail stencil test only (Bottom-Right quadrant: depth 0.75 < 1.0, stencil 0 != 1).
+        // 1024 pixels fail both (Bottom-Left quadrant: depth 0.75 >= 0.5, stencil 0 != 1).
+
+        // Test 1: Single un-nested query with depth/stencil control points
+        scene_on(&k, &p, k.dsv);
+        begin(l, k.qheap as *mut c_void, 0, 0);
+        set_pso(&k, p.probe);
+        stencil_ref(&k, 1);
+        rect(&k, [-1.0, -1.0, 1.0, 1.0, 0.75, 0.75], 1);
+        end(l, k.qheap as *mut c_void, 0, 0);
+        resolve(l, k.qheap as *mut c_void, 0, 0, 1, k.rb as *mut c_void, 0);
+        submit(&mut k);
+        let single_res = read(&k, 1)[0];
+        eprintln!("[SYNTHETIC_TEST1] Single un-nested query samples_passed = {single_res} (control point: 1024 passing, 3072 failing)");
+        assert_eq!(single_res, 1024, "depth/stencil control points failed: expected 1024 passing samples");
+
+        // Test 2: Nested occlusion queries: outer query (slot 0) and inner query (slot 1)
+        // Outer query begins -> Inner query begins -> Draw probe -> Inner ends -> Outer ends
+        scene_on(&k, &p, k.dsv);
+        begin(l, k.qheap as *mut c_void, 0, 0); // Begin outer
+        begin(l, k.qheap as *mut c_void, 0, 1); // Begin inner (unnest_enabled: ends outer on PC command list!)
+        set_pso(&k, p.probe);
+        stencil_ref(&k, 1);
+        rect(&k, [-1.0, -1.0, 1.0, 1.0, 0.75, 0.75], 1); // Draw inside inner
+        end(l, k.qheap as *mut c_void, 0, 1);   // End inner
+        end(l, k.qheap as *mut c_void, 0, 0);   // End outer (swallowed!)
+        resolve(l, k.qheap as *mut c_void, 0, 0, 2, k.rb as *mut c_void, 0);
+        submit(&mut k);
+        let nested_res = read(&k, 2);
+        let outer_res = nested_res[0];
+        let inner_res = nested_res[1];
+        eprintln!("[SYNTHETIC_TEST2] Nested queries: outer samples_passed = {outer_res}, inner samples_passed = {inner_res}");
+        assert_eq!(inner_res, 1024, "inner query failed to record geometry inside it");
+        if std::env::var("TOMBOX_QUERY_UNNEST").map(|v| v != "0").unwrap_or(true) {
+            // When un-nesting is enabled in query_x, outer query was ended early with 0 draws, so it returns 0!
+            assert_eq!(outer_res, 0, "outer query was expected to be 0 due to early un-nest termination");
+        } else {
+            // When un-nesting is disabled, GPU native driver counts both queries: outer gets 1024!
+            assert_eq!(outer_res, 1024, "native GPU driver counts outer query as 1024");
+        }
+
+        // Test 3: Outer query has draw BEFORE inner query begins
+        scene_on(&k, &p, k.dsv);
+        begin(l, k.qheap as *mut c_void, 0, 0); // Begin outer
+        set_pso(&k, p.wall);
+        rect(&k, [-1.0, -1.0, 0.0, 1.0, 0.2, 0.2], 1); // Draw 1 before inner: 2048 px pass
+        begin(l, k.qheap as *mut c_void, 0, 1); // Begin inner (outer ended here!)
+        set_pso(&k, p.probe);
+        stencil_ref(&k, 1);
+        rect(&k, [-1.0, -1.0, 1.0, 1.0, 0.75, 0.75], 1); // Draw 2 inside inner: 1024 px pass
+        end(l, k.qheap as *mut c_void, 0, 1);   // End inner
+        end(l, k.qheap as *mut c_void, 0, 0);   // End outer
+        resolve(l, k.qheap as *mut c_void, 0, 0, 2, k.rb as *mut c_void, 0);
+        submit(&mut k);
+        let predraw_res = read(&k, 2);
+        eprintln!("[SYNTHETIC_TEST3] Pre-draw nested: outer = {}, inner = {}", predraw_res[0], predraw_res[1]);
+
+        // Test 4: Draw AFTER inner query ends, but before outer query ends
+        scene_on(&k, &p, k.dsv);
+        begin(l, k.qheap as *mut c_void, 0, 0); // Begin outer
+        begin(l, k.qheap as *mut c_void, 0, 1); // Begin inner (outer ended here!)
+        set_pso(&k, p.probe);
+        stencil_ref(&k, 1);
+        rect(&k, [-1.0, -1.0, 1.0, 1.0, 0.75, 0.75], 1); // Draw 1 inside inner: 1024 px pass
+        end(l, k.qheap as *mut c_void, 0, 1);   // End inner
+        set_pso(&k, p.wall);
+        rect(&k, [-1.0, -1.0, 0.0, 1.0, 0.2, 0.2], 1); // Draw 2 after inner: 2048 px pass
+        end(l, k.qheap as *mut c_void, 0, 0);   // End outer
+        resolve(l, k.qheap as *mut c_void, 0, 0, 2, k.rb as *mut c_void, 0);
+        submit(&mut k);
+        let postdraw_res = read(&k, 2);
+        eprintln!("[SYNTHETIC_TEST4] Post-draw nested: outer = {}, inner = {}", postdraw_res[0], postdraw_res[1]);
+
+        restore(saved, saved_mine);
+    }
+}

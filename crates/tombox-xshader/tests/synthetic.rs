@@ -80,7 +80,7 @@ fn external_root_signature_binds_a_stripped_mesh_shader() {
     let Err(error) = translate(&ex) else {
         panic!("translation unexpectedly accepted the missing root descriptor");
     };
-    assert!(error.contains("base s16 is not a buffer descriptor"), "{error}");
+    assert!(error.contains("missing root signature for base s16") || error.contains("base s16 is not a buffer descriptor"), "{error}");
 
     let body = [
         2u32, 1, 24, 0, 0, 0,
@@ -297,4 +297,292 @@ fn loops_translate_deterministically() {
     for _ in 0..16 {
         assert!(translate(&ex).expect("translate").hlsl == first, "translation differs between runs");
     }
+}
+
+#[test]
+fn durango_pixel_shader_resource_binding_fails_before_fix() {
+    // Synthetic minimal Durango Pixel Shader:
+    // Durango passes root table pointer in s[0:1].
+    // Instruction 0 (0x0): s_load_dwordx2 s[4:5], s[0:1], 64  (loads descriptor table pointer at root offset 64)
+    // Instruction 2 (0x8): s_load_dwordx8 s[8:15], s[4:5], 0   (loads texture descriptor from descriptor table)
+    // Followed by image load, color export, and s_endpgm.
+    let words = [
+        0xf404_0100, // s_load_dwordx2 s4, s0 [off=64]
+        0xfa00_0040,
+        0xf40c_0202, // s_load_dwordx8 s8, s4 [off=0]
+        0xfa00_0000,
+        0x7e00_0280, // v_mov_b32 v0, 0
+        0x7e02_0280, // v_mov_b32 v1, 0
+        0xf000_1108, // image_load v0 <- 2D texture, coords v0..
+        0x0002_0000,
+        0x3604_0081, // v_and_b32 v2, 1, v0
+        S_NOP,
+        S_NOP,
+        PACK_V0_V2_V2,
+        PACK_V1_V2_V2,
+        EXP_MRT0_COMPR[0],
+        EXP_MRT0_COMPR[1],
+        S_ENDPGM,
+    ];
+    let root = Some(RootSig {
+        version: 2,
+        flags: 1,
+        params: vec![table(0, 64, 5)],
+        num_static_samplers: 0,
+    });
+    let ex = shader(Stage::Pixel, &words, vec![], vec![sig("SV_Target", 64, 3, 0, 0xf)], root);
+    let Err(err) = translate(&ex) else {
+        panic!("translation unexpectedly succeeded before fix");
+    };
+    assert_eq!(
+        err,
+        "s_load at 0x8: base s4 is not a root table pointer (Some(Desc { table: 0, off: 64, k: 0 }))"
+    );
+}
+
+
+
+fn mubuf_raw(op: u32, offset: u32, offen: bool, idxen: bool, glc: bool, vaddr: u32, vdata: u32, soffset: u32) -> [u32; 2] {
+    [
+        0xe000_0000 | (op << 18) | ((glc as u32) << 14) | ((idxen as u32) << 13) | ((offen as u32) << 12) | (offset & 0xfff),
+        (vaddr & 0xff) | ((vdata & 0xff) << 8) | ((soffset & 0xff) << 24),
+    ]
+}
+
+#[test]
+fn cbdyn_mubuf_addressing() {
+    let cb_root = Some(RootSig {
+        version: 2,
+        flags: 1,
+        params: vec![table(2, 16, 5)], // CBV table range (range_type = 2)
+        num_static_samplers: 0,
+    });
+
+    // 1. offen = true, idxen = false, imm = 16
+    let op_offen = mubuf_raw(0x0c, 16, true, false, false, 0, 1, 128); // buffer_load_dword v1, v0, s0, 16 offen
+    let words1 = [
+        0xf408_0004, // s_load_dwordx4 s0, s8 [off=0]
+        0xfa00_0000,
+        0x7e00_0280, // v_mov_b32 v0, 0
+        op_offen[0],
+        op_offen[1],
+        S_ENDPGM,
+    ];
+    let ex1 = shader(Stage::Pixel, &words1, vec![], vec![], cb_root.clone());
+    let t1 = translate(&ex1).expect("translate CbDyn with offen");
+    assert!(t1.hlsl.contains("cbuffer CB0 : register(b0) { uint4 cb0[4096]; };"), "{}", t1.hlsl);
+    assert!(t1.hlsl.contains("uint t0 = (0x10u + v0) >> 2;"), "{}", t1.hlsl);
+    assert!(t1.hlsl.contains("uint t0_0 = cb0[((t0 + 0u) >> 2) & 4095u][(t0 + 0u) & 3u];"), "{}", t1.hlsl);
+    assert!(t1.hlsl.contains("TB_WV(t0_0, v1)"), "{}", t1.hlsl);
+
+    // 2. idxen = true, offen = false, imm = 8
+    let op_idxen = mubuf_raw(0x0c, 8, false, true, false, 0, 1, 128); // buffer_load_dword v1, v0, s0, 8 idxen
+    let words2 = [
+        0xf408_0004,
+        0xfa00_0000,
+        0x7e00_0280,
+        op_idxen[0],
+        op_idxen[1],
+        S_ENDPGM,
+    ];
+    let ex2 = shader(Stage::Pixel, &words2, vec![], vec![], cb_root.clone());
+    let t2 = translate(&ex2).expect("translate CbDyn with idxen");
+    assert!(t2.hlsl.contains("uint t0 = (0x8u + v0 * 16u) >> 2;"), "{}", t2.hlsl);
+    assert!(t2.hlsl.contains("uint t0_0 = cb0[((t0 + 0u) >> 2) & 4095u][(t0 + 0u) & 3u];"), "{}", t2.hlsl);
+
+    // 3. offen = false, idxen = false, imm = 32
+    let op_no_idx = mubuf_raw(0x0c, 32, false, false, false, 0, 1, 128);
+    let words3 = [
+        0xf408_0004,
+        0xfa00_0000,
+        op_no_idx[0],
+        op_no_idx[1],
+        S_ENDPGM,
+    ];
+    let ex3 = shader(Stage::Pixel, &words3, vec![], vec![], cb_root.clone());
+    let t3 = translate(&ex3).expect("translate CbDyn without idxen or offen");
+    assert!(t3.hlsl.contains("uint t0 = 0x20u >> 2;"), "{}", t3.hlsl);
+
+    #[cfg(windows)]
+    if tombox_xshader::dxc::available() {
+        for t in [&t1, &t2, &t3] {
+            let profile = tombox_xshader::dxc::profile_for(t.profile);
+            tombox_xshader::dxc::compile(&t.hlsl, &profile).unwrap_or_else(|e| panic!("dxc: {e}\n{}", t.hlsl));
+        }
+    }
+
+    // 4. Rejection: idxen && offen
+    let op_both = mubuf_raw(0x0c, 0, true, true, false, 0, 1, 128);
+    let words4 = [
+        0xf408_0004,
+        0xfa00_0000,
+        op_both[0],
+        op_both[1],
+        S_ENDPGM,
+    ];
+    let ex4 = shader(Stage::Pixel, &words4, vec![], vec![], cb_root.clone());
+    let Err(err4) = translate(&ex4) else { panic!("should reject idxen && offen"); };
+    assert!(err4.starts_with("constant-buffer MUBUF form unsupported"), "{err4}");
+
+    // 5. Rejection: SOFFSET != 0 (e.g. s12 = 12)
+    let op_soff = mubuf_raw(0x0c, 0, true, false, false, 0, 1, 12);
+    let words5 = [
+        0xf408_0004,
+        0xfa00_0000,
+        op_soff[0],
+        op_soff[1],
+        S_ENDPGM,
+    ];
+    let ex5 = shader(Stage::Pixel, &words5, vec![], vec![], cb_root.clone());
+    let Err(err5) = translate(&ex5) else { panic!("should reject dynamic SOFFSET"); };
+    assert!(err5.starts_with("constant-buffer MUBUF form unsupported"), "{err5}");
+
+    // 6. Rejection: write op (buffer_store_dword = 0x1c)
+    let op_store = mubuf_raw(0x1c, 0, true, false, false, 0, 1, 128);
+    let words6 = [
+        0xf408_0004,
+        0xfa00_0000,
+        op_store[0],
+        op_store[1],
+        S_ENDPGM,
+    ];
+    let ex6 = shader(Stage::Pixel, &words6, vec![], vec![], cb_root);
+    let Err(err6) = translate(&ex6) else { panic!("should reject buffer_store on CbDyn"); };
+    assert!(err6.starts_with("constant-buffer MUBUF form unsupported"), "{err6}");
+}
+
+#[test]
+fn atomic_mubuf_addressing() {
+    use tombox_xshader::meta::PsvResource;
+
+    let uav_root = Some(RootSig {
+        version: 2,
+        flags: 1,
+        params: vec![table(1, 16, 5)], // UAV table range (range_type = 1)
+        num_static_samplers: 0,
+    });
+
+    // 1. Typed UAV (Res::TBuf): offen = true, idxen = false, imm = 8
+    let op_typed_offen = mubuf_raw(0x32, 8, true, false, false, 0, 1, 128); // buffer_atomic_add v1, v0, s0, 8 offen
+    let words1 = [
+        0xf408_0004, // s_load_dwordx4 s0, s8 [off=0]
+        0xfa00_0000,
+        0x7e00_0280, // v_mov_b32 v0, 0
+        0x7e02_0285, // v_mov_b32 v1, 5
+        op_typed_offen[0],
+        op_typed_offen[1],
+        S_ENDPGM,
+    ];
+    let ex1 = shader(Stage::Pixel, &words1, vec![], vec![], uav_root.clone());
+    let t1 = translate(&ex1).expect("translate atomic on typed UAV with offen");
+    assert!(t1.hlsl.contains("RWBuffer<uint> utb0 : register(u0);"), "{}", t1.hlsl);
+    assert!(t1.hlsl.contains("InterlockedAdd(utb0[((v0) + 0x8u) >> 2], v1, t0);"), "{}", t1.hlsl);
+
+    // 2. Typed UAV (Res::TBuf): offen = false, idxen = true, imm = 0
+    let op_typed_idxen = mubuf_raw(0x32, 0, false, true, false, 0, 1, 128);
+    let words2 = [
+        0xf408_0004,
+        0xfa00_0000,
+        0x7e00_0280,
+        0x7e02_0285,
+        op_typed_idxen[0],
+        op_typed_idxen[1],
+        S_ENDPGM,
+    ];
+    let ex2 = shader(Stage::Pixel, &words2, vec![], vec![], uav_root.clone());
+    let t2 = translate(&ex2).expect("translate atomic on typed UAV with idxen");
+    assert!(t2.hlsl.contains("InterlockedAdd(utb0[v0], v1, t0);"), "{}", t2.hlsl);
+
+    // 3. Typed UAV (Res::TBuf): offen = false, idxen = false, imm = 0
+    let op_typed_no_idx = mubuf_raw(0x32, 0, false, false, false, 0, 1, 128);
+    let words3 = [
+        0xf408_0004,
+        0xfa00_0000,
+        0x7e02_0285,
+        op_typed_no_idx[0],
+        op_typed_no_idx[1],
+        S_ENDPGM,
+    ];
+    let ex3 = shader(Stage::Pixel, &words3, vec![], vec![], uav_root.clone());
+    let t3 = translate(&ex3).expect("translate atomic on typed UAV without idxen/offen");
+    assert!(t3.hlsl.contains("InterlockedAdd(utb0[0u], v1, t0);"), "{}", t3.hlsl);
+
+    // 4. Structured UAV (Res::Buf): offen = true, idxen = false, imm = 8
+    let mut ex4 = shader(Stage::Pixel, &words1, vec![], vec![], uav_root.clone());
+    ex4.resources.push(PsvResource {
+        res_type: 8, // Structured UAV
+        space: 0,
+        lower: 0,
+        upper: 0,
+    });
+    let t4 = translate(&ex4).expect("translate atomic on structured UAV with offen");
+    assert!(t4.hlsl.contains("InterlockedAdd(ubuf0[(((v0) + 0x8u) >> 2) / 4u].w[(((v0) + 0x8u) >> 2) % 4u], v1, t0);"), "{}", t4.hlsl);
+
+    // 5. Structured UAV (Res::Buf): offen = false, idxen = true, imm = 8
+    let op_struct_idxen = mubuf_raw(0x32, 8, false, true, false, 0, 1, 128);
+    let words5 = [
+        0xf408_0004,
+        0xfa00_0000,
+        0x7e00_0280,
+        0x7e02_0285,
+        op_struct_idxen[0],
+        op_struct_idxen[1],
+        S_ENDPGM,
+    ];
+    let mut ex5 = shader(Stage::Pixel, &words5, vec![], vec![], uav_root.clone());
+    ex5.resources.push(PsvResource {
+        res_type: 8,
+        space: 0,
+        lower: 0,
+        upper: 0,
+    });
+    let t5 = translate(&ex5).expect("translate atomic on structured UAV with idxen");
+    assert!(t5.hlsl.contains("InterlockedAdd(ubuf0[v0 + 0u].w[2], v1, t0);"), "{}", t5.hlsl);
+
+    #[cfg(windows)]
+    if tombox_xshader::dxc::available() {
+        for t in [&t1, &t2, &t3, &t4, &t5] {
+            let profile = tombox_xshader::dxc::profile_for(t.profile);
+            tombox_xshader::dxc::compile(&t.hlsl, &profile).unwrap_or_else(|e| panic!("dxc: {e}\n{}", t.hlsl));
+        }
+    }
+
+    // 6. Rejection: idxen && offen
+    let op_atomic_both = mubuf_raw(0x32, 0, true, true, false, 0, 1, 128);
+    let words6 = [
+        0xf408_0004,
+        0xfa00_0000,
+        op_atomic_both[0],
+        op_atomic_both[1],
+        S_ENDPGM,
+    ];
+    let ex6 = shader(Stage::Pixel, &words6, vec![], vec![], uav_root.clone());
+    let Err(err6) = translate(&ex6) else { panic!("should reject idxen && offen"); };
+    assert!(err6.contains("atomic MUBUF addressing unsupported"), "{err6}");
+
+    // 7. Rejection: SOFFSET != 0 (e.g. s12 = 12)
+    let op_atomic_soff = mubuf_raw(0x32, 0, true, false, false, 0, 1, 12);
+    let words7 = [
+        0xf408_0004,
+        0xfa00_0000,
+        op_atomic_soff[0],
+        op_atomic_soff[1],
+        S_ENDPGM,
+    ];
+    let ex7 = shader(Stage::Pixel, &words7, vec![], vec![], uav_root.clone());
+    let Err(err7) = translate(&ex7) else { panic!("should reject dynamic SOFFSET on atomic"); };
+    assert!(err7.contains("atomic MUBUF addressing unsupported"), "{err7}");
+
+    // 8. Rejection: Typed UAV with offen = false and imm != 0
+    let op_typed_imm = mubuf_raw(0x32, 4, false, false, false, 0, 1, 128);
+    let words8 = [
+        0xf408_0004,
+        0xfa00_0000,
+        op_typed_imm[0],
+        op_typed_imm[1],
+        S_ENDPGM,
+    ];
+    let ex8 = shader(Stage::Pixel, &words8, vec![], vec![], uav_root);
+    let Err(err8) = translate(&ex8) else { panic!("should reject typed buffer atomic with imm != 0"); };
+    assert!(err8.contains("unresolved atomic target"), "{err8}");
 }

@@ -1333,6 +1333,10 @@ struct BufCase {
 }
 
 fn run_buf_cases(group: &str, cs: &[BufCase]) {
+    run_custom_buf_cases(group, cs, &BUF);
+}
+
+fn run_custom_buf_cases(group: &str, cs: &[BufCase], init_buf: &[u32]) {
     let root = tombox_xshader::meta::RootSig { version: 2, flags: 1, params: vec![rtable(1, 8)], num_static_samplers: 0 };
     let mut fails = Vec::new();
     let mut all: std::collections::BTreeSet<&str> = Default::default();
@@ -1349,7 +1353,7 @@ fn run_buf_cases(group: &str, cs: &[BufCase]) {
         }
         let mut p = Prog::new();
         p.raw(&if rt { vop::opaque(&c.pre) } else { c.pre.clone() }).raw(&[0xf408_0004, 0xfa00_0000]).raw(&c.op).raw(&[vop1(1, 0, v(4)), vop1(1, 1, v(5))]);
-        match run_res_ex(&p.words(), root.clone(), Some(&BUF), None, sampler(0, 3, 0), rt) {
+        match run_res_ex(&p.words(), root.clone(), Some(init_buf), None, sampler(0, 3, 0), rt) {
             Ok(o) => {
                 let mut ok = o.rt[..c.rt.len()] == c.rt[..];
                 let mut got = Vec::new();
@@ -1435,6 +1439,204 @@ fn mubuf_scalar_offset() {
         });
     }
     run_buf_cases("mubuf_soffset", &cases);
+}
+
+#[test]
+fn mubuf_dynamic_soffset_synthetic_test() {
+    let mut cases = Vec::new();
+    let mut init_buf = [0u32; 256];
+    init_buf[..8].copy_from_slice(&BUF);
+    init_buf[255] = 0xfeed_cafe;
+
+    let with_soffset = |opcode, immediate, offen| {
+        let mut words = mubuf(opcode, immediate, offen, false, false, 1, 4);
+        words[1] = (words[1] & 0x00ff_ffff) | (12 << 24);
+        words
+    };
+
+    let value = 0x1234_56ab;
+
+    // Group 1: Zero SOFFSET
+    // (scalar, vector, immediate, offen, expected_word)
+    for (scalar, vector, immediate, offen, word) in [
+        (0u32, 0u32, 0u32, false, 0usize),
+        (0, 4, 0, true, 1),
+        (0, 0, 8, false, 2),
+    ] {
+        let mut pre = Prog::new();
+        pre.sv(12, scalar).vv(1, vector).vv(4, value);
+        cases.push(BufCase {
+            m: "buffer_load_dword",
+            pre: pre.w.clone(),
+            op: with_soffset(0x0c, immediate, offen),
+            rt: vec![init_buf[word]],
+            mem: vec![],
+        });
+        cases.push(BufCase {
+            m: "buffer_store_dword",
+            pre: pre.w,
+            op: with_soffset(0x1c, immediate, offen),
+            rt: vec![],
+            mem: vec![(word, value), (word ^ 1, init_buf[word ^ 1])],
+        });
+    }
+
+    // Group 2: Positive values (4, 8, 16, combined)
+    for (scalar, vector, immediate, offen, word) in [
+        (4u32, 0u32, 0u32, false, 1usize),
+        (8, 0, 0, false, 2),
+        (16, 0, 0, false, 4),
+        (16, 8, 4, true, 7),
+    ] {
+        let mut pre = Prog::new();
+        pre.sv(12, scalar).vv(1, vector).vv(4, value);
+        cases.push(BufCase {
+            m: "buffer_load_dword",
+            pre: pre.w.clone(),
+            op: with_soffset(0x0c, immediate, offen),
+            rt: vec![init_buf[word]],
+            mem: vec![],
+        });
+        cases.push(BufCase {
+            m: "buffer_store_dword",
+            pre: pre.w,
+            op: with_soffset(0x1c, immediate, offen),
+            rt: vec![],
+            mem: vec![(word, value), (word ^ 1, init_buf[word ^ 1])],
+        });
+    }
+
+    // Group 3: MSB set (0x8000_0000, 0xffff_fff0 OOB, and wrapping into valid buffer)
+    // 3a: OOB cases - load returns 0, store is suppressed
+    for (scalar, vector, immediate, offen) in [
+        (0x8000_0000u32, 0u32, 0u32, false),
+        (0xffff_fff0u32, 0u32, 0u32, false),
+    ] {
+        let mut pre = Prog::new();
+        pre.sv(12, scalar).vv(1, vector).vv(4, value);
+        cases.push(BufCase {
+            m: "buffer_load_dword",
+            pre: pre.w.clone(),
+            op: with_soffset(0x0c, immediate, offen),
+            rt: vec![0u32], // OOB load returns 0
+            mem: vec![],
+        });
+        cases.push(BufCase {
+            m: "buffer_store_dword",
+            pre: pre.w,
+            op: with_soffset(0x1c, immediate, offen),
+            rt: vec![],
+            mem: vec![(0, init_buf[0]), (1, init_buf[1])], // store suppressed
+        });
+    }
+    // 3b: Wrapping cases: (soffset + voffset) wraps modulo 2^32 into valid buffer
+    // 0xffff_fffc (-4) + 0x10 (16) = 0x0c (word 3)
+    // 0xffff_fff0 (-16) + 0x20 (32) = 0x10 (word 4)
+    for (scalar, vector, immediate, offen, word) in [
+        (0xffff_fffcu32, 0x10u32, 0u32, true, 3usize),
+        (0xffff_fff0u32, 0x20u32, 0u32, true, 4usize),
+    ] {
+        let mut pre = Prog::new();
+        pre.sv(12, scalar).vv(1, vector).vv(4, value);
+        cases.push(BufCase {
+            m: "buffer_load_dword",
+            pre: pre.w.clone(),
+            op: with_soffset(0x0c, immediate, offen),
+            rt: vec![init_buf[word]],
+            mem: vec![],
+        });
+        cases.push(BufCase {
+            m: "buffer_store_dword",
+            pre: pre.w,
+            op: with_soffset(0x1c, immediate, offen),
+            rt: vec![],
+            mem: vec![(word, value), (word ^ 1, init_buf[word ^ 1])],
+        });
+    }
+
+    // Group 4: Boundary values (near buffer size 1024 bytes = 256 dwords)
+    // In-bounds:
+    // soffset = 28 (word 7, last word of BUF): loads BUF[7], stores word 7
+    // soffset = 1020 (word 255, last word of 1024-byte buffer): loads init_buf[255]=0xfeed_cafe, stores word 255
+    for (scalar, vector, immediate, offen, word) in [
+        (28u32, 0u32, 0u32, false, 7usize),
+        (1020u32, 0u32, 0u32, false, 255usize),
+    ] {
+        let mut pre = Prog::new();
+        pre.sv(12, scalar).vv(1, vector).vv(4, value);
+        cases.push(BufCase {
+            m: "buffer_load_dword",
+            pre: pre.w.clone(),
+            op: with_soffset(0x0c, immediate, offen),
+            rt: vec![init_buf[word]],
+            mem: vec![],
+        });
+        cases.push(BufCase {
+            m: "buffer_store_dword",
+            pre: pre.w,
+            op: with_soffset(0x1c, immediate, offen),
+            rt: vec![],
+            mem: vec![(word, value), (0, init_buf[0])],
+        });
+    }
+    // Out-of-bounds on and beyond boundary:
+    // soffset = 1024 (word 256: first word OOB)
+    // soffset = 1028 (word 257: word OOB)
+    for (scalar, vector, immediate, offen) in [
+        (1024u32, 0u32, 0u32, false),
+        (1028u32, 0u32, 0u32, false),
+    ] {
+        let mut pre = Prog::new();
+        pre.sv(12, scalar).vv(1, vector).vv(4, value);
+        cases.push(BufCase {
+            m: "buffer_load_dword",
+            pre: pre.w.clone(),
+            op: with_soffset(0x0c, immediate, offen),
+            rt: vec![0u32], // OOB returns 0
+            mem: vec![],
+        });
+        cases.push(BufCase {
+            m: "buffer_store_dword",
+            pre: pre.w,
+            op: with_soffset(0x1c, immediate, offen),
+            rt: vec![],
+            mem: vec![(0, init_buf[0]), (255, init_buf[255])], // store suppressed
+        });
+    }
+
+    run_custom_buf_cases("mubuf_dynamic_soffset_synthetic", &cases, &init_buf);
+}
+
+#[test]
+#[ignore]
+fn print_mubuf_dynamic_soffset_hlsl() {
+    let with_soffset = |opcode, immediate, offen| {
+        let mut words = mubuf(opcode, immediate, offen, false, false, 1, 4);
+        words[1] = (words[1] & 0x00ff_ffff) | (12 << 24);
+        words
+    };
+    let root = tombox_xshader::meta::RootSig { version: 2, flags: 1, params: vec![rtable(1, 8)], num_static_samplers: 0 };
+
+    println!("=== 1. buffer_load_dword with dynamic s12 (offen=false, imm=0) ===");
+    let mut p = Prog::new();
+    p.sv(12, 0).raw(&[0xf408_0004, 0xfa00_0000]).raw(&with_soffset(0x0c, 0, false)).raw(&[vop1(1, 0, v(4))]);
+    if let Ok(t) = translate(&shader_root(&p.words(), root.clone())) {
+        println!("{}", t.hlsl);
+    }
+
+    println!("=== 2. buffer_store_dword with dynamic s12 (offen=true, imm=4) ===");
+    let mut p = Prog::new();
+    p.sv(12, 16).vv(1, 8).vv(4, 0x1234_56ab).raw(&[0xf408_0004, 0xfa00_0000]).raw(&with_soffset(0x1c, 4, true)).raw(&[vop1(1, 0, v(4))]);
+    if let Ok(t) = translate(&shader_root(&p.words(), root.clone())) {
+        println!("{}", t.hlsl);
+    }
+
+    println!("=== 3. buffer_load_dword with dynamic s12 wrapping (offen=true, imm=0) ===");
+    let mut p = Prog::new();
+    p.sv(12, 0xffff_fffc).vv(1, 0x10).raw(&[0xf408_0004, 0xfa00_0000]).raw(&with_soffset(0x0c, 0, true)).raw(&[vop1(1, 0, v(4))]);
+    if let Ok(t) = translate(&shader_root(&p.words(), root)) {
+        println!("{}", t.hlsl);
+    }
 }
 
 #[test]

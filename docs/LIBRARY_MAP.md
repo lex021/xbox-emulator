@@ -31,7 +31,7 @@ Upstream's metric set (same definitions as upstream `tools/progress/gen.py`, For
 | shader_stages | 0 | 8 | 0.0 |
 | milestones | 9 | 18 | 50.0 |
 | titles_examined | 6 | - | - |
-| console_exports | 2131 | 2155 | 98.89 |
+| console_exports | 2134 | 2155 | 99.03 |
 | shader_compile_lobby_frame | 139 | 139 | 100.0 |
 | shader_compile_fixtures | 25 | 25 | 100.0 |
 | shader_compile_full_sweep | not published | 105506 | - |
@@ -41,7 +41,7 @@ Upstream's metric set (same definitions as upstream `tools/progress/gen.py`, For
 | title_imports_Terraria | 61 | 61 | 100.0 |
 | title_imports_Trackmania | 48 | 48 | 100.0 |
 | title_imports_Minecraft | 34 | 35 | 97.14 |
-| console_exports_targeted | 2131 | 2153 | 98.98 |
+| console_exports_targeted | 2134 | 2153 | 99.12 |
 | console_exports_not_targeted | not published | 2 | - |
 
 Shader compile: all 139 shaders of the lobby frame compile with DXC (TomBox `docs/DEVELOPMENT_LOG.md:894`); 25/25 fixtures compile (`:672`). The full-library compile sweep (`:706`) has no published final count, so no compile badge is shown.
@@ -1075,7 +1075,7 @@ Console-related exports of the DLLs in each title's EmbeddedXvd `Windows\System3
 | GDK XLaunchUri (QueryApiImpl) | xgameruntime QueryApiImpl (title call sites, analysis/gdk) | no | 3 | 3 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 1 | 3 | 1 | 1 |  |
 | GDK XNetworking (QueryApiImpl) | xgameruntime QueryApiImpl (title call sites, analysis/gdk) | no | 16 | 16 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 9 | 9 | 14 | 9 | 9 |  |
 | GDK XPackage (QueryApiImpl) | xgameruntime QueryApiImpl (title call sites, analysis/gdk) | no | 24 | 24 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 12 | 3 | 18 | 5 | 1 |  |
-| GDK XPersistentLocalStorage (QueryApiImpl) | xgameruntime QueryApiImpl (title call sites, analysis/gdk) | no | 5 | 3 | 0 | 0 | 0 | 0 | 2 | 0 | 0 | 0 | 2 | 2 | 2 | 2 | 5 |  |
+| GDK XPersistentLocalStorage (QueryApiImpl) | xgameruntime QueryApiImpl (title call sites, analysis/gdk) | no | 5 | 5 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 2 | 2 | 2 | 2 | 5 |  |
 | GDK XStore (QueryApiImpl) | xgameruntime QueryApiImpl (title call sites, analysis/gdk) | no | 71 | 71 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 22 | 24 | 71 | 21 | 24 |  |
 | GDK XSystem (QueryApiImpl) | xgameruntime QueryApiImpl (title call sites, analysis/gdk) | no | 4 | 4 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 2 | 1 | 3 | 1 | 2 |  |
 | GDK XSystemAnalytics (QueryApiImpl) | xgameruntime QueryApiImpl (title call sites, analysis/gdk) | no | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 1 | 1 | 1 | 1 |  |
@@ -1092,7 +1092,7 @@ Console-related exports of the DLLs in each title's EmbeddedXvd `Windows\System3
 | MFH264Enc.dll | System32 | yes | 2 | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite None; XDefiant None; Terraria None; Trackmania None |
 | mfhevcdec.dll | System32 | no | 5 | 5 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite None; XDefiant None; Terraria None; Trackmania None |
 | mflnmhelp.dll | System32 | no | 15 | 15 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite None; XDefiant None; Terraria None; Trackmania None |
-| mfplat.dll | System32 | yes | 8 | 6 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 1 | 0 | 0 | 0 | 0 | Fortnite None; XDefiant None; Terraria None; Trackmania None |
+| mfplat.dll | System32 | yes | 8 | 6 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 0 | Fortnite None; XDefiant None; Terraria None; Trackmania None |
 | minappmodelx.dll | System32 | no | 4 | 4 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 4 | 4 | 4 | 4 | 4 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | minuserx.dll | System32 | no | 74 | 36 | 38 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 9 | 10 | 12 | 13 | 15 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | msave64xgs.dll | System32 | no | 24 | 24 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
@@ -1151,7 +1151,7 @@ Console-related exports of the DLLs in each title's EmbeddedXvd `Windows\System3
 
 ### Not targeted (no analysed title references them)
 
-The console-library total above (2155 exports in 110 libraries) keeps every console-only export in the denominator, including devkit, tools and OS service DLLs that no analysed title imports. 108 libraries (2153 exports) are imported by at least one title, directly or through API-set host attribution, or are emulator-provided; the 2 below (2 exports) are not targeted: no title EXE or shipped DLL imports any of their exports and the emulator does not provide them. They stay `missing` in the headline instead of being dropped from it, so the percentage is not inflated; a library moves out of this list as soon as a title imports it or an emulator crate exports it. The earlier Xbox-only figure (2078 exports) counted only DLLs with no same-named PC DLL and is kept in `summary.json` under `all_including_pc`. Coverage inside the 108 targeted libraries alone: 2131/2153.
+The console-library total above (2155 exports in 110 libraries) keeps every console-only export in the denominator, including devkit, tools and OS service DLLs that no analysed title imports. 108 libraries (2153 exports) are imported by at least one title, directly or through API-set host attribution, or are emulator-provided; the 2 below (2 exports) are not targeted: no title EXE or shipped DLL imports any of their exports and the emulator does not provide them. They stay `missing` in the headline instead of being dropped from it, so the percentage is not inflated; a library moves out of this list as soon as a title imports it or an emulator crate exports it. The earlier Xbox-only figure (2078 exports) counted only DLLs with no same-named PC DLL and is kept in `summary.json` under `all_including_pc`. Coverage inside the 108 targeted libraries alone: 2134/2153.
 
 | Library | Folder | Same-named PC DLL | Console-only exports | Present in |
 |---|---|---|---|---|
@@ -2483,15 +2483,15 @@ No PC DLL is named advapi32legacy.dll; it is emulated by its compat crate, so no
 
 </details>
 
-<details><summary><b>GDK XPersistentLocalStorage (QueryApiImpl)</b>: 5 console-only exports, 3 covered</summary>
+<details><summary><b>GDK XPersistentLocalStorage (QueryApiImpl)</b>: 5 console-only exports, 5 covered</summary>
 
 | Function | Status | Imported by | Present in |
 |---|---|---|---|
 | `XPersistentLocalStorage(d29411df) slot 3 (pls_path_size)` | implemented | Minecraft, Terraria, Trackmania, XDefiant | Minecraft, Terraria, Trackmania, XDefiant |
+| `XPersistentLocalStorage(d29411df) slot 6 (pls_prompt_async)` | implemented | Minecraft | Minecraft |
+| `XPersistentLocalStorage(d29411df) slot 7 (pls_prompt_result_slot)` | implemented | Minecraft | Minecraft |
 | `XPersistentLocalStorageGetPath` | implemented | Fortnite, Minecraft, Terraria, Trackmania, XDefiant | Fortnite, Minecraft, Terraria, Trackmania, XDefiant |
 | `XPersistentLocalStorageGetSpaceInfo` | implemented | Fortnite, Minecraft | Fortnite, Minecraft |
-| `XPersistentLocalStorage(d29411df) slot 6 (pls_prompt_async)` | pending | Minecraft | Minecraft |
-| `XPersistentLocalStorage(d29411df) slot 7 (pls_prompt_result_slot)` | pending | Minecraft | Minecraft |
 
 </details>
 
@@ -3088,7 +3088,7 @@ No PC DLL is named kernel32legacy.dll; it is emulated by its compat crate, so no
 
 </details>
 
-<details><summary><b>mfplat.dll</b>: 8 console-only exports, 7 covered</summary>
+<details><summary><b>mfplat.dll</b>: 8 console-only exports, 8 covered</summary>
 
 | Function | Status | Imported by | Present in |
 |---|---|---|---|
@@ -3099,7 +3099,7 @@ No PC DLL is named kernel32legacy.dll; it is emulated by its compat crate, so no
 | `MFResetDXGIDeviceManagerX` | implemented | Fortnite | Fortnite, XDefiant, Terraria, Trackmania |
 | `MFUnblockThread` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `MFCreateDXGISurfaceBufferX` | forwarded |  | Fortnite, XDefiant, Terraria, Trackmania |
-| `MFGetPlatform` | missing |  | Fortnite, XDefiant, Terraria, Trackmania |
+| `MFGetPlatform` | forwarded |  | Fortnite, XDefiant, Terraria, Trackmania |
 
 </details>
 

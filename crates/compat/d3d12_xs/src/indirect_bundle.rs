@@ -870,4 +870,122 @@ mod tests {
         assert_eq!(&code[0..4], b"DXBC");
         assert!(code.windows(4).any(|w| w == b"RTS0"));
     }
+
+    #[test]
+    fn conditional_bundle_executed_predicate_true_updates_pipeline_and_registers() {
+        use crate::cl2_state::{ListState, RootArg};
+
+        let mut caller = ListState {
+            open: true,
+            pso: Some(0x100),
+            topology: Some(1),
+            blend: Some(Some([0x55; 16])),
+            stencil: Some(1),
+            ..ListState::default()
+        };
+        caller.set_root(1, 0x200);
+        caller.set_const(1, 0, 0, &[42]);
+        caller.args.insert((1, 1), RootArg::Table(0x5000));
+        caller.set_vbs(0, &[Some([1; 16])]);
+
+        let mut bundle = ListState {
+            pso: Some(0x800),
+            topology: Some(4),
+            blend: Some(Some([0xaa; 16])),
+            stencil: Some(7),
+            ib: Some(Some([0xbb; 16])),
+            ..ListState::default()
+        };
+        bundle.set_root(1, 0x900);
+        bundle.set_const(1, 0, 0, &[99]);
+        bundle.set_const(1, 0, 1, &[123]);
+        bundle.args.insert((1, 2), RootArg::Table(0x7000));
+        bundle.set_vbs(1, &[Some([2; 16])]);
+
+        let pair = Pair { slot: 0, bundle: 0x8000 };
+        let record = rec(0x8000);
+        // title predicate: op 0 (EQUAL_ZERO -> run if nonzero), value = 1 (nonzero) -> predicate is TRUE
+        let title_predicate_true = Some((0, 1));
+        let will_run = runs(pair, None, 32, &record, title_predicate_true);
+        assert!(will_run, "Predicate is TRUE: bundle must execute");
+
+        // When executed, bundle state is merged into the caller's pipeline and registers
+        caller.merge_bundle(&bundle);
+
+        // Verify pipeline state after executed bundle:
+        assert_eq!(caller.pso, Some(0x800), "PSO must be updated to bundle's PSO");
+        assert_eq!(caller.root[1], Some(0x900), "Compute Root Signature must be updated to bundle's Root Signature");
+        assert_eq!(caller.topology, Some(4), "Topology must be updated to bundle's topology");
+        assert_eq!(caller.blend, Some(Some([0xaa; 16])), "Blend factor must be updated to bundle's blend");
+        assert_eq!(caller.stencil, Some(7), "Stencil ref must be updated to bundle's stencil");
+        assert_eq!(caller.ib, Some(Some([0xbb; 16])), "Index buffer must be updated to bundle's IB");
+
+        // Verify registers after executed bundle:
+        // Changing the root signature (0x200 -> 0x900) invalidates previous root bindings for that side:
+        assert_eq!(caller.args.get(&(1, 1)), None, "Previous root table at param 1 invalidated by root signature change");
+        assert_eq!(caller.args.get(&(1, 0)), Some(&RootArg::Consts([(0, 99), (1, 123)].into_iter().collect())), "Root constants must reflect bundle writes");
+        assert_eq!(caller.args.get(&(1, 2)), Some(&RootArg::Table(0x7000)), "New root table at param 2 added from bundle");
+        assert_eq!(caller.vbs.len(), 2, "Vertex buffer registers must include bundle VBs");
+    }
+
+    #[test]
+    fn conditional_bundle_skipped_predicate_false_preserves_pipeline_and_registers() {
+        use crate::cl2_state::{ListState, RootArg};
+
+        let mut caller = ListState {
+            open: true,
+            pso: Some(0x100),
+            topology: Some(1),
+            blend: Some(Some([0x55; 16])),
+            stencil: Some(1),
+            ..ListState::default()
+        };
+        caller.set_root(1, 0x200);
+        caller.set_const(1, 0, 0, &[42]);
+        caller.args.insert((1, 1), RootArg::Table(0x5000));
+        caller.set_vbs(0, &[Some([1; 16])]);
+
+        let initial_caller_state = caller.clone();
+
+        let mut bundle = ListState {
+            pso: Some(0x800),
+            topology: Some(4),
+            blend: Some(Some([0xaa; 16])),
+            stencil: Some(7),
+            ib: Some(Some([0xbb; 16])),
+            ..ListState::default()
+        };
+        bundle.set_root(1, 0x900);
+        bundle.set_const(1, 0, 0, &[99]);
+        bundle.set_const(1, 0, 1, &[123]);
+        bundle.args.insert((1, 2), RootArg::Table(0x7000));
+        bundle.set_vbs(1, &[Some([2; 16])]);
+
+        let pair = Pair { slot: 0, bundle: 0x8000 };
+        let record = rec(0x8000);
+        // title predicate: op 0 (EQUAL_ZERO -> run if nonzero), value = 0 (zero) -> predicate is FALSE (skipped)
+        let title_predicate_false = Some((0, 0));
+        let will_run = runs(pair, None, 32, &record, title_predicate_false);
+        assert!(!will_run, "Predicate is FALSE: bundle must be skipped");
+
+        // When skipped, bundle state is NOT merged; caller state remains untouched
+        if will_run {
+            caller.merge_bundle(&bundle);
+        }
+
+        // Verify pipeline state after skipped bundle is strictly preserved:
+        assert_eq!(caller.pso, initial_caller_state.pso, "PSO must remain caller's pre-call PSO");
+        assert_eq!(caller.root[1], initial_caller_state.root[1], "Root Signature must remain caller's pre-call Root Signature");
+        assert_eq!(caller.topology, initial_caller_state.topology, "Topology must remain caller's pre-call topology");
+        assert_eq!(caller.blend, initial_caller_state.blend, "Blend factor must remain caller's pre-call blend");
+        assert_eq!(caller.stencil, initial_caller_state.stencil, "Stencil ref must remain caller's pre-call stencil");
+        assert_eq!(caller.ib, initial_caller_state.ib, "Index buffer must remain caller's pre-call IB (None)");
+
+        // Verify registers after skipped bundle are strictly preserved:
+        assert_eq!(caller.args.get(&(1, 0)), Some(&RootArg::Consts([(0, 42)].into_iter().collect())), "Root constant 0 must remain 42 (caller value)");
+        assert_eq!(caller.args.get(&(1, 1)), Some(&RootArg::Table(0x5000)), "Root table 1 must remain 0x5000 (caller value)");
+        assert_eq!(caller.args.get(&(1, 2)), None, "Bundle root table 2 must NOT be bound");
+        assert_eq!(caller.vbs.len(), 1, "Vertex buffers must only contain caller's initial VB 0");
+        assert_eq!(caller, initial_caller_state, "Full command list state must match pre-call state exactly");
+    }
 }

@@ -376,3 +376,237 @@ fn conservative_z_export_variant_keeps_the_exported_depth() {
         call!(r.dev, 2, () -> u32);
     }
 }
+
+extern "system" {
+    fn LoadLibraryA(name: *const u8) -> *mut c_void;
+    fn GetProcAddress(h: *mut c_void, name: *const u8) -> *mut c_void;
+}
+
+const IID_FACTORY4: Guid = Guid { d1: 0x1bc6_ea02, d2: 0xef36, d3: 0x464f, d4: [0xbf, 0x0c, 0x21, 0xca, 0x39, 0xe5, 0x16, 0x8a] };
+const IID_ADAPTER: Guid = Guid { d1: 0x2411_e7e1, d2: 0x12ac, d3: 0x4ccf, d4: [0xbd, 0x14, 0x97, 0x98, 0xe8, 0x53, 0x4d, 0xc0] };
+const IID_QUERY_HEAP: Guid = Guid { d1: 0x0d96_58ae, d2: 0xed45, d3: 0x469e, d4: [0xa6, 0x1d, 0x97, 0x0e, 0xc5, 0x83, 0xca, 0xb4] };
+
+unsafe fn warp_adapter() -> *mut c_void {
+    let h = LoadLibraryA(b"dxgi.dll\0".as_ptr());
+    assert!(!h.is_null());
+    let p = GetProcAddress(h, b"CreateDXGIFactory2\0".as_ptr());
+    assert!(!p.is_null());
+    let create: unsafe extern "system" fn(u32, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(p);
+    let mut f: *mut c_void = core::ptr::null_mut();
+    assert!(create(0, &IID_FACTORY4, &mut f) >= 0);
+    let mut a: *mut c_void = core::ptr::null_mut();
+    assert!(call!(f, 27, (*const Guid, *mut *mut c_void) -> i32, &IID_ADAPTER, &mut a) >= 0);
+    call!(f, 2, () -> u32);
+    a
+}
+
+unsafe fn rig_warp() -> Rig {
+    unsafe {
+        crate::enable_experimental_shader_models();
+        let adapter = warp_adapter();
+        let mk: extern "system" fn(*mut c_void, u32, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(crate::host_proc(b"D3D12CreateDevice\0"));
+        let mut dev = null();
+        let hr = mk(adapter, 0xb000, &IID_DEV, &mut dev);
+        call!(adapter, 2, () -> u32);
+        assert!(hr >= 0 && !dev.is_null(), "D3D12CreateDevice(WARP) hr={hr:#010x}");
+        let qd = [0u32; 4];
+        let mut queue = null();
+        assert!(call!(dev, 8, (*const u32, *const Guid, *mut *mut c_void) -> i32, qd.as_ptr(), &IID_QUEUE, &mut queue) >= 0);
+        let vs_hi = tombox_xshader::dxc::compile(&VS.replace("TB_Z", "0.5"), "vs_6_0").expect("vs");
+        let vs_lo = tombox_xshader::dxc::compile(&VS.replace("TB_Z", "0.6"), "vs_6_0").expect("vs");
+        let mut rs = null();
+        assert!(call!(dev, 16, (u32, *const u8, usize, *const Guid, *mut *mut c_void) -> i32, 0, vs_hi.as_ptr(), vs_hi.len(), &IID_RS, &mut rs) >= 0);
+        Rig { dev, queue, rs, vs_hi, vs_lo }
+    }
+}
+
+unsafe fn pso_mask(r: &Rig, d: &Draw, samples: u32, mask: u32) -> *mut c_void {
+    let mut p = vec![0u8; 0x290];
+    p[0..8].copy_from_slice(&(r.rs as u64).to_le_bytes());
+    p[8..0x10].copy_from_slice(&(d.vs.as_ptr() as u64).to_le_bytes());
+    p[0x10..0x18].copy_from_slice(&(d.vs.len() as u64).to_le_bytes());
+    if !d.ps.is_empty() {
+        p[0x18..0x20].copy_from_slice(&(d.ps.as_ptr() as u64).to_le_bytes());
+        p[0x20..0x28].copy_from_slice(&(d.ps.len() as u64).to_le_bytes());
+    }
+    for i in 0..8 {
+        let o = 0x80 + i * 40;
+        for (k, v) in [1u32, 2, 1, 1, 2, 1, 4].iter().enumerate() {
+            put(&mut p, o + 8 + 4 * k, *v);
+        }
+        p[o + 36] = 15;
+    }
+    put(&mut p, 0x1c0, mask);
+    put(&mut p, 0x1c4, 3);
+    put(&mut p, 0x1c8, 1);
+    put(&mut p, 0x1dc, 1);
+    put(&mut p, 0x1f0, d.depth as u32);
+    put(&mut p, 0x1f4, d.write as u32);
+    put(&mut p, 0x1f8, d.func);
+    for f in [0x204usize, 0x214] {
+        for (k, v) in [1u32, 1, 1, 8].iter().enumerate() {
+            put(&mut p, f + 4 * k, *v);
+        }
+    }
+    put(&mut p, 0x23c, 3);
+    put(&mut p, 0x264, 40);
+    put(&mut p, 0x268, samples);
+    let mut out = null();
+    let hr = unsafe { call!(r.dev, 10, (*const u8, *const Guid, *mut *mut c_void) -> i32, p.as_ptr(), &IID_PSO, &mut out) };
+    assert!(hr >= 0, "pso hr={hr:#010x}");
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MaskMetrics {
+    ps_invocations: u32,
+    occlusion_samples: u64,
+}
+
+unsafe fn run_with_sample_mask(r: &Rig, d: &Draw, samples: u32, mask: u32) -> MaskMetrics {
+    unsafe {
+        let dev = r.dev;
+        let mut dd = vec![0u8; 56];
+        put(&mut dd, 0, 3);
+        dd[0x10..0x18].copy_from_slice(&(SIZE as u64).to_le_bytes());
+        put(&mut dd, 0x18, SIZE);
+        dd[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes());
+        dd[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes());
+        put(&mut dd, 0x20, 40);
+        put(&mut dd, 0x24, samples);
+        put(&mut dd, 0x30, 2);
+        let mut cv = [0u8; 0x14];
+        cv[0..4].copy_from_slice(&40u32.to_le_bytes());
+        cv[4..8].copy_from_slice(&1.0f32.to_le_bytes());
+        let depth = committed(dev, 1, &dd, 0x10, cv.as_ptr());
+        let uav = committed(dev, 1, &buffer_desc(256, 4), 8, core::ptr::null());
+        let back = committed(dev, 3, &buffer_desc(256, 0), 0x400, core::ptr::null());
+        let qback = committed(dev, 3, &buffer_desc(256, 0), 0x400, core::ptr::null());
+        let hd = [3u32, 1, 0, 0];
+        let mut heap = null();
+        assert!(call!(dev, 14, (*const u32, *const Guid, *mut *mut c_void) -> i32, hd.as_ptr(), &IID_HEAP, &mut heap) >= 0);
+        let mut dsv = 0usize;
+        call!(heap, 9, (*mut usize) -> *mut usize, &mut dsv);
+        call!(dev, 21, (*mut c_void, *const c_void, usize) -> (), depth, core::ptr::null(), dsv);
+        let qdesc: [u32; 3] = [0, 4, 0];
+        let mut qheap: *mut c_void = null();
+        assert!(call!(dev, 39, (*const u32, *const Guid, *mut *mut c_void) -> i32, qdesc.as_ptr(), &IID_QUERY_HEAP, &mut qheap) >= 0);
+        let mut alloc = null();
+        assert!(call!(dev, 9, (u32, *const Guid, *mut *mut c_void) -> i32, 0, &IID_ALLOCATOR, &mut alloc) >= 0);
+        let mut l = null();
+        assert!(call!(dev, 12, (u32, u32, *mut c_void, *mut c_void, *const Guid, *mut *mut c_void) -> i32, 0, 0, alloc, null(), &IID_LIST, &mut l) >= 0);
+        let p = pso_mask(r, d, samples, mask);
+        call!(l, 46, (u32, *const usize, i32, *const usize) -> (), 0, core::ptr::null(), 0, &dsv);
+        call!(l, 47, (usize, u32, f32, u8, u32, *const c_void) -> (), dsv, 1, 1.0f32, 0, 0, core::ptr::null());
+        call!(l, 30, (*mut c_void) -> (), r.rs);
+        let va = call!(uav, 11, () -> u64);
+        call!(l, 42, (u32, u64) -> (), 0, va);
+        let vp = [0f32, 0.0, SIZE as f32, SIZE as f32, 0.0, 1.0];
+        call!(l, 21, (u32, *const f32) -> (), 1, vp.as_ptr());
+        let sc = [0i32, 0, SIZE as i32, SIZE as i32];
+        call!(l, 22, (u32, *const i32) -> (), 1, sc.as_ptr());
+        call!(l, 20, (u32) -> (), 4);
+        call!(l, 25, (*mut c_void) -> (), p);
+        call!(l, 52, (*mut c_void, u32, u32) -> (), qheap, 0, 0);
+        call!(l, 12, (u32, u32, u32, u32) -> (), 3, 1, 0, 0);
+        call!(l, 53, (*mut c_void, u32, u32) -> (), qheap, 0, 0);
+        call!(l, 54, (*mut c_void, u32, u32, u32, *mut c_void, u64) -> (), qheap, 0, 0, 1, qback, 0);
+        let b = barrier(uav, 8, 0x800);
+        call!(l, 26, (u32, *const u8) -> (), 1, b.as_ptr());
+        call!(l, 15, (*mut c_void, u64, *mut c_void, u64, u64) -> (), back, 0, uav, 0, 4);
+        assert!(call!(l, 9, () -> i32) >= 0);
+        let mut fence = null();
+        assert!(call!(dev, 36, (u64, u32, *const Guid, *mut *mut c_void) -> i32, 0, 0, &IID_FENCE, &mut fence) >= 0);
+        let ls = [l];
+        call!(r.queue, 10, (u32, *const *mut c_void) -> (), 1, ls.as_ptr());
+        call!(r.queue, 14, (*mut c_void, u64) -> i32, fence, 1);
+        let t = std::time::Instant::now();
+        while call!(fence, 8, () -> u64) < 1 {
+            assert!(t.elapsed().as_secs() < 10, "GPU timeout");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mut cpu: *mut u8 = core::ptr::null_mut();
+        assert!(call!(back, 8, (u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut cpu) >= 0);
+        let ps_invocations = core::ptr::read_volatile(cpu as *const u32);
+        let mut qcpu: *mut u8 = core::ptr::null_mut();
+        assert!(call!(qback, 8, (u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut qcpu) >= 0);
+        let occlusion_samples = core::ptr::read_volatile(qcpu as *const u64);
+        for o in [p, fence, l, alloc, qheap, heap, qback, back, uav, depth] {
+            call!(o, 2, () -> u32);
+        }
+        MaskMetrics { ps_invocations, occlusion_samples }
+    }
+}
+
+#[test]
+fn sample_mask_ab_test_on_warp() {
+    unsafe {
+        let r = rig_warp();
+        let h = ps(false, false);
+        let shader = compile_ps(&h);
+
+        // Test 1: 1x MSAA with Pixel Shader (full-screen quad/triangle covering 64x64 = 4096 pixels)
+        let d_ps = Draw { vs: &r.vs_hi, ps: &shader, depth: true, write: true, func: 2 };
+        let m1_0 = run_with_sample_mask(&r, &d_ps, 1, 0x0);
+        let m1_all = run_with_sample_mask(&r, &d_ps, 1, 0xffff_ffff);
+        let m1_1 = run_with_sample_mask(&r, &d_ps, 1, 0x1);
+
+        // Test 2: 4x MSAA with Pixel Shader (64x64 = 4096 pixels, 4x MSAA = 16384 samples)
+        let m4_0 = run_with_sample_mask(&r, &d_ps, 4, 0x0);
+        let m4_all = run_with_sample_mask(&r, &d_ps, 4, 0xffff_ffff);
+        let m4_1 = run_with_sample_mask(&r, &d_ps, 4, 0x1);
+
+        // Test 3: Depth-only pass without Pixel Shader (UE / Fortnite occlusion query box geometry)
+        let d_nops = Draw { vs: &r.vs_hi, ps: &[], depth: true, write: true, func: 2 };
+        let occ1_0 = run_with_sample_mask(&r, &d_nops, 1, 0x0);
+        let occ1_all = run_with_sample_mask(&r, &d_nops, 1, 0xffff_ffff);
+        let occ1_1 = run_with_sample_mask(&r, &d_nops, 1, 0x1);
+
+        let occ4_0 = run_with_sample_mask(&r, &d_nops, 4, 0x0);
+        let occ4_all = run_with_sample_mask(&r, &d_nops, 4, 0xffff_ffff);
+        let occ4_1 = run_with_sample_mask(&r, &d_nops, 4, 0x1);
+
+        eprintln!("=== WARP SAMPLE MASK SYNTHETIC A/B TEST RESULTS ===");
+        eprintln!("1x MSAA with PS: mask=0x0 -> ps_invocations={}, occlusion_samples={}", m1_0.ps_invocations, m1_0.occlusion_samples);
+        eprintln!("1x MSAA with PS: mask=0xFFFFFFFF -> ps_invocations={}, occlusion_samples={}", m1_all.ps_invocations, m1_all.occlusion_samples);
+        eprintln!("1x MSAA with PS: mask=0x1 -> ps_invocations={}, occlusion_samples={}", m1_1.ps_invocations, m1_1.occlusion_samples);
+
+        eprintln!("4x MSAA with PS: mask=0x0 -> ps_invocations={}, occlusion_samples={}", m4_0.ps_invocations, m4_0.occlusion_samples);
+        eprintln!("4x MSAA with PS: mask=0xFFFFFFFF -> ps_invocations={}, occlusion_samples={}", m4_all.ps_invocations, m4_all.occlusion_samples);
+        eprintln!("4x MSAA with PS: mask=0x1 -> ps_invocations={}, occlusion_samples={}", m4_1.ps_invocations, m4_1.occlusion_samples);
+
+        eprintln!("1x MSAA Depth-only (no PS): mask=0x0 -> ps_invocations={}, occlusion_samples={}", occ1_0.ps_invocations, occ1_0.occlusion_samples);
+        eprintln!("1x MSAA Depth-only (no PS): mask=0xFFFFFFFF -> ps_invocations={}, occlusion_samples={}", occ1_all.ps_invocations, occ1_all.occlusion_samples);
+        eprintln!("1x MSAA Depth-only (no PS): mask=0x1 -> ps_invocations={}, occlusion_samples={}", occ1_1.ps_invocations, occ1_1.occlusion_samples);
+
+        eprintln!("4x MSAA Depth-only (no PS): mask=0x0 -> ps_invocations={}, occlusion_samples={}", occ4_0.ps_invocations, occ4_0.occlusion_samples);
+        eprintln!("4x MSAA Depth-only (no PS): mask=0xFFFFFFFF -> ps_invocations={}, occlusion_samples={}", occ4_all.ps_invocations, occ4_all.occlusion_samples);
+        eprintln!("4x MSAA Depth-only (no PS): mask=0x1 -> ps_invocations={}, occlusion_samples={}", occ4_1.ps_invocations, occ4_1.occlusion_samples);
+
+        // Core assertions confirming SampleMask behavior:
+        // When SampleMask = 0: exactly 0 samples pass the occlusion test!
+        assert_eq!(m1_0.occlusion_samples, 0);
+        assert_eq!(m4_0.occlusion_samples, 0);
+        assert_eq!(occ1_0.occlusion_samples, 0);
+        assert_eq!(occ4_0.occlusion_samples, 0);
+
+        // When SampleMask = 0xFFFFFFFF: all covered samples pass!
+        assert_eq!(m1_all.occlusion_samples, PIXELS as u64);
+        assert_eq!(m4_all.occlusion_samples, (PIXELS * 4) as u64);
+        assert_eq!(occ1_all.occlusion_samples, PIXELS as u64);
+        assert_eq!(occ4_all.occlusion_samples, (PIXELS * 4) as u64);
+
+        // When SampleMask = 0x1:
+        // On 1x MSAA, sample 0 is the only sample, so mask 0x1 == 0xFFFFFFFF.
+        assert_eq!(m1_1.occlusion_samples, PIXELS as u64);
+        assert_eq!(occ1_1.occlusion_samples, PIXELS as u64);
+
+        // On 4x MSAA, only sample 0 is active (1 of 4 samples per pixel), so exactly 1/4 of samples pass!
+        assert_eq!(m4_1.occlusion_samples, PIXELS as u64);
+        assert_eq!(occ4_1.occlusion_samples, PIXELS as u64);
+
+        call!(r.rs, 2, () -> u32);
+        call!(r.queue, 2, () -> u32);
+        call!(r.dev, 2, () -> u32);
+    }
+}

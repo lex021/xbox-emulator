@@ -148,6 +148,21 @@ fn translate_reports_incomplete_instruction_offset() {
 }
 
 #[test]
+fn sendmsghalt_is_decoded_and_requires_resumable_wave_support() {
+    let words = [0xbf80_0000, 0xbf91_0001, vop1(1, 0, v(1)), S_ENDPGM];
+    let ex = shader(&words, None);
+    let instructions = disassemble(&ex.isa);
+    let halt = &instructions[1];
+    assert_eq!(halt.mnemonic, "s_sendmsghalt");
+    assert_eq!(halt.aux.imm, 1);
+    assert_eq!(halt.offset, 4);
+    let err = translate(&ex).err().expect("HLSL has no resumable wave halt");
+    assert!(err.contains("SIMM16 0x0001"), "{err}");
+    assert!(err.contains("resumable halted wave"), "{err}");
+    assert!(err.contains("[s_sendmsghalt @ 0x4]"), "{err}");
+}
+
+#[test]
 fn vopc_gfx10_compare_table() {
     let cases: &[(u32, &str, bool)] = &[
         (0x10, "v_cmpx_f_f32", true),

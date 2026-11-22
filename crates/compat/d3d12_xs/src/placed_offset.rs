@@ -277,34 +277,45 @@ pub unsafe fn place_in_heap(real: *mut c_void, heap: *mut c_void, offset: u64, d
     Some(hr)
 }
 
-pub fn helper_plan(pos: u64, stride: u64, heap_off: u64) -> Option<(u64, u64)> {
+fn helper_plan(pos: u64, stride: u64, heap_off: u64) -> Option<(u64, u64)> {
     if stride == 0 {
         return None;
     }
     if pos % stride == 0 {
-        return Some((0, pos / stride));
+        return Some((heap_off, pos / stride));
     }
-    let mut m = 1u64;
-    while m <= stride && m * PAGE <= heap_off {
-        let p = pos + m * PAGE;
+    for pages in 1..=stride.min(heap_off / PAGE) {
+        let delta = pages * PAGE;
+        let p = pos.checked_add(delta)?;
         if p % stride == 0 {
-            return Some((m, p / stride));
+            return Some((heap_off - delta, p / stride));
         }
-        m += 1;
+    }
+    // A view starting later in the buffer can use a helper on a later
+    // page. The helper must start at or before the view's first byte.
+    for pages in 1..=stride.min(pos / PAGE) {
+        let delta = pages * PAGE;
+        let p = pos - delta;
+        if p % stride == 0 {
+            return Some((heap_off.checked_add(delta)?, p / stride));
+        }
     }
     None
 }
 
-unsafe fn helper(res: usize, off: Off, m: u64) -> Option<*mut c_void> {
-    if m == 0 {
+unsafe fn helper(res: usize, off: Off, heap_offset: u64) -> Option<*mut c_void> {
+    if heap_offset == off.heap_off {
         return Some(res as *mut c_void);
     }
-    if let Some(h) = HELPERS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|t| t.get(&(res, m)).copied()) {
+    let end = off.heap_off.checked_add(off.bytes)?.checked_add(off.width)?;
+    let width = end.checked_sub(heap_offset).filter(|&width| width != 0)?;
+    let key = (res, heap_offset);
+    if let Some(h) = HELPERS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|t| t.get(&key).copied()) {
         return Some(h as *mut c_void);
     }
     let mut d = [0u8; 0x38];
     d[0..4].copy_from_slice(&1u32.to_le_bytes());
-    d[0x10..0x18].copy_from_slice(&(m * PAGE + off.bytes + off.width).to_le_bytes());
+    d[0x10..0x18].copy_from_slice(&width.to_le_bytes());
     d[0x18..0x1c].copy_from_slice(&1u32.to_le_bytes());
     d[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes());
     d[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes());
@@ -315,24 +326,35 @@ unsafe fn helper(res: usize, off: Off, m: u64) -> Option<*mut c_void> {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(*vt(real).add(DEV_PLACED)) };
     let mut h: *mut c_void = core::ptr::null_mut();
     let hr = if crate::title_shadow::is_shadow_heap(off.heap) {
-        unsafe { crate::title_shadow::place_helper(real, off.heap, off.heap_off - m * PAGE, &d, &mut h) }
+        unsafe { crate::title_shadow::place_helper(real, off.heap, heap_offset, &d, &mut h) }
     } else {
-        unsafe { f(real, off.heap as *mut c_void, off.heap_off - m * PAGE, d.as_ptr(), 0, core::ptr::null(), &IID_RESOURCE, &mut h) }
+        unsafe { f(real, off.heap as *mut c_void, heap_offset, d.as_ptr(), 0, core::ptr::null(), &IID_RESOURCE, &mut h) }
     };
     if hr < 0 || h.is_null() {
-        record("d3d12_xs", "placed_offset", &format!("view helper buffer at heap {:#x}+{:#x} hr={hr:#010x}", off.heap, off.heap_off - m * PAGE));
+        record("d3d12_xs", "placed_offset", &format!("view helper buffer at heap {:#x}+{heap_offset:#x} hr={hr:#010x}", off.heap));
         return None;
     }
-    HELPERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert((res, m), h as usize);
-    Some(h)
+    let cached = {
+        let mut helpers = HELPERS.lock().unwrap_or_else(|e| e.into_inner());
+        *helpers.get_or_insert_with(HashMap::new).entry(key).or_insert(h as usize)
+    };
+    if cached != h as usize {
+        crate::title_shadow::helper_gone(h as usize);
+        unsafe { release(h) };
+    }
+    Some(cached as *mut c_void)
 }
 
 pub unsafe fn exact_view(res: usize, view: &mut [u8], at: crate::console_slots_dev2::BufferView) -> Option<*mut c_void> {
     let off = of(res)?;
     let e = crate::console_slots_dev2::element_bytes(view, at)? as u64;
     let first = u64::from_le_bytes(view[at.first..at.first + 8].try_into().unwrap());
-    let (m, f) = helper_plan(off.bytes + first * e, e, off.heap_off)?;
-    let target = unsafe { helper(res, off, m) }?;
+    let first_byte = first.checked_mul(e)?;
+    if first_byte >= off.width {
+        return None;
+    }
+    let (heap_offset, f) = helper_plan(off.bytes.checked_add(first_byte)?, e, off.heap_off)?;
+    let target = unsafe { helper(res, off, heap_offset) }?;
     view[at.first..at.first + 8].copy_from_slice(&f.to_le_bytes());
     Some(target)
 }
@@ -351,7 +373,7 @@ fn uneven(what: &str, o: u64, view: &[u8], at: crate::console_slots_dev2::Buffer
     let n = UNEVEN.fetch_add(1, Ordering::Relaxed);
     if n < 16 || n.is_power_of_two() {
         let e = crate::console_slots_dev2::element_bytes(view, at);
-        record("d3d12_xs", "placed_offset", &format!("{what} on a buffer {o:#x} bytes into its 64 KB page: element size {e:?} does not divide the offset and no 64 KB step below it in the heap lines up, so the PC view starts {} bytes early (#{})", e.map_or(0, |e| o % e as u64), n + 1));
+        record("d3d12_xs", "placed_offset", &format!("{what} on a buffer {o:#x} bytes into its 64 KB page: element size {e:?} does not divide the offset and no helper lines up, so the PC view starts {} bytes early (#{})", e.map_or(0, |e| o % e as u64), n + 1));
     }
 }
 
@@ -720,6 +742,30 @@ mod tests {
             assert!((0x2200..0x3000).all(|i| *m.add(i) == 0x5c));
             assert!((0..0x2000).all(|i| *m.add(i) == 0xaa));
             vc!(rb, 9, fn(u32, *const c_void) -> (), 0, core::ptr::null());
+
+            let dd = buf_desc(0x3_0000);
+            let mut deep = core::ptr::null_mut();
+            let deep_base = base + 0x10_0000;
+            let placement = create(dev, deep_base + 0x2000, &dd, 0x3_0000, 0, core::ptr::null(), &mut deep).expect("sub-page buffer spanning several pages");
+            assert_eq!(placement.offset, 0);
+            let kind = crate::console_slots_dev2::SRV_BUFFER;
+            let mut view = [0u8; 0x28];
+            view[kind.first..kind.first + 8].copy_from_slice(&0x3000u64.to_le_bytes());
+            view[kind.stride..kind.stride + 4].copy_from_slice(&12u32.to_le_bytes());
+            let forward = exact_view(deep as usize, &mut view, kind).expect("a helper two pages forward aligns the structured view");
+            let first = u64::from_le_bytes(view[kind.first..kind.first + 8].try_into().unwrap());
+            assert_eq!(first * 12, 0x6000);
+            let mut typed = [0u8; 0x28];
+            typed[0..4].copy_from_slice(&6u32.to_le_bytes()); // R32G32B32_FLOAT
+            typed[kind.first..kind.first + 8].copy_from_slice(&0x3000u64.to_le_bytes());
+            assert_eq!(exact_view(deep as usize, &mut typed, kind), Some(forward));
+            assert_eq!(&typed[kind.first..kind.first + 8], &first.to_le_bytes());
+            run(&|l| { copy(l, deep, 0x24000, up, 0x7ffc, 16); });
+            run(&|l| { copy(l, rb, 0, forward, first * 12, 16); });
+            assert!(vc!(rb, 8, fn(u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut m) >= 0);
+            assert_eq!(core::slice::from_raw_parts(m, 16), core::slice::from_raw_parts(u.add(0x7ffc), 16));
+            vc!(rb, 9, fn(u32, *const c_void) -> (), 0, core::ptr::null());
+            vc!(deep, 2, fn() -> u32);
             for r in [small, rb, up, l, al, fe, q] {
                 vc!(r, 2, fn() -> u32);
             }
@@ -773,8 +819,10 @@ mod tests {
             assert_eq!(DISCARDS.load(Ordering::SeqCst), 1);
         }
         assert_eq!(*SEEN_TEX.lock().unwrap(), vec![(0x2040, 0x100, 7), (3, 0x200, 7)], "the footprint offset moves by the page offset and the row pitch survives");
-        assert_eq!(helper_plan(0x2000, 12, 0x2_0000), Some((1, 0x1_2000 / 12)));
+        assert_eq!(helper_plan(0x2000, 12, 0x2_0000), Some((0x1_0000, 0x1_2000 / 12)));
         assert_eq!(helper_plan(0x2000, 12, 0), None);
+        assert_eq!(helper_plan(0x1_2008, 12, 0), None);
+        assert_eq!(helper_plan(0x2_6000, 12, 0), Some((0x2_0000, 0x6000 / 12)));
         assert_eq!(helper_plan(0x2004, 4, 0), Some((0, 0x801)));
         assert_eq!(helper_plan(0x2001, 12, 0x10_0000), None);
         let mut dropped = false;
@@ -848,14 +896,26 @@ mod tests {
             let mut info = [0u64; 2];
             let md = tex_desc(4);
             vc!(dev, 25, fn(*mut u64, u32, u32, *const u8) -> *mut u64, info.as_mut_ptr(), 0, 1, md.as_ptr());
-            let off_step = crate::alias::create_placed_x(dev, r + 0x31_0000, &md, 0x1_0000, 4, core::ptr::null(), &mut t3);
+            let off_va = r + 0x31_0000;
+            let off_step = crate::alias::create_placed_x(dev, off_va, &md, 0x1_0000, 4, core::ptr::null(), &mut t3)
+                .expect("MSAA placement off the reservation's 4 MB step");
+            let mut t4: *mut c_void = core::ptr::null_mut();
+            let repeated = crate::alias::create_placed_x(dev, off_va, &md, 0x1_0000, 4, core::ptr::null(), &mut t4)
+                .expect("second MSAA placement at the same address");
+            assert_eq!(off_step.kind, crate::alias::Kind::Local);
+            assert_eq!((off_step.heap, off_step.offset), (repeated.heap, repeated.offset));
             if info[1] >= crate::msaa_place::MSAA_ALIGN {
-                assert!(off_step.is_none(), "MSAA off a 4 MB step of its heap falls back to a committed resource");
+                assert_ne!(off_step.heap, m1.heap, "the original heap cannot represent both alignments");
+                assert_eq!(off_step.offset % info[1], 0);
             } else {
-                assert!(off_step.is_some(), "this adapter places MSAA at {:#x}, so any 64 KB step works", info[1]);
-                vc!(t3, 2, fn() -> u32);
+                assert_eq!(off_step.heap, m1.heap);
+                assert_eq!(off_step.offset, 0x31_0000);
             }
-            for t in [t1, t2] {
+            let mut t5: *mut c_void = core::ptr::null_mut();
+            let single = crate::alias::create_placed_x(dev, at, &tex_desc(1), 0x4_0000, 4, core::ptr::null(), &mut t5)
+                .expect("single-sample alias after the shifted MSAA heap");
+            assert_eq!((single.heap, single.offset), (m2.heap, m2.offset));
+            for t in [t1, t2, t3, t4, t5] {
                 vc!(t, 2, fn() -> u32);
             }
             VirtualFree(r as *mut c_void, 0, 0x8000);

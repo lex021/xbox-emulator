@@ -138,10 +138,8 @@ unsafe fn wait_status(b: *mut Block) -> i32 {
 }
 
 #[test]
-fn pls_prompt_for_space_completes_from_free_space() {
+fn pls_prompt_for_space_reports_the_dialog_choice() {
     env();
-    assert_eq!(system::pls_prompt_result(10, 10), 0);
-    assert_eq!(system::pls_prompt_result(11, 10), 0x8000_4004u32 as i32);
     assert_eq!(system::pls_prompt_needed(30, 10), 20);
     assert_eq!(system::pls_prompt_needed(10, 10), 0xa0_0000);
     assert_eq!(system::pls_prompt_needed(0, 10), 0xa0_0000);
@@ -155,21 +153,63 @@ fn pls_prompt_for_space_completes_from_free_space() {
         assert_eq!(prompt(o, 1, core::ptr::null_mut()), 0x8007_0057u32 as i32);
         let mut b = Box::new(Block { queue: 0, context: 0, callback: 0, internal: [0; 32] });
         let bp = &mut *b as *mut Block;
-        assert_eq!(prompt(o, 1, bp as *mut c_void), 0);
+        let (_, info) = method(system::PLS, system::PLS_IID, 5);
+        let info: unsafe extern "system" fn(*mut c_void, *mut u64) -> i32 = core::mem::transmute(info);
+        let mut sp = [0u64; 4];
+        assert_eq!(info(o, sp.as_mut_ptr()), 0);
+        assert_eq!(prompt(o, sp[3], bp as *mut c_void), 0);
+        press_storage_dialog_button(0);
         assert_eq!(wait_status(bp), 0);
         assert_eq!(result(o, bp as *mut c_void), 0);
         let mut b2 = Box::new(Block { queue: 0, context: 0, callback: 0, internal: [0; 32] });
         let bp2 = &mut *b2 as *mut Block;
         assert_eq!(prompt(o, u64::MAX, bp2 as *mut c_void), 0x8007_0057u32 as i32);
-        let (_, info) = method(system::PLS, system::PLS_IID, 5);
-        let info: unsafe extern "system" fn(*mut c_void, *mut u64) -> i32 = core::mem::transmute(info);
-        let mut sp = [0u64; 4];
-        assert_eq!(info(o, sp.as_mut_ptr()), 0);
-        if sp[0] < sp[3] {
-            assert_eq!(prompt(o, sp[3], bp2 as *mut c_void), 0);
-            assert_eq!(wait_status(bp2), 0x8000_4004u32 as i32);
-            assert_eq!(result(o, bp2 as *mut c_void), 0x8000_4004u32 as i32);
+        assert_eq!(prompt(o, 1, bp2 as *mut c_void), 0);
+        press_storage_dialog_button(1);
+        assert_eq!(wait_status(bp2), 0x8000_4004u32 as i32);
+        assert_eq!(result(o, bp2 as *mut c_void), 0x8000_4004u32 as i32);
+    }
+}
+
+fn press_storage_dialog_button(button: usize) {
+    extern "system" {
+        fn GetWindowThreadProcessId(window: usize, pid: *mut u32) -> u32;
+    }
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(window) = gdk::win::find_dialog() {
+            let mut pid = 0;
+            unsafe { GetWindowThreadProcessId(window, &mut pid) };
+            if pid == std::process::id() {
+                gdk::win::press(window, gdk::win::BUTTON_ID + button);
+                return;
+            }
         }
+        assert!(Instant::now() < until, "storage dialog did not appear");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn pls_prompt_result_reports_pending_and_preserves_completion_status() {
+    env();
+    unsafe {
+        let (obj, method) = method(system::PLS, system::PLS_IID, 7);
+        let result: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32 = core::mem::transmute(method);
+        let mut block = Block { queue: 0, context: 0, callback: 0, internal: [0; 32] };
+        let ptr = &mut block as *mut Block;
+        let (finish, wait) = std::sync::mpsc::channel();
+        let error = 0x8007_0070u32 as i32;
+        assert_eq!(xasync::run_with(ptr.cast(), b"test PLS completion\0", Box::new(move |_| {
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            xasync::Payload::status(error)
+        })), 0);
+        let pending = result(obj, ptr.cast());
+        finish.send(()).unwrap();
+        let completed = wait_status(ptr);
+        assert_eq!(pending, 0x8000_000Au32 as i32);
+        assert_eq!(completed, error);
+        assert_eq!(result(obj, ptr.cast()), error);
     }
 }
 

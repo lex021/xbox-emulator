@@ -114,7 +114,7 @@ fn versioned_deserializer_restores_xbox_flags_at_every_version() {
     assert!(hr >= 0, "deserializer hr={hr:#010x}");
     let at_version: unsafe extern "system" fn(*mut c_void, u32, *mut *const Versioned) -> i32 = unsafe { core::mem::transmute(vslot(de, 3)) };
     let mut checked = 0;
-    for ver in [1u32, 2] {
+    for ver in [1u32, 2, 3] {
         let mut d: *const Versioned = core::ptr::null();
         let hr = unsafe { at_version(de, ver, &mut d) };
         assert!(hr >= 0 && !d.is_null(), "version {ver} hr={hr:#010x}");
@@ -124,7 +124,7 @@ fn versioned_deserializer_restores_xbox_flags_at_every_version() {
     }
     let unconverted: unsafe extern "system" fn(*mut c_void) -> *const Versioned = unsafe { core::mem::transmute(vslot(de, 4)) };
     assert_eq!(unsafe { (*unconverted(de)).desc.flags }, ALLOW_IA | XBOX_ROOT_FLAGS);
-    assert_eq!(checked, 2);
+    assert_eq!(checked, 3);
     unsafe {
         release(de);
         release(blob);

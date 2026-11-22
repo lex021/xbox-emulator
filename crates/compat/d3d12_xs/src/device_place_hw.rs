@@ -144,3 +144,141 @@ fn hw_slot44_sub_page_placements_at_title_vas_share_bytes_on_the_gpu() {
         }
     }
 }
+
+#[test]
+#[ignore = "needs a D3D12 device; run: cargo test -p d3d12_xs --lib hw_ -- --ignored --test-threads=1 (TOMBOX_HW_ADAPTER=warp for WARP)"]
+fn hw_slot44_placed_texture_loads_xbox_one_pattern_and_reads_back_from_gpu() {
+    let g = gpu();
+    let w = wrapped();
+    unsafe {
+        let (h, bpe_off) = crate::xone_tex::xg_module();
+        assert!(!h.is_null(), "xg_x module must be loadable");
+        assert_eq!(bpe_off, 0x38, "Xbox One requires xg_x layout model");
+        let f = GetProcAddress(h, b"XGCreateTextureComputer\0".as_ptr());
+        assert!(!f.is_null(), "XGCreateTextureComputer export must exist");
+        let create_comp: unsafe extern "system" fn(*const u8, *mut *mut c_void) -> i32 = core::mem::transmute(f);
+
+        let width = 64u64;
+        let height = 64u32;
+        let bpe = 4usize;
+        let mut d = [0u8; 56];
+        d[0..4].copy_from_slice(&3u32.to_le_bytes()); // TEXTURE2D
+        d[0x10..0x18].copy_from_slice(&width.to_le_bytes());
+        d[0x18..0x1c].copy_from_slice(&height.to_le_bytes());
+        d[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes()); // array = 1
+        d[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes()); // mips = 1
+        d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes()); // DXGI_FORMAT_R8G8B8A8_UNORM
+        d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes()); // sample count = 1
+        d[0x2c..0x30].copy_from_slice(&0u32.to_le_bytes()); // layout = 0 (optimal Xbox One tile mode 13)
+
+        let mut comp: *mut c_void = core::ptr::null_mut();
+        assert_eq!(create_comp(d.as_ptr(), &mut comp), 0);
+        assert!(!comp.is_null());
+
+        let mut lay = vec![0u8; 0x4000];
+        let get_lay: unsafe extern "system" fn(*mut c_void, *mut u8) -> i32 = core::mem::transmute(*(*(comp as *const *const usize)).add(2));
+        assert_eq!(get_lay(comp, lay.as_mut_ptr()), 0);
+        let xg_size = u64::from_le_bytes(lay[0..8].try_into().unwrap());
+        assert!(xg_size >= width * height as u64 * bpe as u64);
+
+        extern "system" {
+            fn VirtualAlloc(address: *mut c_void, size: usize, alloc_type: u32, protect: u32) -> *mut c_void;
+            fn VirtualFree(address: *mut c_void, size: usize, free_type: u32) -> i32;
+        }
+        let alloc_size = ((xg_size.max(0x1_0000) + 0xffff) & !0xffff) as usize;
+        let base = VirtualAlloc(core::ptr::null_mut(), alloc_size, 0x3000, 4);
+        assert!(!base.is_null());
+        let va = base as u64;
+
+        let row_pitch = (width as usize) * bpe;
+        let mut pattern = vec![0u8; row_pitch * height as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let off = y * row_pitch + x * bpe;
+                pattern[off + 0] = (x * 4) as u8;             // R
+                pattern[off + 1] = (y * 4) as u8;             // G
+                pattern[off + 2] = ((x ^ y) * 4) as u8;       // B
+                pattern[off + 3] = 255;                       // A
+            }
+        }
+
+        let copy_into: unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, *const u8, u32, u32) -> i32 =
+            core::mem::transmute(*(*(comp as *const *const usize)).add(8));
+        assert_eq!(copy_into(comp, va as *mut u8, 0, 0, pattern.as_ptr(), row_pitch as u32, 0), 0);
+
+        let rel: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*(*(comp as *const *const usize)).add(1));
+        rel(comp);
+
+        assert_ne!(core::slice::from_raw_parts(va as *const u8, row_pitch * height as usize), &pattern[..],
+            "Xbox One memory at va must be stored in tiled mode");
+
+        let mut tex: *mut c_void = core::ptr::null_mut();
+        let hr = call!(w, D_PLACED_X,
+            (u64, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32,
+            va, d.as_ptr(), ST_COMMON, core::ptr::null(), &IID_RESOURCE, &mut tex);
+        assert!(hr >= 0 && !tex.is_null(), "CreatePlacedResourceX failed: {hr:#010x}");
+
+        crate::upload::pump(g.a as *mut c_void);
+        run(g, |_| {});
+
+        let rb = buffer(g.dev, HEAP_READBACK, (row_pitch * height as usize) as u64, 0, ST_COPY_DEST);
+        run(g, |l| {
+            let b_to_src = [0u64, tex as u64, 0xffff_ffffu64 | ((ST_COMMON as u64) << 32), ST_COPY_SOURCE as u64];
+            call!(l, X_BARRIER, (u32, *const [u64; 4]) -> (), 1, [b_to_src].as_ptr());
+
+            let mut dst = [0u8; 48];
+            dst[0..8].copy_from_slice(&(rb.res as u64).to_le_bytes());
+            dst[8..12].copy_from_slice(&1u32.to_le_bytes()); // PLACED_FOOTPRINT
+            dst[16..24].copy_from_slice(&0u64.to_le_bytes());
+            dst[24..28].copy_from_slice(&28u32.to_le_bytes()); // DXGI_FORMAT_R8G8B8A8_UNORM
+            dst[28..32].copy_from_slice(&(width as u32).to_le_bytes());
+            dst[32..36].copy_from_slice(&height.to_le_bytes());
+            dst[36..40].copy_from_slice(&1u32.to_le_bytes());
+            dst[40..44].copy_from_slice(&(row_pitch as u32).to_le_bytes());
+
+            let mut src = [0u8; 48];
+            src[0..8].copy_from_slice(&(tex as u64).to_le_bytes());
+            src[8..12].copy_from_slice(&0u32.to_le_bytes()); // SUBRESOURCE_INDEX
+            src[16..20].copy_from_slice(&0u32.to_le_bytes());
+
+            call!(l, 16, (*const u8, u32, u32, u32, *const u8, *const c_void) -> (),
+                dst.as_ptr(), 0, 0, 0, src.as_ptr(), core::ptr::null());
+
+            let b_to_common = [0u64, tex as u64, 0xffff_ffffu64 | ((ST_COPY_SOURCE as u64) << 32), ST_COMMON as u64];
+            call!(l, X_BARRIER, (u32, *const [u64; 4]) -> (), 1, [b_to_common].as_ptr());
+        });
+
+        let mut matches = 0usize;
+        let mut mismatches = 0usize;
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let off = y * row_pitch + x * bpe;
+                let actual = [
+                    core::ptr::read_volatile(rb.cpu.add(off + 0)),
+                    core::ptr::read_volatile(rb.cpu.add(off + 1)),
+                    core::ptr::read_volatile(rb.cpu.add(off + 2)),
+                    core::ptr::read_volatile(rb.cpu.add(off + 3)),
+                ];
+                let expected = [
+                    pattern[off + 0],
+                    pattern[off + 1],
+                    pattern[off + 2],
+                    pattern[off + 3],
+                ];
+                if actual == expected {
+                    matches += 1;
+                } else {
+                    mismatches += 1;
+                }
+            }
+        }
+
+        eprintln!("TEXTURE_READBACK_RESULT: total={} matches={matches} mismatches={mismatches}", width as usize * height as usize);
+        assert_eq!(mismatches, 0, "GPU readback must have 0 mismatches vs reference pattern");
+        assert_eq!(matches, (width * height as u64) as usize, "All pixels must match");
+
+        call!(tex, 2, () -> u32);
+        call!(rb.res as *mut c_void, 2, () -> u32);
+        VirtualFree(base, 0, 0x8000);
+    }
+}

@@ -2810,7 +2810,10 @@ impl<'a> Emitter<'a> {
                 }
                 Ok(())
             }
-            Enc::Sopp if ins.op == 0x11 => Err("s_sendmsghalt halts the wave after the message".into()),
+            Enc::Sopp if ins.op == 0x11 => Err(format!(
+                "s_sendmsghalt with SIMM16 {:#06x} requires a resumable halted wave, which the HLSL backend cannot represent",
+                ins.aux.imm as u16
+            )),
             Enc::Sopp if ins.op == 0x12 => Ok(()),
             Enc::Sopp if ins.op == 0x0a && self.is_ms() => self.mesh_barrier(),
             Enc::Sopp if ins.op == 0x0a && self.is_cs => {

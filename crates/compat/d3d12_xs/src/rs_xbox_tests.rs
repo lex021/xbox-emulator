@@ -13,6 +13,7 @@ const PARAM_UAV: u32 = 4;
 const PARAM_CONSTANTS: u32 = 1;
 const VERSION_1_0: u32 = 1;
 const VERSION_1_1: u32 = 2;
+const VERSION_1_2: u32 = 3;
 
 unsafe fn vslot(o: *mut c_void, i: usize) -> usize {
     unsafe { *(*(o as *const *const usize)).add(i) }
@@ -234,6 +235,276 @@ fn deserializers_report_the_console_flags() {
         let get: unsafe extern "system" fn(*mut c_void) -> *const u8 = core::mem::transmute(vslot(d, 3));
         assert_eq!(core::ptr::read_unaligned(get(d).add(DESC_FLAGS) as *const u32), XBOX_FORCE_MEMORY_BASED_ABI | 0x1);
         release(d);
+    }
+}
+
+#[test]
+fn versioned_deserializer_slot3_conversion_test() {
+    let test_cases = [
+        ("XBOX_FORCE_MEMORY_BASED_ABI", XBOX_FORCE_MEMORY_BASED_ABI),
+        ("XBOX_FORCE_COMPUTE_2_SPILL_AREA", XBOX_FORCE_COMPUTE_2_SPILL_AREA),
+        ("XBOX_INTERNAL_XDXR", XBOX_INTERNAL_XDXR),
+        ("XBOX_INTERNAL_XDXR | 0x1", XBOX_INTERNAL_XDXR | 0x1),
+    ];
+
+    for (name, input_flags) in test_cases {
+        let blob = serialize_xdxr(input_flags);
+        let mut d: *mut c_void = core::ptr::null_mut();
+        let hr = crate::xs_exports::D3D12CreateVersionedRootSignatureDeserializer(
+            blob.as_ptr() as *const c_void,
+            blob.len(),
+            &IID_VERSIONED_DESERIALIZER as *const Guid as *const c_void,
+            &mut d,
+        );
+        assert!(hr >= 0 && !d.is_null(), "D3D12CreateVersionedRootSignatureDeserializer failed: hr={hr:#010x}");
+
+        unsafe {
+            // Slot 4: GetUnconvertedRootSignatureDesc
+            let get_unconverted: unsafe extern "system" fn(*mut c_void) -> *const u8 =
+                core::mem::transmute(vslot(d, 4));
+            let unconverted_desc = get_unconverted(d);
+            assert!(!unconverted_desc.is_null());
+            let unconverted_version = core::ptr::read_unaligned(unconverted_desc as *const u32);
+            let unconverted_flags = core::ptr::read_unaligned(unconverted_desc.add(VERSIONED_DESC_FLAGS) as *const u32);
+
+            // Slot 3: GetRootSignatureDescAtVersion
+            let get_at_version: unsafe extern "system" fn(*mut c_void, u32, *mut *const u8) -> i32 =
+                core::mem::transmute(vslot(d, 3));
+            let mut checked = 0;
+            for &ver in &ROOT_SIGNATURE_VERSIONS {
+                let mut converted_desc: *const u8 = core::ptr::null();
+                let hr_conv = get_at_version(d, ver, &mut converted_desc);
+                if hr_conv >= 0 && !converted_desc.is_null() {
+                    let converted_version = core::ptr::read_unaligned(converted_desc as *const u32);
+                    let converted_flags = core::ptr::read_unaligned(converted_desc.add(VERSIONED_DESC_FLAGS) as *const u32);
+
+                    eprintln!(
+                        "TEST [{name}] ver={ver}: hr_conv={hr_conv:#010x}, converted_flags={converted_flags:#010x}",
+                    );
+
+                    assert_eq!(converted_version, ver, "{name}: converted_version for {ver}");
+                    assert_eq!(converted_flags, input_flags, "{name}: converted_flags for {ver}");
+
+                    // Verify console flags are NOT lost after conversion:
+                    if input_flags & XBOX_FORCE_MEMORY_BASED_ABI != 0 {
+                        assert!(converted_flags & XBOX_FORCE_MEMORY_BASED_ABI != 0, "{name}: lost XBOX_FORCE_MEMORY_BASED_ABI");
+                    }
+                    if input_flags & XBOX_FORCE_COMPUTE_2_SPILL_AREA != 0 {
+                        assert!(converted_flags & XBOX_FORCE_COMPUTE_2_SPILL_AREA != 0, "{name}: lost XBOX_FORCE_COMPUTE_2_SPILL_AREA");
+                    }
+                    checked += 1;
+                }
+            }
+            assert!(checked >= 2, "{name}: expected at least versions 1.0 and 1.1 to be supported");
+
+            release(d);
+        }
+    }
+}
+
+#[test]
+fn matrix_v12_investigation_test() {
+    eprintln!("=== [1] D3D12SerializeRootSignature versions ===");
+    for ver in [0u32, 1, 2, 3, 4] {
+        let params = param(PARAM_CONSTANTS, 0, 4);
+        let d = desc_1_0(&params, 1, 0x1);
+        let (mut b, mut e): (*mut c_void, *mut c_void) = (core::ptr::null_mut(), core::ptr::null_mut());
+        let hr = crate::D3D12SerializeRootSignature(d.as_ptr() as *const c_void, ver, &mut b, &mut e);
+        eprintln!("D3D12SerializeRootSignature(version={ver}) -> hr={hr:#010x}");
+        unsafe { release(b); release(e); }
+    }
+
+    eprintln!("\n=== [2] D3D12SerializeVersionedRootSignature versions ===");
+    for ver in [0u32, 1, 2, 3, 4] {
+        let mut d = [0u8; 48];
+        d[0..4].copy_from_slice(&ver.to_le_bytes());
+        d[40..44].copy_from_slice(&1u32.to_le_bytes()); // ALLOW_IA
+        let (mut b, mut e): (*mut c_void, *mut c_void) = (core::ptr::null_mut(), core::ptr::null_mut());
+        let hr = crate::D3D12SerializeVersionedRootSignature(d.as_ptr() as *const c_void, &mut b, &mut e);
+        eprintln!("D3D12SerializeVersionedRootSignature(version={ver}) -> hr={hr:#010x}");
+        unsafe { release(b); release(e); }
+    }
+
+    eprintln!("\n=== [3] Supported Version Transitions Matrix ===");
+    for src_ver in [1u32, 2, 3] {
+        let mut d = [0u8; 48];
+        d[0..4].copy_from_slice(&src_ver.to_le_bytes());
+        d[40..44].copy_from_slice(&1u32.to_le_bytes()); // ALLOW_IA
+        let (mut b, mut e): (*mut c_void, *mut c_void) = (core::ptr::null_mut(), core::ptr::null_mut());
+        let hr_ser = crate::D3D12SerializeVersionedRootSignature(d.as_ptr() as *const c_void, &mut b, &mut e);
+        if hr_ser < 0 || b.is_null() {
+            eprintln!("Source version {src_ver} failed to serialize: hr={hr_ser:#010x}");
+            unsafe { release(b); release(e); }
+            continue;
+        }
+        let bytes = unsafe { blob_bytes(b) };
+        unsafe { release(b); release(e); }
+
+        let mut de: *mut c_void = core::ptr::null_mut();
+        let hr_de = crate::xs_exports::D3D12CreateVersionedRootSignatureDeserializer(
+            bytes.as_ptr() as *const c_void,
+            bytes.len(),
+            &IID_VERSIONED_DESERIALIZER as *const Guid as *const c_void,
+            &mut de,
+        );
+        if hr_de < 0 || de.is_null() {
+            eprintln!("Failed to create deserializer for source version {src_ver}: hr={hr_de:#010x}");
+            continue;
+        }
+
+        unsafe {
+            let get_unconv: unsafe extern "system" fn(*mut c_void) -> *const u8 = core::mem::transmute(vslot(de, 4));
+            let unconv = get_unconv(de);
+            let unconv_ver = core::ptr::read_unaligned(unconv as *const u32);
+            let unconv_flags = core::ptr::read_unaligned(unconv.add(VERSIONED_DESC_FLAGS) as *const u32);
+            eprintln!("Source v{src_ver} unconverted: version={unconv_ver}, flags={unconv_flags:#x}");
+
+            let get_at_ver: unsafe extern "system" fn(*mut c_void, u32, *mut *const u8) -> i32 = core::mem::transmute(vslot(de, 3));
+            let mut conv_same: *const u8 = core::ptr::null();
+            let _ = get_at_ver(de, src_ver, &mut conv_same);
+            eprintln!("  Pointer check v{src_ver}: unconv={:p}, conv(src_ver)={:p}, equal={}", unconv, conv_same, unconv == conv_same);
+            for dst_ver in [0u32, 1, 2, 3, 4] {
+                let mut conv: *const u8 = core::ptr::null();
+                let hr_conv = get_at_ver(de, dst_ver, &mut conv);
+                if hr_conv >= 0 && !conv.is_null() {
+                    let out_ver = core::ptr::read_unaligned(conv as *const u32);
+                    let out_flags = core::ptr::read_unaligned(conv.add(VERSIONED_DESC_FLAGS) as *const u32);
+                    eprintln!("  Transition v{src_ver} -> v{dst_ver}: SUCCESS (hr={hr_conv:#010x}, out_ver={out_ver}, out_flags={out_flags:#x})");
+                } else {
+                    eprintln!("  Transition v{src_ver} -> v{dst_ver}: FAILED (hr={hr_conv:#010x})");
+                }
+            }
+            release(de);
+        }
+    }
+
+    eprintln!("\n=== [4] Flags Matrix: Normal, Console, and Unsupported ===");
+    let pc_individual_flags: &[(&str, u32)] = &[
+        ("NONE", 0x0),
+        ("ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT", 0x1),
+        ("DENY_VERTEX_SHADER_ROOT_ACCESS", 0x2),
+        ("DENY_HULL_SHADER_ROOT_ACCESS", 0x4),
+        ("DENY_DOMAIN_SHADER_ROOT_ACCESS", 0x8),
+        ("DENY_GEOMETRY_SHADER_ROOT_ACCESS", 0x10),
+        ("DENY_PIXEL_SHADER_ROOT_ACCESS", 0x20),
+        ("ALLOW_STREAM_OUTPUT", 0x40),
+        ("LOCAL_ROOT_SIGNATURE", 0x80),
+        ("DENY_AMPLIFICATION_SHADER_ROOT_ACCESS", 0x100),
+        ("DENY_MESH_SHADER_ROOT_ACCESS", 0x200),
+        ("CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED", 0x400),
+        ("SAMPLER_HEAP_DIRECTLY_INDEXED", 0x800),
+    ];
+
+    for &(name, flag) in pc_individual_flags {
+        let mut d = [0u8; 48];
+        d[0..4].copy_from_slice(&2u32.to_le_bytes()); // V1.1
+        d[40..44].copy_from_slice(&flag.to_le_bytes());
+        let (mut b, mut e): (*mut c_void, *mut c_void) = (core::ptr::null_mut(), core::ptr::null_mut());
+        let hr = crate::D3D12SerializeVersionedRootSignature(d.as_ptr() as *const c_void, &mut b, &mut e);
+        eprintln!("  PC Flag individual [{name} {flag:#06x}]: hr={hr:#010x}");
+        unsafe { release(b); release(e); }
+    }
+
+    // Test combinations
+    let combo_flags: &[(&str, u32)] = &[
+        ("ALL_SHADERS_DENIED (0x33e)", 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x100 | 0x200),
+        ("ALL_GRAPHICS_FLAGS (0x37f)", 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x100 | 0x200),
+        ("ALL_EXCEPT_LOCAL_AND_DIRECT (0x37f)", 0x37f),
+        ("DIRECTLY_INDEXED_BOTH (0xc00)", 0x400 | 0x800),
+        ("ALL_PC_EXCEPT_LOCAL (0xf7f)", 0xf7f),
+        ("ALL_PC_FLAGS_WITH_LOCAL (0xfff)", 0xfff),
+    ];
+    for &(name, flag) in combo_flags {
+        let mut d = [0u8; 48];
+        d[0..4].copy_from_slice(&2u32.to_le_bytes()); // V1.1
+        d[40..44].copy_from_slice(&flag.to_le_bytes());
+        let (mut b, mut e): (*mut c_void, *mut c_void) = (core::ptr::null_mut(), core::ptr::null_mut());
+        let hr = crate::D3D12SerializeVersionedRootSignature(d.as_ptr() as *const c_void, &mut b, &mut e);
+        eprintln!("  PC Flag combo [{name} {flag:#06x}]: hr={hr:#010x}");
+        unsafe { release(b); release(e); }
+    }
+
+    let flag_cases: &[(&str, u32)] = &[
+        ("NONE", 0),
+        ("ALLOW_IA", 0x1),
+        ("DENY_VS", 0x2),
+        ("DENY_PS", 0x20),
+        ("ALLOW_SO", 0x40),
+        ("LOCAL_RS", 0x80),
+        ("DENY_AS", 0x100),
+        ("DENY_MS", 0x200),
+        ("CBV_SRV_UAV_DIRECTLY_INDEXED", 0x400),
+        ("SAMPLER_DIRECTLY_INDEXED", 0x800),
+        ("ALL_PC_FLAGS (0xFFF)", 0xFFF),
+        ("XBOX_FORCE_MEMORY_BASED_ABI", XBOX_FORCE_MEMORY_BASED_ABI),
+        ("XBOX_FORCE_COMPUTE_2_SPILL_AREA", XBOX_FORCE_COMPUTE_2_SPILL_AREA),
+        ("XBOX_INTERNAL_XDXR", XBOX_INTERNAL_XDXR),
+        ("XBOX_DRIVER_DISCARDED", XBOX_DRIVER_DISCARDED),
+        ("ALL_XBOX_FLAGS", XBOX_ROOT_FLAGS),
+        ("PC + XBOX (0xFFF | XBOX_ROOT_FLAGS)", 0xFFF | XBOX_ROOT_FLAGS),
+        ("UNSUPPORTED_0x1000", 0x1000),
+        ("UNSUPPORTED_0x0400_0000", 0x0400_0000),
+        ("CONSOLE_UNSUPPORTED", CONSOLE_UNSUPPORTED),
+        ("ALL_BITS_0xFFFFFFFF", 0xFFFF_FFFF),
+    ];
+
+    for ver in [1u32, 2, 3] {
+        eprintln!("\n--- Version {ver} Flags Check ---");
+        for (name, flags) in flag_cases {
+            let mut d = [0u8; 48];
+            d[0..4].copy_from_slice(&ver.to_le_bytes());
+            d[40..44].copy_from_slice(&flags.to_le_bytes());
+            let (mut b, mut e): (*mut c_void, *mut c_void) = (core::ptr::null_mut(), core::ptr::null_mut());
+            let hr_ser = crate::D3D12SerializeVersionedRootSignature(d.as_ptr() as *const c_void, &mut b, &mut e);
+            if hr_ser < 0 || b.is_null() {
+                eprintln!("  [{name} {flags:#010x}] Serialize: REJECTED (hr={hr_ser:#010x})");
+                unsafe { release(b); release(e); }
+                continue;
+            }
+            let bytes = unsafe { blob_bytes(b) };
+            unsafe { release(b); release(e); }
+            let in_blob = blob_flags(&bytes).map(|(_, f)| f).unwrap_or(0);
+
+            let mut de: *mut c_void = core::ptr::null_mut();
+            let hr_de = crate::xs_exports::D3D12CreateVersionedRootSignatureDeserializer(
+                bytes.as_ptr() as *const c_void,
+                bytes.len(),
+                &IID_VERSIONED_DESERIALIZER as *const Guid as *const c_void,
+                &mut de,
+            );
+            if hr_de < 0 || de.is_null() {
+                eprintln!("  [{name} {flags:#010x}] Serialize: OK, in_blob={in_blob:#010x}, Deserializer: FAILED (hr={hr_de:#010x})");
+                continue;
+            }
+
+            unsafe {
+                let get_unconv: unsafe extern "system" fn(*mut c_void) -> *const u8 = core::mem::transmute(vslot(de, 4));
+                let unconv = get_unconv(de);
+                let unconv_flags = core::ptr::read_unaligned(unconv.add(VERSIONED_DESC_FLAGS) as *const u32);
+
+                let get_at_ver: unsafe extern "system" fn(*mut c_void, u32, *mut *const u8) -> i32 = core::mem::transmute(vslot(de, 3));
+                let mut conv_1_0: *const u8 = core::ptr::null();
+                let hr_1_0 = get_at_ver(de, VERSION_1_0, &mut conv_1_0);
+                let flags_1_0 = if hr_1_0 >= 0 && !conv_1_0.is_null() {
+                    Some(core::ptr::read_unaligned(conv_1_0.add(VERSIONED_DESC_FLAGS) as *const u32))
+                } else {
+                    None
+                };
+
+                let mut conv_1_2: *const u8 = core::ptr::null();
+                let hr_1_2 = get_at_ver(de, VERSION_1_2, &mut conv_1_2);
+                let flags_1_2 = if hr_1_2 >= 0 && !conv_1_2.is_null() {
+                    Some(core::ptr::read_unaligned(conv_1_2.add(VERSIONED_DESC_FLAGS) as *const u32))
+                } else {
+                    None
+                };
+
+                eprintln!(
+                    "  [{name} {flags:#010x}] Serialize: OK, blob={in_blob:#010x}, unconv={unconv_flags:#010x}, at_v10={flags_1_0:#010x?}, at_v12={flags_1_2:#010x?}"
+                );
+                release(de);
+            }
+        }
     }
 }
 

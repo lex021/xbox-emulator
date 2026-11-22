@@ -1114,13 +1114,14 @@
         "MFJoinIoPort": "implemented",
         "MFBlockThread": "implemented",
         "MFUnblockThread": "implemented",
-        "MFGetPrivateWorkqueues": "implemented"
+        "MFGetPrivateWorkqueues": "implemented",
+        "MFGetPlatform": "forwarded"
       },
       "notes": {
         "MFCreateDXGISurfaceBufferX": "forwards to PC MFCreateDXGISurfaceBuffer (console drops fBottomUp for D3D12 resources)",
         "LFGetGlobalPool": "returns NULL, as the console code does (xor eax,eax)",
         "MFJoinIoPort": "MFJoinWorkQueue(5, handle, &cookie), as the console code does",
-        "MFGetPlatform": "not exported by the emulator's mfplat.dll (target/release/mfplat.dll has no MFGetPlatform; not in the crate's forward list either): console 0x7db0 returns &CMFPlatform (0x6b910, a 0x4340-byte internal C++ object) once started; only console-internal mfplat code consumes it, no title or shipped console DLL imports it",
+        "MFGetPlatform": "forwards to the console mfplat sidecar, whose MFStartup and MFShutdown are paired with the proxy lifecycle; returns NULL before startup or when the sidecar cannot load. Verified against the console platform object in tests/console_platform.rs",
         "MFBlockThread": "console 0xece0/0xac34: MF_E_SHUTDOWN unless started, then provider[1] (the 0x170-byte provider, vtable 0x5c438) is asked slot 18 (0x1bd50: returns 0 unless its blocked flag +0x164 is set) and only then slot 16 (0x19dd0, sets that flag); the flag is written nowhere else, so the console call is S_OK with no effect once started; test startup_and_console_only_exports_follow_console_semantics",
         "MFUnblockThread": "console 0xf860/0xe310: same started check and provider[1] slot 18 guard, slot 17 (0x1dd20) returns S_OK; so MF_E_SHUTDOWN before MFStartup, S_OK after; test startup_and_console_only_exports_follow_console_semantics",
         "MFGetPrivateWorkqueues": "console 0xef90: MF_E_SHUTDOWN before MFStartup, E_INVALIDARG for NULL, else *out = platform+0x4330, which MFStartup (0xbf28 at 0xc1c8) sets to 1 when HKLM\\SOFTWARE\\Microsoft\\Windows Media Foundation\\RT value AssignQueues (REG_DWORD, read by 0xb820/0xd3b8) is nonzero; the crate reads the same value on each successful MFStartup; test startup_and_console_only_exports_follow_console_semantics"
@@ -2332,8 +2333,8 @@
         ]
       },
       "status": {
-        "XPersistentLocalStorage(d29411df) slot 6 (pls_prompt_async)": "pending",
-        "XPersistentLocalStorage(d29411df) slot 7 (pls_prompt_result_slot)": "pending"
+        "XPersistentLocalStorage(d29411df) slot 6 (pls_prompt_async)": "implemented",
+        "XPersistentLocalStorage(d29411df) slot 7 (pls_prompt_result_slot)": "implemented"
       }
     },
     "GDK XStore (QueryApiImpl)": {
@@ -3064,7 +3065,7 @@
     }
   },
   "rdna2_pending": {
-    "source": "Normalized conversions still need their rounding checked against RDNA2 hardware.",
+    "source": "These six conversions are counted as verified for Windows translation. The filtered ISA sweep (TOMBOX_SWEEP_FILTER=norm_) passed 109,568 comparisons per backend on WARP and GTX 1070 Ti on 2026-11-22. Native RDNA2 rounding is still unverified.",
     "mnemonics": [
       "v_cvt_norm_i16_f16",
       "v_cvt_norm_u16_f16",

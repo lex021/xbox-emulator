@@ -191,10 +191,24 @@ pub unsafe fn deserializer(f: DeserializerFn, versioned: bool, data: *const c_vo
         if versioned {
             let get: unsafe extern "system" fn(*mut c_void) -> *const u8 = unsafe { core::mem::transmute(vslot(d, 4)) };
             unsafe { or_flags(get(d), VERSIONED_DESC_FLAGS, xbox) };
+            unsafe { restore_versions(d, xbox) };
         } else {
             let get: unsafe extern "system" fn(*mut c_void) -> *const u8 = unsafe { core::mem::transmute(vslot(d, 3)) };
             unsafe { or_flags(get(d), DESC_FLAGS, xbox) };
         }
     }
     hr
+}
+
+pub const ROOT_SIGNATURE_VERSIONS: [u32; 3] = [1, 2, 3];
+
+unsafe fn restore_versions(o: *mut c_void, xbox: u32) {
+    let at_version: unsafe extern "system" fn(*mut c_void, u32, *mut *const u8) -> i32 = unsafe { core::mem::transmute(vslot(o, 3)) };
+    for v in ROOT_SIGNATURE_VERSIONS {
+        let mut desc: *const u8 = core::ptr::null();
+        if unsafe { at_version(o, v, &mut desc) } >= 0 && !desc.is_null() {
+            let p = unsafe { desc.add(VERSIONED_DESC_FLAGS) } as *mut u32;
+            unsafe { core::ptr::write_unaligned(p, core::ptr::read_unaligned(p) | xbox) };
+        }
+    }
 }
