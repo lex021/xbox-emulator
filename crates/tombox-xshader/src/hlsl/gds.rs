@@ -168,8 +168,12 @@ impl Emitter<'_> {
             return Err("phased GWS requires exactly one wave32 per workgroup".into());
         }
         let instructions = self.insns.clone();
-        if !instructions.iter().any(|ins| ins.mnemonic == "ds_gws_sema_p") {
-            return Err("cooperative GWS requires a semaphore wait".into());
+        let barrier = instructions.iter().any(|ins| ins.mnemonic == "ds_gws_barrier");
+        if !barrier && !instructions.iter().any(|ins| ins.mnemonic == "ds_gws_sema_p") {
+            return Err("cooperative GWS requires a semaphore wait or a barrier".into());
+        }
+        if barrier && instructions.iter().any(|ins| ins.mnemonic.starts_with("ds_gws_sema_")) {
+            return Err("mixing GWS barriers and semaphore operations is unsupported".into());
         }
         let end = instructions.len();
         let end_offset = instructions.last().map_or(0, |ins| ins.offset + ins.dwords * 4);
@@ -194,16 +198,19 @@ impl Emitter<'_> {
         }
         self.line("if (gtid.x == 0u) {");
         self.line("tb_gws_first = 0xffffffffu;");
-        self.line("uint wait_addr = tb_gws_pending[tb_gws_turn];");
-        self.line("if (wait_addr != 0u) {");
-        self.line("uint earlier = 0u;");
-        self.line("for (uint p = 0u; p < TB_GWS_WAVES; ++p) earlier |= (tb_gws_pending[p] == wait_addr && tb_gws_ticket[p] < tb_gws_ticket[tb_gws_turn]) ? 1u : 0u;");
-        self.line("uint count;");
-        self.line("tb_gds.InterlockedOr(wait_addr, 0u, count);");
-        self.line(&format!("if (earlier == 0u && (count & {counter_mask}u) != 0u) {{"));
-        self.line("uint old; tb_gds.InterlockedAdd(wait_addr, 0xffffffffu, old);");
-        self.line("tb_gws_pending[tb_gws_turn] = 0u; tb_gws_progress = 1u;");
-        self.line("} } }");
+        if !barrier {
+            self.line("uint wait_addr = tb_gws_pending[tb_gws_turn];");
+            self.line("if (wait_addr != 0u) {");
+            self.line("uint earlier = 0u;");
+            self.line("for (uint p = 0u; p < TB_GWS_WAVES; ++p) earlier |= (tb_gws_pending[p] == wait_addr && tb_gws_ticket[p] < tb_gws_ticket[tb_gws_turn]) ? 1u : 0u;");
+            self.line("uint count;");
+            self.line("tb_gds.InterlockedOr(wait_addr, 0u, count);");
+            self.line(&format!("if (earlier == 0u && (count & {counter_mask}u) != 0u) {{"));
+            self.line("uint old; tb_gds.InterlockedAdd(wait_addr, 0xffffffffu, old);");
+            self.line("tb_gws_pending[tb_gws_turn] = 0u; tb_gws_progress = 1u;");
+            self.line("} }");
+        }
+        self.line("}");
         self.line("GroupMemoryBarrierWithGroupSync();");
         self.line("if (tb_gws_wave == tb_gws_turn && (exec_lo & 1u) != 0u) InterlockedMin(tb_gws_first, gtid.x);");
         self.line("GroupMemoryBarrierWithGroupSync();");
@@ -235,13 +242,26 @@ impl Emitter<'_> {
                     };
                 }
                 "ds_gws_init" | "ds_gws_sema_v" | "ds_gws_sema_br" | "ds_gws_sema_p"
-                | "ds_gws_sema_release_all" => {
+                | "ds_gws_sema_release_all" | "ds_gws_barrier" => {
                     if ins.raw[0] & (1 << 17) == 0 || ins.aux.imm & !0x3f != 0 {
                         return Err("invalid cooperative GWS resource encoding".into());
                     }
                     let offset = ins.aux.imm;
                     self.line(&format!("if (gtid.x == tb_gws_first) {{ uint addr = {base}u + 4u * (((m0 >> 16) + {offset}u) & {resource_mask}u);"));
                     match ins.mnemonic.as_str() {
+                        "ds_gws_barrier" => {
+                            let data = &ins.src[0];
+                            self.touch(data);
+                            // The counter holds the number of arrivals before the releasing wave.
+                            self.line("uint count; tb_gds.InterlockedOr(addr, 0u, count);");
+                            self.line(&format!("if ((count & {counter_mask}u) == 0u) {{"));
+                            self.line(&format!("uint old; tb_gds.InterlockedExchange(addr, ({}) & {counter_mask}u, old);", r(data)?));
+                            self.line("for (uint p = 0u; p < TB_GWS_WAVES; ++p) { if (tb_gws_pending[p] == addr) tb_gws_pending[p] = 0u; }");
+                            self.line("} else {");
+                            self.line("uint old; tb_gds.InterlockedAdd(addr, 0xffffffffu, old);");
+                            self.line("tb_gws_pending[tb_gws_turn] = addr;");
+                            self.line("}");
+                        }
                         "ds_gws_sema_p" => {
                             self.line("uint count; tb_gds.InterlockedOr(addr, 0u, count);");
                             self.line("uint older = 0u;");
@@ -270,7 +290,7 @@ impl Emitter<'_> {
                     self.line("}");
                 }
                 "s_waitcnt" | "s_nop" | "v_nop" => {}
-                "s_mov_b32" | "v_mov_b32" | "v_lshlrev_b32" | "s_load_dwordx4" | "buffer_store_dword" => {
+                "s_mov_b32" | "v_mov_b32" | "v_lshlrev_b32" | "v_add_nc_u32" | "s_load_dwordx4" | "buffer_store_dword" => {
                     for operand in ins.src.iter().chain(&ins.dst) {
                         self.touch(operand);
                     }

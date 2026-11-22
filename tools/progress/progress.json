@@ -3071,16 +3071,23 @@
     }
   },
   "rdna2_pending": {
-    "source": "These six conversions are counted as verified for Windows translation. The filtered ISA sweep (TOMBOX_SWEEP_FILTER=norm_) passed 109,568 comparisons per backend on WARP and GTX 1070 Ti on 2026-11-22. Native RDNA2 rounding is still unverified.",
+    "source": "The filtered ISA sweep (TOMBOX_SWEEP_FILTER=norm_) passed 109,568 normalization comparisons per backend on WARP and GTX 1070 Ti on 2026-11-22. Native RDNA2 rounding is still unverified. Cooperative GWS wait, release-all, and barrier paths passed D3D12 readback on WARP and hardware for bounded direct compute dispatches.",
     "mnemonics": [
       "v_cvt_norm_i16_f16",
       "v_cvt_norm_u16_f16",
       "v_cvt_pknorm_i16_f16",
       "v_cvt_pknorm_i16_f32",
       "v_cvt_pknorm_u16_f16",
-      "v_cvt_pknorm_u16_f32"
+      "v_cvt_pknorm_u16_f32",
+      "ds_gws_sema_p",
+      "ds_gws_sema_release_all",
+      "ds_gws_barrier"
     ],
-    "tests": []
+    "tests": [
+      "exec_mem::gds::ds_gws_phased_dispatch_wakes_across_physical_groups",
+      "exec_mem::gds::ds_gws_barrier_reloads_and_releases_only_after_last_arrival",
+      "hw_gws_compute_pso_selects_dispatch_variant"
+    ]
   },
   "console_pending": {
     "XVMAudioService.dll": [

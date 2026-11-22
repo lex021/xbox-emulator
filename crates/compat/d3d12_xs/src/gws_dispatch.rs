@@ -143,7 +143,7 @@ pub(crate) unsafe fn try_create(
     if !matches!(ex.stage, tombox_xshader::Stage::Compute)
         || !tombox_xshader::rdna2::disassemble(&ex.isa)
             .iter()
-            .any(|i| i.mnemonic == "ds_gws_sema_p")
+            .any(|i| matches!(i.mnemonic.as_str(), "ds_gws_sema_p" | "ds_gws_barrier"))
     {
         return None;
     }

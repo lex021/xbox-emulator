@@ -638,3 +638,62 @@ fn ds_gws_phased_dispatch_wakes_across_physical_groups() {
     assert_eq!(&scratch[1 + 5..1 + 2 * 5], &[0; 5]);
     assert_eq!(actual, gds, "release-all must not deposit credits");
 }
+
+#[test]
+fn ds_gws_barrier_reloads_and_releases_only_after_last_arrival() {
+    use tombox_xshader::gds_abi::{TB_GWS_TABLE_DWORD, tb_gds_byte_offset};
+    use tombox_xshader::hlsl::{translate_gws_fused_dispatch, translate_gws_phased_dispatch};
+
+    const RESOURCE: u32 = 7;
+    const SENTINEL: u32 = 0x51ab_1e7e;
+    let counter = (TB_GWS_TABLE_DWORD + RESOURCE) as usize;
+    let pending = tb_gds_byte_offset(TB_GWS_TABLE_DWORD + RESOURCE);
+    for (groups, phased) in [(4, false), (5, true)] {
+        for extra in [0, 1] {
+            // Lane 0 is inactive. Lane 1 supplies the next generation's count.
+            // DATA0 is deliberately different from the encoded ADDR operand.
+            let mut words = vec![
+                vop1(1, 22, ic(11)),
+                vop2(0x25, 20, ic(groups as i32 - 2 + extra as i32), 0),
+                vopc(0xd1, ic(0), 0),
+            ];
+            words.extend_from_slice(&gds_op(0x1d, RESOURCE, 20, 22, 0, 0));
+            words.push(vop2(0x25, 20, ic(7), 0));
+            words.extend_from_slice(&gds_op(0x1d, RESOURCE, 20, 22, 0, 0));
+            words.extend_from_slice(&smem(2, 8, 4, 0, SNULL));
+            words.extend_from_slice(&[
+                vop1(1, 21, 5),
+                vop2(0x1a, 1, ic(2), 21),
+                vop1(1, 10, LIT),
+                SENTINEL,
+                vopc(0xd2, ic(1), 0),
+                0xe070_1000,
+                0x8002_0a01,
+                S_ENDPGM,
+            ]);
+            let ex = cs_extract(&words, 32);
+            assert!(translate(&ex).is_err());
+            let mut gds = init();
+            gds[counter] = groups - 1;
+            let (output, actual, scratch) = if phased {
+                let plan = translate_gws_phased_dispatch(&ex, [groups, 1, 1]).unwrap();
+                execute(&plan.shader, &gds, groups, Some((&plan, plan.max_rounds))).unwrap()
+            } else {
+                let shader = translate_gws_fused_dispatch(&ex, [groups, 1, 1]).unwrap();
+                execute(&shader, &gds, 1, None).unwrap()
+            };
+            let marker = if extra == 0 { SENTINEL } else { 0 };
+            assert_eq!(&output[..groups as usize], vec![marker; groups as usize]);
+            assert!(output[groups as usize..].iter().all(|&value| value == 0));
+            if phased {
+                let queued = if extra == 0 { 0 } else { pending };
+                assert_eq!(
+                    &scratch[1 + groups as usize..1 + 2 * groups as usize],
+                    vec![queued; groups as usize],
+                );
+            }
+            gds[counter] = if extra == 0 { 8 } else { 0 };
+            assert_eq!(actual, gds);
+        }
+    }
+}

@@ -394,9 +394,10 @@ fn hw_gds_round_trip_through_the_shader_binding() {
 }
 
 fn gws_shader_fixture(opcode: u32, resource: u32) -> Vec<u8> {
-    // Synthetic Xbox compute container with one global semaphore instruction.
+    // Synthetic Xbox compute container with one global wave sync instruction.
     let isa = [
         0xd580_0000u32, 0x03fe_0000, 0, // VOP3 nop, including the literal operand
+        0x7e00_0289, // v_mov_b32 v0, 9 (next barrier count)
         0xd800_0000 | (opcode << 18) | (1 << 17) | resource, 0,
         0xbf81_0000,
     ];
@@ -429,6 +430,7 @@ fn hw_gws_compute_pso_selects_dispatch_variant() {
     const RESOURCE: u32 = 7;
     let dxbc = gws_shader_fixture(0x1c, RESOURCE);
     let post_shader = gws_shader_fixture(0x1a, RESOURCE);
+    let barrier_shader = gws_shader_fixture(0x1d, RESOURCE + 1);
     let ex = tombox_xshader::extract(&dxbc).expect("Xbox fixture");
     assert_eq!(ex.isa_preamble[1..], [32, 1, 1]);
     assert!(tombox_xshader::hlsl::translate(&ex).is_err());
@@ -466,14 +468,22 @@ fn hw_gws_compute_pso_selects_dispatch_variant() {
         let hr = call!(dev, 11, (*const u8, *const Guid, *mut *mut c_void) -> i32, desc.as_ptr(), &IID_PSO, &mut producer);
         assert!(hr >= 0 && !producer.is_null(), "GWS producer PSO creation hr={hr:#010x}");
 
+        desc[8..16].copy_from_slice(&(barrier_shader.as_ptr() as u64).to_le_bytes());
+        desc[16..24].copy_from_slice(&(barrier_shader.len() as u64).to_le_bytes());
+        let mut barrier_pso = core::ptr::null_mut();
+        let hr = call!(dev, 11, (*const u8, *const Guid, *mut *mut c_void) -> i32, desc.as_ptr(), &IID_PSO, &mut barrier_pso);
+        assert!(hr >= 0 && !barrier_pso.is_null(), "GWS barrier PSO creation hr={hr:#010x}");
+
         let src = buffer(g.dev, HEAP_UPLOAD, 256, 0, ST_GENERIC_READ);
         core::ptr::write_volatile(src.cpu as *mut u32, 0);
+        let barrier_groups = if phased { 5 } else { 2 };
+        core::ptr::write_volatile(src.cpu.add(4) as *mut u32, barrier_groups - 1);
         let dst = buffer(g.dev, HEAP_DEFAULT, 256, 0, ST_COPY_DEST);
         let out = buffer(g.dev, HEAP_READBACK, 256, 0, ST_COPY_DEST);
         let raw = crate::cmdlist_wrap::unwrap(list);
         let counter = tombox_xshader::gds_abi::TB_GWS_TABLE_DWORD + RESOURCE;
         // The emulated semaphore table is outside the title-visible GDS range.
-        crate::gds::copy(raw, true, counter, 1, src.va, "seed GWS test");
+        crate::gds::copy(raw, true, counter, 2, src.va, "seed GWS test");
         call!(list, X_SET_COMPUTE_ROOT_SIGNATURE, (*mut c_void) -> (), rs);
         // Credits must survive a guest dispatch boundary and a compute PSO switch.
         call!(list, X_SET_PSO, (*mut c_void) -> (), producer);
@@ -493,16 +503,18 @@ fn hw_gws_compute_pso_selects_dispatch_variant() {
             barrier[..4].copy_from_slice(&2u32.to_le_bytes());
             call!(list, X_BARRIER, (u32, *const u8) -> (), 1, barrier.as_ptr());
         }
+        call!(list, X_SET_PSO, (*mut c_void) -> (), barrier_pso);
+        call!(list, X_DISPATCH, (u32, u32, u32) -> (), barrier_groups, 1, 1);
         call!(list, X_SET_PSO, (*mut c_void) -> (), normal);
         call!(list, X_DISPATCH, (u32, u32, u32) -> (), 2, 1, 1);
-        crate::gds::copy(raw, false, counter, 1, dst.va, "read GWS test");
+        crate::gds::copy(raw, false, counter, 2, dst.va, "read GWS test");
         let mut barrier = [0u8; 32];
         barrier[8..16].copy_from_slice(&(dst.res as u64).to_le_bytes());
         barrier[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
         barrier[20..24].copy_from_slice(&ST_COPY_DEST.to_le_bytes());
         barrier[24..28].copy_from_slice(&ST_COPY_SOURCE.to_le_bytes());
         call!(list, X_BARRIER, (u32, *const u8) -> (), 1, barrier.as_ptr());
-        call!(list, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (), out.res, 0, dst.res, 0, 4);
+        call!(list, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (), out.res, 0, dst.res, 0, 8);
         crate::fill::barrier_pub(raw, dst.res, ST_COPY_SOURCE, ST_COPY_DEST);
         assert!(call!(list, X_CLOSE, () -> i32) >= 0);
         let f = fence(g.dev);
@@ -510,6 +522,7 @@ fn hw_gws_compute_pso_selects_dispatch_variant() {
         assert!(reached(f, 1, Duration::from_secs(5)));
         let expected = 12 - 2 - 3 - if phased { 5 } else { 0 };
         assert_eq!(rd(&out, 0), expected);
+        assert_eq!(rd(&out, 4), 9, "the last wave reloads the barrier counter");
         if phased {
             // A second submission must start with zeroed checkpoints even though
             // the command list and its scratch allocation are the same.
