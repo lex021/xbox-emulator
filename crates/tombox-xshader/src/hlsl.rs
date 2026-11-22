@@ -84,6 +84,30 @@ const XYZW: [&str; 4] = ["x", "y", "z", "w"];
 /// face-local S/T, face index 0..5 = +X,-X,+Y,-Y,+Z,-Z). Hardware cube sampling takes
 /// (s, t, face) with s,t = sc/|ma| + 1.5 (so each is in [1, 2]); `tb_cube_dir` inverts that
 /// to the direction vector HLSL TextureCube sampling expects.
+pub fn f16_exact(v: f32) -> bool {
+    let b = v.to_bits() & 0x7fff_ffff;
+    if b == 0 {
+        return true;
+    }
+    if b >= 0x7f80_0000 {
+        return b == 0x7f80_0000;
+    }
+    let e = (b >> 23) as i32 - 127;
+    if !(-24..=15).contains(&e) {
+        return false;
+    }
+    let keep = if e >= -14 { 10 } else { 10 - (-14 - e) };
+    let m = b & 0x7f_ffff;
+    m & ((1u32 << (23 - keep)) - 1) == 0
+}
+
+pub fn fma16_operands_exact(ops: &[Opnd]) -> bool {
+    ops.iter().all(|o| match o {
+        Opnd::ConstF32(x) => f16_exact(*x),
+        _ => true,
+    })
+}
+
 pub(crate) const CUBE_HELPERS: &str = r#"uint tb_perm_byte(uint hi, uint lo, uint sel) { if (sel >= 13u) return 0xffu; if (sel == 12u) return 0u; if (sel == 11u) return (hi >> 31) * 0xffu; if (sel == 10u) return ((hi >> 15) & 1u) * 0xffu; if (sel == 9u) return (lo >> 31) * 0xffu; if (sel == 8u) return ((lo >> 15) & 1u) * 0xffu; return sel >= 4u ? ((hi >> ((sel - 4u) * 8u)) & 0xffu) : ((lo >> (sel * 8u)) & 0xffu); }
 uint tb_perm(uint hi, uint lo, uint sel) { return tb_perm_byte(hi, lo, sel & 0xffu) | (tb_perm_byte(hi, lo, (sel >> 8) & 0xffu) << 8) | (tb_perm_byte(hi, lo, (sel >> 16) & 0xffu) << 16) | (tb_perm_byte(hi, lo, sel >> 24) << 24); }
 bool tb_cmp_class(uint b, uint mask) { uint e = (b >> 23) & 0xffu; uint m = b & 0x7fffffu; bool neg = (b >> 31) != 0u; uint c; if (e == 0xffu) { c = (m != 0u) ? (((m & 0x400000u) != 0u) ? 1u : 0u) : (neg ? 2u : 9u); } else if (e == 0u) { c = (m == 0u) ? (neg ? 5u : 6u) : (neg ? 4u : 7u); } else { c = neg ? 3u : 8u; } return ((mask >> c) & 1u) != 0u; }uint tb_bfe_i32(uint a, uint b) { uint o = b & 31u, w = (b >> 16) & 127u; if (w == 0u) return 0u; if (w + o >= 32u) return asuint(asint(a) >> o); return asuint(asint(a << (32u - w - o)) >> (32u - w)); }uint tb_mulhi_u32(uint a, uint b) { uint a0 = a & 0xffffu, a1 = a >> 16, b0 = b & 0xffffu, b1 = b >> 16; uint p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1; uint mid = (p00 >> 16) + (p01 & 0xffffu) + (p10 & 0xffffu); return p11 + (p01 >> 16) + (p10 >> 16) + (mid >> 16); }
@@ -98,9 +122,12 @@ int tb_nrm(float v, uint k) { uint b = asuint(v); uint a = b & 0x7fffffffu; if (
 float tb_rev(float x) { return (abs(x) < 0.5) ? x : x - round(x); }
 float tb_ldexp32(float x, int e) { int k = clamp(e, -330, 330); return (float)((double)x * asdouble(0u, (uint)(k + 1023) << 20)); }
 float tb_rto(double s) { float f = (float)s; if ((double)f != s) { uint u = asuint(f); if (abs((double)f) > abs(s)) u -= 1u; f = asfloat(u | 1u); } return f; }
+float tb_fma16(float a, float b, float c) { precise float p = a * b; precise float s = p + c; if ((asuint(s) & 0x7fffffffu) >= 0x7f800000u) return s; precise float bb = s - p; precise float e = (p - (s - bb)) + (c - bb); uint u = asuint(s); if (e != 0.0) { if ((e > 0.0) != (s > 0.0)) u -= 1u; u |= 1u; } return asfloat(u); }
 float tb_mull(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }
 #ifdef TB_FAST_FMA
 float tb_fma(float a, float b, float c) { precise float r = mad(a, b, c); uint m = 0x7fffffffu; uint xa = asuint(a) & m, xb = asuint(b) & m, xc = asuint(c) & m; if (max(max(xa, xb), xc) > 0x7f800000u) return asfloat(((xa > 0x7f800000u) ? asuint(a) : ((xb > 0x7f800000u) ? asuint(b) : asuint(c))) | 0x400000u); return ((asuint(r) & m) > 0x7f800000u) ? asfloat(0x7fc00000u) : r; }
+#elif defined(TB_HYBRID_FMA)
+float tb_fma(float a, float b, float c) { precise float r0 = mad(a, b, c); uint m0 = 0x7fffffffu; uint ya = asuint(a) & m0, yb = asuint(b) & m0, yc = asuint(c) & m0, yr = asuint(r0) & m0; if ((ya == 0u || (ya >= 0x00800000u && ya < 0x7f800000u)) && (yb == 0u || (yb >= 0x00800000u && yb < 0x7f800000u)) && (yc == 0u || (yc >= 0x00800000u && yc < 0x7f800000u)) && (ya == 0u || yb == 0u || (ya >> 23) + (yb >> 23) >= 129u) && yr >= 0x01000000u && yr < 0x7f000000u) return r0; precise double p = (double)a * (double)b; precise double dc = (double)c; precise double s = p + dc; precise double bb = s - p; precise double e = (p - (s - bb)) + (dc - bb); uint lo, hi; asuint(s, lo, hi); uint fin = (uint)(abs(s) < 1.0e300); uint adj = fin & (uint)(e != 0.0) & (~lo & 1u); uint dn = adj & (uint)((e > 0.0) != (s > 0.0)); precise float r = (float)asdouble(lo + adj - 2u * dn, hi - (dn & (uint)(lo == 0u))); uint m = 0x7fffffffu; float q = ((asuint(r) & m) > 0x7f800000u) ? asfloat(0x7fc00000u) : r; float sp = (max(max(asuint(a) & m, asuint(b) & m), asuint(c) & m) > 0x7f800000u) ? asfloat((((asuint(a) & m) > 0x7f800000u) ? asuint(a) : (((asuint(b) & m) > 0x7f800000u) ? asuint(b) : asuint(c))) | 0x400000u) : q; return ((fin | (uint)(abs(p) < 1.0e300)) != 0u) ? r : sp; }
 #else
 float tb_fma(float a, float b, float c) { precise double p = (double)a * (double)b; precise double dc = (double)c; precise double s = p + dc; precise double bb = s - p; precise double e = (p - (s - bb)) + (dc - bb); uint lo, hi; asuint(s, lo, hi); uint fin = (uint)(abs(s) < 1.0e300); uint adj = fin & (uint)(e != 0.0) & (~lo & 1u); uint dn = adj & (uint)((e > 0.0) != (s > 0.0)); precise float r = (float)asdouble(lo + adj - 2u * dn, hi - (dn & (uint)(lo == 0u))); uint m = 0x7fffffffu; float q = ((asuint(r) & m) > 0x7f800000u) ? asfloat(0x7fc00000u) : r; float sp = (max(max(asuint(a) & m, asuint(b) & m), asuint(c) & m) > 0x7f800000u) ? asfloat((((asuint(a) & m) > 0x7f800000u) ? asuint(a) : (((asuint(b) & m) > 0x7f800000u) ? asuint(b) : asuint(c))) | 0x400000u) : q; return ((fin | (uint)(abs(p) < 1.0e300)) != 0u) ? r : sp; }
 #endif
@@ -110,7 +137,11 @@ float tb_u2f(uint a) { precise float r = (float)(a & 0xffff0000u) + (float)(a & 
 float tb_log(float x) { return tb_qn((asuint(x) == 0x7f800000u) ? x : log2(x)); }
 float tb_fsub(float a, float b) { precise float r = a - b; return tb_qn(r); }
 float tb_fract(float x) { if ((asuint(x) & 0x7fffffffu) >= 0x7f800000u) return asfloat(0x7fc00000u); precise float f = x - floor(x); return min(f, asfloat(0x3f7fffffu)); }
+#ifdef TB_FAST_F2H
+uint tb_f2h(float x) { uint b = asuint(x); uint s = (b >> 16) & 0x8000u; uint a = b & 0x7fffffffu; if (a > 0x7f800000u) return s | 0x7e00u | ((a >> 13) & 0x3ffu); if (a >= 0x477ff000u) return s | 0x7c00u; float ax = asfloat(a); uint h = f32tof16(ax) & 0x7fffu; float d1 = ax - f16tof32(h); float d2 = f16tof32(h + 1u) - ax; return s | ((d2 < d1 || (d2 == d1 && (h & 1u) != 0u)) ? h + 1u : h); }
+#else
 uint tb_f2h(float x) { uint b = asuint(x); uint s = (b >> 16) & 0x8000u; uint a = b & 0x7fffffffu; if (a > 0x7f800000u) return s | 0x7e00u | ((a >> 13) & 0x3ffu); if (a >= 0x477ff000u) return s | 0x7c00u; if (a >= 0x38800000u) { uint r = a - 0x38000000u; return s | ((r + 0xfffu + ((r >> 13) & 1u)) >> 13); } if (a < 0x33000000u) return s; uint e = a >> 23; uint m = (a & 0x7fffffu) | 0x800000u; uint sh = 126u - e; uint q = m >> sh; uint rem = m & ((1u << sh) - 1u); uint hf = 1u << (sh - 1u); if (rem > hf || (rem == hf && (q & 1u) != 0u)) q += 1u; return s | q; }
+#endif
 float tb_rne(float x) { float a = abs(x); if (!(a < 8388608.0)) return x; float r = floor(a); float f = a - r; if (f > 0.5 || (f == 0.5 && (((uint)r) & 1u) != 0u)) r += 1.0; return asfloat(asuint(r) | (asuint(x) & 0x80000000u)); }
 uint tb_cvt_i(float x) { if (tb_nan(x)) return 0u; if (x >= 2147483648.0) return 0x7fffffffu; if (x <= -2147483648.0) return 0x80000000u; return asuint((int)x); }
 uint tb_cvt_u(float x) { if (tb_nan(x) || x <= 0.0) return 0u; if (x >= 4294967296.0) return 0xffffffffu; return (uint)x; }
@@ -4071,7 +4102,11 @@ impl<'a> Emitter<'a> {
             return self.wv(&d, &format!("tb_hzb({})", hres(format!("t{t}"))));
         }
         if m == "v_fma_f16" {
-            let e = format!("tb_rto((double)({}) * (double)({}) + (double)({}))", h16(&s[0])?, h16(&s[1])?, h16(&s[2])?);
+            let e = if fma16_operands_exact(&s[..2]) {
+                format!("tb_fma16({}, {}, {})", h16(&s[0])?, h16(&s[1])?, h16(&s[2])?)
+            } else {
+                format!("tb_rto((double)({}) * (double)({}) + (double)({}))", h16(&s[0])?, h16(&s[1])?, h16(&s[2])?)
+            };
             return self.wv(&d, &hres(e));
         }
         if matches!(m.as_str(), "v_pk_fma_f16" | "v_pk_add_f16" | "v_pk_mul_f16" | "v_pk_min_f16" | "v_pk_max_f16") {
@@ -4098,7 +4133,7 @@ impl<'a> Emitter<'a> {
                     v.push(e);
                 }
                 halves.push(match m.as_str() {
-                    "v_pk_fma_f16" => format!("tb_rto((double)({}) * (double)({}) + (double)({}))", v[0], v[1], v[2]),
+                    "v_pk_fma_f16" => format!("tb_fma16({}, {}, {})", v[0], v[1], v[2]),
                     "v_pk_add_f16" => format!("{} + {}", v[0], v[1]),
                     "v_pk_mul_f16" => format!("{} * {}", v[0], v[1]),
                     "v_pk_min_f16" => format!("min({}, {})", v[0], v[1]),

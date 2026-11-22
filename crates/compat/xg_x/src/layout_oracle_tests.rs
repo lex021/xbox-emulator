@@ -74,7 +74,7 @@ fn texture2d_layout_export_matches_console() {
     for (w, h) in [(1, 1), (64, 64), (100, 37), (1920, 1080), (513, 7)] {
         for (mips, arr) in [(0, 1), (1, 1), (2, 6)] {
             for fmt in FMTS {
-                for mode in [8, 13, 14, 31] {
+                for mode in [8, 13, 14, 31, 0, 2, 4, 5, 7, 9, 10, 16, 17, 20, 24, 27, 32] {
                     ok += assert_same_layout("2D", theirs, XGComputeTexture2DLayout, &desc2d(w, h, mips, arr, fmt, mode)) as u32;
                 }
             }
@@ -98,6 +98,27 @@ fn texture3d_layout_matches_console() {
         }
     }
     assert!(ok > 50, "only {ok} valid 3D descs");
+}
+
+#[test]
+fn texture2d_planar_zero_and_hw2_layouts_match_console() {
+    let o = oracle();
+    let theirs: Layout = unsafe { core::mem::transmute(o.f("XGComputeTexture2DLayout")) };
+    let mut ok = 0;
+    for version in [0, 2] {
+        o.hardware_version(version);
+        for (w, h) in [(1, 1), (100, 37), (300, 70), (1920, 1080)] {
+            for (mips, arr) in [(0, 1), (1, 1), (3, 2)] {
+                for fmt in [0, 19, 20, 44, 45, 103, 104, 105, 106, 110, 118, 120, 28, 71, 98] {
+                    for mode in [8, 13, 14, 0, 10, 17, 31] {
+                        ok += assert_same_layout("2D planar/hw", theirs, XGComputeTexture2DLayout, &desc2d(w, h, mips, arr, fmt, mode)) as u32;
+                    }
+                }
+            }
+        }
+    }
+    o.hardware_version(0);
+    assert!(ok > 200, "only {ok} valid descs");
 }
 
 #[test]
@@ -232,4 +253,62 @@ fn texture_computer_with_pitch_matches_console() {
             }
         }
     }
+}
+
+#[test]
+fn texture_computer_with_pitch_chains_and_planes_match_console() {
+    let o = oracle();
+    let theirs: extern "system" fn(*const u8, u32, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(o.f("XGCreateTextureComputerWithPitch")) };
+    let mut ok = 0;
+    for (dim, w, h, da) in [(2u32, 300u64, 1u32, 2u16), (3, 7, 1, 1), (3, 100, 37, 1), (3, 64, 360, 2), (4, 100, 37, 5)] {
+        for mips in [0u16, 1, 3] {
+            for fmt in [28u32, 71, 98, 61, 0, 20, 44, 103, 104, 105] {
+                for lay in [0u32, 0x100, 0x105, 0x106, 0x107, 0x108, 0x10a, 0x10d, 0x10e, 0x110, 0x111, 0x11f] {
+                    for pitch in [0u32, 1, 64, 65, 129, 256, 300, 16385, 20000] {
+                        let mut d = resource_desc_bytes(w, h, fmt, lay);
+                        d[0..4].copy_from_slice(&dim.to_le_bytes());
+                        d[0x1c..0x1e].copy_from_slice(&da.to_le_bytes());
+                        d[0x1e..0x20].copy_from_slice(&mips.to_le_bytes());
+                        let (mut t, mut u): (*mut c_void, *mut c_void) = (core::ptr::null_mut(), core::ptr::null_mut());
+                        let (ht, hu) = (theirs(d.as_ptr(), pitch, &mut t), XGCreateTextureComputerWithPitch(d.as_ptr(), pitch, &mut u));
+                        let tag = format!("dim={dim} {w}x{h}x{da} mips={mips} fmt={fmt} lay={lay:#x} pitch={pitch}");
+                        assert_eq!(ht < 0, hu < 0, "{tag} console={ht:#x} ours={hu:#x}");
+                        if ht < 0 {
+                            continue;
+                        }
+                        let (a, b) = (computer_layout(t), computer_layout(u));
+                        release(t);
+                        release(u);
+                        let diff = a.iter().zip(&b).position(|(x, y)| x != y);
+                        assert_eq!(diff, None, "{tag} first difference at {:#x}", diff.unwrap_or(0));
+                        ok += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(ok > 2000, "only {ok} valid descs");
+}
+
+#[test]
+fn texture2d_display_msaa_hw2_matches_console() {
+    let o = oracle();
+    let theirs: Layout = unsafe { core::mem::transmute(o.f("XGComputeTexture2DLayout")) };
+    let mut ok = 0;
+    for version in [0, 2] {
+        o.hardware_version(version);
+        for fmt in [2u32, 10, 24, 28, 61, 77, 83, 98] {
+            for samples in [1u32, 2, 4, 8] {
+                for (w, h) in [(64, 64), (100, 37), (300, 70), (1920, 1080)] {
+                    for mode in [9, 10, 11, 12, 14] {
+                        let mut d = desc2d(w, h, 1, 1, fmt, mode);
+                        d[0x14..0x18].copy_from_slice(&samples.to_le_bytes());
+                        ok += assert_same_layout("2D display msaa", theirs, XGComputeTexture2DLayout, &d) as u32;
+                    }
+                }
+            }
+        }
+    }
+    o.hardware_version(0);
+    assert!(ok > 400, "only {ok} valid descs");
 }

@@ -311,15 +311,16 @@ public static class TbFrame {
     s.Drawn = s.Std >= 4 && s.Distinct >= 24;
     s.Verdict = s.Mean < 3 && s.Std < 2 ? "black" : (s.Std < 2 || s.Distinct < 8 ? "uniform" : (!s.Drawn ? "nearly uniform" : (s.Mean < 18 ? "dark" : "drawn")));
   }
+  static System.Threading.Tasks.Task pending;
   public static Shot Capture(uint[] pids, string path) {
     int w, h;
     IntPtr hw = Find(pids, out w, out h);
     if (hw == IntPtr.Zero) return null;
     var s = new Shot { W = w, H = h };
     var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
-    if (IsHungAppWindow(hw)) { bmp.Dispose(); s.Method = "skipped"; s.Verdict = "hung"; return s; }
+    if (pending != null && !pending.IsCompleted) { bmp.Dispose(); s.Method = "previous capture still blocked"; s.Verdict = "hung"; return s; }
     bool ok = false;
-    var job = System.Threading.Tasks.Task.Run(() => { using (var g = Graphics.FromImage(bmp)) { IntPtr dc = g.GetHdc(); ok = PrintWindow(hw, dc, 3); g.ReleaseHdc(dc); } });
+    var job = pending = System.Threading.Tasks.Task.Run(() => { using (var g = Graphics.FromImage(bmp)) { IntPtr dc = g.GetHdc(); ok = PrintWindow(hw, dc, 3); g.ReleaseHdc(dc); } });
     if (!job.Wait(3000)) { s.Method = "PrintWindow timed out"; s.Verdict = "hung"; return s; }
     s.Method = ok ? "PrintWindow" : "PrintWindow failed";
     Stats(bmp, s);
@@ -510,10 +511,21 @@ foreach ($t in $Titles) {
   }
 
   foreach ($f in Get-SourceFiles $t.LogDir) { if ($f.Src -ne 'launcher') { Remove-Item -LiteralPath $f.Path -Force -ErrorAction SilentlyContinue } }
+  $lock = Join-Path $OutRoot 'GAME_LOCK'
+  $lockWait = (Get-Date).AddMinutes(30)
+  while ($true) {
+    try { $fs = [IO.File]::Open($lock, 'CreateNew', 'Write', 'None'); $b = [Text.Encoding]::UTF8.GetBytes("batch_test $($t.Slug) $(Get-Date -Format s)"); $fs.Write($b, 0, $b.Length); $fs.Close(); break } catch {}
+    if ((Get-Date) -gt $lockWait) { break }
+    Start-Sleep -Seconds 5
+  }
   $dumpRoot = Get-DumpRoot $t
   $snap = Get-DumpSnapshot $dumpRoot
   Say "  dump snapshot: $($snap.Count) files under $dumpRoot" 'DarkGray'
   $netOk = $false
+  $padDir = Join-Path $t.LogDir 'pad'
+  $splashAt = $null
+  $splashPresses = 0
+  $splashDone = $false
   $launcher = Join-Path $dir 'launcher.txt'
   $start = Get-Date
   $ps = Start-Process -FilePath 'powershell.exe' -ArgumentList $la -RedirectStandardOutput $launcher -RedirectStandardError (Join-Path $dir 'launcher.err.txt') -WindowStyle Hidden -PassThru
@@ -542,6 +554,10 @@ foreach ($t in $Titles) {
           if ($res.Live.Contains($m.Name)) { continue }
           if (($m.Src -eq 'any' -or $m.Src -eq $s.Src) -and $m.Rx.IsMatch($l)) { $res.Live[$m.Name] = [Math]::Round($el, 1); Say ("  +{0:N0}s milestone: {1}" -f $el, $m.Name) 'Green' }
         }
+        if ($s.Src -eq 'ods' -and $t.Kind -eq 'fortnite' -and -not $splashDone) {
+          if ($l -match 'Setting user focus to widget Splash_Screen' -and -not $splashAt) { $splashAt = $el }
+          if ($l -match 'CloseSplashScreen|Auto-login attempt started') { $splashDone = $true; Say ("  +{0:N0}s splash closed" -f $el) 'Green' }
+        }
         if ($s.Src -eq 'ods') { $u = $UiRx.Match($l); if ($u.Success) { Say ("  +{0:N0}s UI State {1} -> {2}" -f $el, $u.Groups[1].Value, $u.Groups[2].Value) 'Green' } }
         if ($s.Src -eq 'compat') { $fm = $FpsRx.Match($l); if ($fm.Success) { $lastFps = $fm.Groups[1].Value }; if (-not $netOk -and $l -match '\[net_guard\] installed') { $netOk = $true; Say ("  +{0:N0}s network guard installed" -f $el) 'Green' } }
         if ($s.Src -eq 'trace' -and $l -match 'firstChance=0|ACCESS_VIOLATION|EXIT_PROCESS|\[HANG\]|too many exceptions') { Say ("  +{0:N0}s {1}" -f $el, $l.Trim()) 'Yellow' }
@@ -549,6 +565,15 @@ foreach ($t in $Titles) {
     }
     if (((Get-Date) - $lastBeat).TotalSeconds -ge 60) { $lastBeat = Get-Date; Say ("  +{0:N0}s running; fps {1}; muted {2}" -f $el, $(if ($lastFps) { $lastFps } else { '-' }), $muted) 'DarkGray' }
     if (-not $netOk -and $el -ge 45) { $res.Notes.Add("network guard not installed after $([int]$el)s: run stopped to keep the title offline"); Say '  network guard missing: stopping the run' 'Red'; $timedOut = $true; break }
+    if ($splashAt -and -not $splashDone -and $splashPresses -lt 6 -and $el -ge $splashAt + 3 + 15 * $splashPresses) {
+      New-Item -ItemType Directory -Force -Path $padDir | Out-Null
+      $pn = '{0:D20}_batch' -f [DateTime]::UtcNow.Ticks
+      [IO.File]::WriteAllText((Join-Path $padDir "$pn.tmp"), "press a`n", (New-Object Text.UTF8Encoding $false))
+      Move-Item -LiteralPath (Join-Path $padDir "$pn.tmp") -Destination (Join-Path $padDir "$pn.cmd")
+      $splashPresses++
+      $res.Notes.Add("virtual gamepad: 'press a' queued at +$([int]$el)s to close the splash screen (no mouse or keyboard input)")
+      Say ("  +{0:N0}s virtual pad: press A on the splash screen" -f $el) 'DarkGray'
+    }
     if ($el -ge $nextShot) { Invoke-FrameCapture $res ([uint32[]]$pids) $el ''; $nextShot = if ($nextShot -lt 45) { 45 } else { $nextShot + $CaptureEvery } }
     $ps.Refresh()
     if ($ps.HasExited) { break }
@@ -563,6 +588,7 @@ foreach ($t in $Titles) {
     foreach ($g in $left) { try { Stop-Process -Id $g.Id -Force } catch {} }
   }
   Start-Sleep -Seconds 2
+  Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
   $after = Get-DumpSnapshot $dumpRoot
   $changed = @($after.Keys | Where-Object { -not $snap.ContainsKey($_) -or $snap[$_] -ne $after[$_] }) + @($snap.Keys | Where-Object { -not $after.ContainsKey($_) })
   if ($changed.Count) { $res.Notes.Add("DUMP MODIFIED: $($changed.Count) file(s) under $dumpRoot changed during the run: $(($changed | Select-Object -First 10) -join ', ')"); Say "  DUMP MODIFIED: $($changed.Count) files" 'Red' } else { $res.Notes.Add("dump unchanged ($($after.Count) files under $dumpRoot)") }

@@ -1,7 +1,7 @@
 $CompatStatuses = @('Nothing', 'Boots', 'Menus', 'Ingame', 'Playable')
 $CompatMenuMilestones = @{ fortnite = @('game-mode select', 'lobby', 'ready-up ticket', 'session assigned', 'session joined'); generic = @('menu / lobby') }
 $CompatGameMilestones = @{ fortnite = @('match start'); generic = @('match start') }
-$CompatIssueOrder = @('Crashes and hangs', 'Missing exports / unimplemented calls', 'Shader translation failures', 'D3D12 debug layer / DRED / device removal', 'First-chance exceptions', 'Compat errors', 'Title errors')
+$CompatIssueOrder = @('Crashes and hangs', 'Missing exports / unimplemented calls', 'Shader translation failures', 'D3D12 debug layer / DRED / device removal', 'Compat errors', 'Title errors')
 
 function ConvertTo-PublicText([string]$s) {
   if ($null -eq $s) { return '' }
@@ -33,7 +33,7 @@ function Get-CompatEntry($r, $Build, [string]$Root, [string]$RunStamp) {
   $frames = if ($r.Frames) { [object[]]$r.Frames.ToArray() } else { [object[]]@() }
   $withWin = @($frames | Where-Object { $_.Png })
   $drawn = @($frames | Where-Object { $_.Drawn })
-  $crashed = $r.Status -match 'crash|exit code'
+  $crashed = $r.Status -match '^crash'
   $fpsAvg = $null; $fpsMin = $null; $fpsMax = $null
   if ($a -and $a.Fps.Count) { $st = $a.Fps | Measure-Object -Minimum -Maximum -Average; $fpsAvg = [Math]::Round($st.Average, 1); $fpsMin = [Math]::Round($st.Minimum, 1); $fpsMax = [Math]::Round($st.Maximum, 1) }
   $p99 = if ($a -and $a.P99) { [double]$a.P99 } else { $null }

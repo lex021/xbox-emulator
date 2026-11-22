@@ -31,7 +31,7 @@ Upstream's metric set (same definitions as upstream `tools/progress/gen.py`, For
 | shader_stages | 0 | 8 | 0.0 |
 | milestones | 9 | 18 | 50.0 |
 | titles_examined | 6 | - | - |
-| console_exports | 2124 | 2155 | 98.56 |
+| console_exports | 2131 | 2155 | 98.89 |
 | shader_compile_lobby_frame | 139 | 139 | 100.0 |
 | shader_compile_fixtures | 25 | 25 | 100.0 |
 | shader_compile_full_sweep | not published | 105506 | - |
@@ -41,7 +41,7 @@ Upstream's metric set (same definitions as upstream `tools/progress/gen.py`, For
 | title_imports_Terraria | 61 | 61 | 100.0 |
 | title_imports_Trackmania | 48 | 48 | 100.0 |
 | title_imports_Minecraft | 34 | 35 | 97.14 |
-| console_exports_targeted | 2124 | 2153 | 98.65 |
+| console_exports_targeted | 2131 | 2153 | 98.98 |
 | console_exports_not_targeted | not published | 2 | - |
 
 Shader compile: all 139 shaders of the lobby frame compile with DXC (TomBox `docs/DEVELOPMENT_LOG.md:894`); 25/25 fixtures compile (`:672`). The full-library compile sweep (`:706`) has no published final count, so no compile badge is shown.
@@ -1127,8 +1127,8 @@ Console-related exports of the DLLs in each title's EmbeddedXvd `Windows\System3
 | xdxr_i.dll | System32 | no | 1 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | XDefiant None; Terraria None; Trackmania None |
 | xfp_gc.dll | System32 | no | 8 | 8 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xfrontpaneldisplay.dll | System32 | no | 8 | 8 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 6 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
-| xg_x.dll | System32 | no | 21 | 15 | 0 | 0 | 0 | 0 | 6 | 0 | 0 | 0 | 0 | 0 | 3 | 4 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
-| xg_xs.dll | System32 | no | 23 | 20 | 0 | 0 | 0 | 0 | 1 | 2 | 0 | 0 | 1 | 1 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
+| xg_x.dll | System32 | no | 21 | 21 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 4 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
+| xg_xs.dll | System32 | no | 23 | 21 | 0 | 0 | 0 | 0 | 0 | 2 | 0 | 0 | 1 | 1 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xgs12.dll | System32 | no | 17 | 17 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xgs12_10.dll | System32 | no | 21 | 21 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xgs12_10d.dll | System32 | no | 21 | 21 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
@@ -1151,7 +1151,7 @@ Console-related exports of the DLLs in each title's EmbeddedXvd `Windows\System3
 
 ### Not targeted (no analysed title references them)
 
-The console-library total above (2155 exports in 110 libraries) keeps every console-only export in the denominator, including devkit, tools and OS service DLLs that no analysed title imports. 108 libraries (2153 exports) are imported by at least one title, directly or through API-set host attribution, or are emulator-provided; the 2 below (2 exports) are not targeted: no title EXE or shipped DLL imports any of their exports and the emulator does not provide them. They stay `missing` in the headline instead of being dropped from it, so the percentage is not inflated; a library moves out of this list as soon as a title imports it or an emulator crate exports it. The earlier Xbox-only figure (2078 exports) counted only DLLs with no same-named PC DLL and is kept in `summary.json` under `all_including_pc`. Coverage inside the 108 targeted libraries alone: 2124/2153.
+The console-library total above (2155 exports in 110 libraries) keeps every console-only export in the denominator, including devkit, tools and OS service DLLs that no analysed title imports. 108 libraries (2153 exports) are imported by at least one title, directly or through API-set host attribution, or are emulator-provided; the 2 below (2 exports) are not targeted: no title EXE or shipped DLL imports any of their exports and the emulator does not provide them. They stay `missing` in the headline instead of being dropped from it, so the percentage is not inflated; a library moves out of this list as soon as a title imports it or an emulator crate exports it. The earlier Xbox-only figure (2078 exports) counted only DLLs with no same-named PC DLL and is kept in `summary.json` under `all_including_pc`. Coverage inside the 108 targeted libraries alone: 2131/2153.
 
 | Library | Folder | Same-named PC DLL | Console-only exports | Present in |
 |---|---|---|---|---|
@@ -4035,35 +4035,35 @@ No PC DLL is named minuserx.dll; it is emulated by its compat crate, so no row i
 
 </details>
 
-<details><summary><b>xg_x.dll</b>: 21 console-only exports, 15 covered</summary>
+<details><summary><b>xg_x.dll</b>: 21 console-only exports, 21 covered</summary>
 
 | Function | Status | Imported by | Present in |
 |---|---|---|---|
 | `XGComputeBufferLayout` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGComputeOptimalDepthStencilTileModes` | implemented | Trackmania | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGComputeOptimalTileMode` | implemented | Terraria, Trackmania | Fortnite, XDefiant, Terraria, Trackmania |
+| `XGComputeTexture1DLayout` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGComputeTexture2DLayout` | implemented | Trackmania | Fortnite, XDefiant, Terraria, Trackmania |
+| `XGComputeTexture3DLayout` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGComputeTileShape` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
+| `XGCreateTexture1DComputer` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGCreateTexture2DComputer` | implemented | Terraria | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGCreateTexture3DComputer` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGCreateTextureComputer` | implemented | Terraria, Trackmania | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGCreateTextureComputerFromDescriptor` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
+| `XGCreateTextureComputerWithPitch` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
+| `XGDecodeDCC` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGEnableExclusiveLocking` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
+| `XGEncodeDCC` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGEnterExclusiveLock` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGLeaveExclusiveLock` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGSetHardwareVersion` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGValidateDepthStencilTileMode` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGValidateJpegFile` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
-| `XGComputeTexture1DLayout` | pending |  | Fortnite, XDefiant, Terraria, Trackmania |
-| `XGComputeTexture3DLayout` | pending |  | Fortnite, XDefiant, Terraria, Trackmania |
-| `XGCreateTexture1DComputer` | pending |  | Fortnite, XDefiant, Terraria, Trackmania |
-| `XGCreateTextureComputerWithPitch` | pending |  | Fortnite, XDefiant, Terraria, Trackmania |
-| `XGDecodeDCC` | pending |  | Fortnite, XDefiant, Terraria, Trackmania |
-| `XGEncodeDCC` | pending |  | Fortnite, XDefiant, Terraria, Trackmania |
 
 </details>
 
-<details><summary><b>xg_xs.dll</b>: 23 console-only exports, 20 covered</summary>
+<details><summary><b>xg_xs.dll</b>: 23 console-only exports, 21 covered</summary>
 
 | Function | Status | Imported by | Present in |
 |---|---|---|---|
@@ -4071,6 +4071,7 @@ No PC DLL is named minuserx.dll; it is emulated by its compat crate, so no row i
 | `XGComputeOptimalDepthStencilSwizzleMode` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGComputeOptimalSwizzleMode` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGComputeTexture1DLayout` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
+| `XGComputeTexture2DLayout` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGComputeTexture3DLayout` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGComputeTileShape` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGCreateBVHComputer` | implemented |  | XDefiant, Terraria, Trackmania |
@@ -4087,7 +4088,6 @@ No PC DLL is named minuserx.dll; it is emulated by its compat crate, so no row i
 | `XGTerminateLibrary` | implemented |  | XDefiant, Terraria, Trackmania |
 | `XGValidateDepthStencilSwizzleMode` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGValidateDescriptor` | implemented |  | XDefiant, Terraria, Trackmania |
-| `XGComputeTexture2DLayout` | pending |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGDecodeDCC` | stub |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGEncodeDCC` | stub |  | Fortnite, XDefiant, Terraria, Trackmania |
 

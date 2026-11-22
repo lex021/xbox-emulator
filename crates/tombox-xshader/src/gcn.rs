@@ -399,18 +399,92 @@ fn convert(ins: &Insn) -> Result<Vec<u32>, String> {
 #[derive(Debug, Clone, Default)]
 pub struct Lowered {
     pub isa: Vec<u8>,
+    pub code_len: usize,
     pub notes: Vec<String>,
 }
 
+fn sopp_op(ins: &Insn) -> Option<u32> {
+    (ins.enc == Enc::Sopp).then(|| (ins.words[0] >> 16) & 0x7f)
+}
+
+fn sop1_op(ins: &Insn) -> Option<u32> {
+    (ins.enc == Enc::Sop1).then(|| (ins.words[0] >> 8) & 0xff)
+}
+
+fn reachable(insns: &[Insn]) -> Result<Vec<bool>, String> {
+    let at: BTreeMap<usize, usize> = insns.iter().enumerate().map(|(k, i)| (i.offset / 4, k)).collect();
+    let mut live = vec![false; insns.len()];
+    let mut todo = vec![0usize];
+    while let Some(k) = todo.pop() {
+        if k >= insns.len() || live[k] {
+            continue;
+        }
+        live[k] = true;
+        let ins = &insns[k];
+        let w = ins.words[0];
+        match (sopp_op(ins), sop1_op(ins)) {
+            (Some(0x01), _) | (_, Some(0x20)) => continue,
+            (Some(op @ (0x02 | 0x04..=0x09)), _) => {
+                let target = (ins.offset / 4) as i64 + 1 + (w & 0xffff) as i16 as i64;
+                let t = usize::try_from(target).ok().and_then(|t| at.get(&t).copied()).ok_or_else(|| {
+                    format!("gfx7 branch at {:#x} targets dword {target}, which is not an instruction start", ins.offset)
+                })?;
+                todo.push(t);
+                if op != 0x02 {
+                    todo.push(k + 1);
+                }
+            }
+            _ => todo.push(k + 1),
+        }
+    }
+    Ok(live)
+}
+
+fn sop2(ins: &Insn) -> Option<(u32, u32, u32, u32)> {
+    let w = ins.words[0];
+    (ins.enc == Enc::Sop2).then(|| ((w >> 23) & 0x7f, (w >> 16) & 0x7f, w & 0xff, (w >> 8) & 0xff))
+}
+
+fn pc_add(insns: &[Insn], k: usize) -> Result<u32, String> {
+    let g = &insns[k];
+    let d = (g.words[0] >> 16) & 0x7f;
+    let bad = || format!("gfx7 s_getpc_b64 at {:#x}: the PC in s[{d}:{}] is not consumed by s_add_u32 s{d}, s{d}, literal; s_addc_u32 s{}, s{}, 0", g.offset, d + 1, d + 1, d + 1);
+    let (add, addc) = (insns.get(k + 1).ok_or_else(bad)?, insns.get(k + 2).ok_or_else(bad)?);
+    let lit = match sop2(add) {
+        Some((0, sd, a, b)) if sd == d && add.words.len() == 2 && ((a == d && b == 0xff) || (a == 0xff && b == d)) => add.words[1],
+        _ => return Err(bad()),
+    };
+    match sop2(addc) {
+        Some((4, sd, a, b)) if sd == d + 1 && addc.words.len() == 1 && ((a == d + 1 && b == 0x80) || (a == 0x80 && b == d + 1)) => Ok(lit),
+        _ => Err(bad()),
+    }
+}
+
 pub fn to_rdna2(code: &[u8]) -> Result<Lowered, String> {
-    let insns = decode(code);
+    lower(code, &[])
+}
+
+pub fn lower(code: &[u8], data: &[u8]) -> Result<Lowered, String> {
+    let all = decode(code);
+    let live = reachable(&all)?;
+    let n = live.iter().rposition(|&r| r).map_or(0, |k| k + 1);
+    let insns = &all[..n];
+    let code_end = all.get(n).map_or(code.len(), |i| i.offset);
+    let mut tail = code[code_end..].to_vec();
+    tail.extend_from_slice(data);
     let mut out: Vec<Vec<u32>> = Vec::with_capacity(insns.len());
     let mut notes = Vec::new();
     let mut new_at: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut pcs = Vec::new();
     let mut pos = 0usize;
-    for ins in &insns {
-        if ins.enc == Enc::Sop1 && matches!((ins.words[0] >> 8) & 0xff, 0x1f | 0x20 | 0x21) {
-            return Err(format!("gfx7 at {:#x}: PC-relative code (s_getpc/s_setpc/s_swappc) is not relocated yet", ins.offset));
+    for (k, ins) in insns.iter().enumerate() {
+        match sop1_op(ins) {
+            Some(0x1f) => pcs.push((k, pc_add(insns, k)?)),
+            Some(0x20) if k + 1 != n || n == 0 => {
+                return Err(format!("gfx7 at {:#x}: s_setpc_b64 jumps to a computed address inside the program", ins.offset));
+            }
+            Some(0x21) => notes.push(format!("swappc at {:#x}: fetch-shader call, vertex attributes come from the input layout", ins.offset)),
+            _ => {}
         }
         if ins.enc == Enc::Mimg && (ins.words[0] >> 18) & 0x7f != 0x0e {
             notes.push(format!("mimg at {:#x}: dim taken from DA ({})", ins.offset, if (ins.words[0] >> 14) & 1 != 0 { "2D array" } else { "2D" }));
@@ -420,7 +494,8 @@ pub fn to_rdna2(code: &[u8]) -> Result<Lowered, String> {
         pos += v.len();
         out.push(v);
     }
-    new_at.insert(code.len() / 4, pos);
+    new_at.insert(code_end / 4, pos);
+    let code_len = pos * 4;
     for (k, ins) in insns.iter().enumerate() {
         let w = ins.words[0];
         if !is_branch(w) {
@@ -435,8 +510,29 @@ pub fn to_rdna2(code: &[u8]) -> Result<Lowered, String> {
         let rel = i16::try_from(rel).map_err(|_| format!("gfx7 branch at {:#x}: relocated offset {rel} overflows", ins.offset))?;
         out[k][0] = (w & 0xffff_0000) | rel as u16 as u32;
     }
-    let isa = out.into_iter().flatten().flat_map(|d| d.to_le_bytes()).collect();
-    Ok(Lowered { isa, notes })
+    for (k, lit) in pcs {
+        let g = &insns[k];
+        let target = (g.offset + 4) as u64 + lit as u64;
+        let new_target = if target >= code_end as u64 {
+            let t = target - code_end as u64;
+            if t >= tail.len() as u64 {
+                return Err(format!("gfx7 s_getpc_b64 at {:#x}: target {target:#x} lies past the code section ({:#x} bytes)", g.offset, code_end + tail.len()));
+            }
+            code_len as u64 + t
+        } else if target % 4 == 0 && insns.iter().any(|i| i.offset as u64 == target) {
+            new_at[&(target as usize / 4)] as u64 * 4
+        } else {
+            return Err(format!("gfx7 s_getpc_b64 at {:#x}: target {target:#x} is inside an instruction", g.offset));
+        };
+        let new_pc = (new_at[&(g.offset / 4)] as u64 + 1) * 4;
+        let rel = u32::try_from(new_target.checked_sub(new_pc).ok_or_else(|| format!("gfx7 s_getpc_b64 at {:#x}: relocated target precedes the PC", g.offset))?)
+            .map_err(|_| format!("gfx7 s_getpc_b64 at {:#x}: relocated offset overflows", g.offset))?;
+        out[k + 1][1] = rel;
+        notes.push(format!("getpc at {:#x}: pc+{lit:#x} -> lowered pc+{rel:#x}", g.offset));
+    }
+    let mut isa: Vec<u8> = out.into_iter().flatten().flat_map(|d| d.to_le_bytes()).collect();
+    isa.extend_from_slice(&tail);
+    Ok(Lowered { isa, code_len, notes })
 }
 
 pub fn find_durango_all(xdat: &[u8]) -> Vec<Vec<u8>> {
@@ -474,7 +570,7 @@ pub fn extract_durango(
     blob: &[u8],
 ) -> Result<crate::ShaderExtract, String> {
     let d = parse(blob)?;
-    let lowered = to_rdna2(&d.code)?;
+    let lowered = lower(&d.code, &d.data)?;
     let body = |cc: &[u8; 4]| container.chunk(cc).map(|c| &dxbc[c.offset..c.offset + c.size]);
     let sig = |a: &[u8; 4], b: &[u8; 4]| body(a).or_else(|| body(b)).and_then(|x| crate::meta::parse_signature(x).ok()).unwrap_or_default();
     Ok(crate::ShaderExtract {
@@ -483,7 +579,7 @@ pub fn extract_durango(
         bitcode_stripped,
         fssm: blob.to_vec(),
         entry: None,
-        isa: lowered.isa.clone(),
+        isa: lowered.isa[..lowered.code_len].to_vec(),
         isa_offset_in_fssm: d.code_start,
         isa_preamble: [0; 4],
         isa_data: lowered.isa,
@@ -548,6 +644,80 @@ mod tests {
         assert_eq!(d.last().unwrap().mnemonic, "s_endpgm");
     }
 
+    fn words(b: &[u8]) -> Vec<u32> {
+        b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    }
+
+    fn bytes(w: &[u32]) -> Vec<u8> {
+        w.iter().flat_map(|d| d.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn getpc_relocates_into_embedded_data() {
+        let code = bytes(&[0xc0000300, 0xbe821f00, 0x8002ff02, 0x14, 0x82038003, 0xc0020300, 0xbf810000, 0x0000000e, 0x3f000000, 0xbf810000]);
+        let l = lower(&code, &[0x11, 0, 0, 0]).unwrap();
+        let w = words(&l.isa);
+        assert_eq!(l.code_len, 0x24);
+        assert_eq!(w[2], 0xbe821f00);
+        assert_eq!(w[4], 0x18);
+        assert_eq!(&w[9..], &[0x0000000e, 0x3f000000, 0xbf810000, 0x11]);
+        let pc = (2 + 1) * 4;
+        assert_eq!(w[(pc + w[4] as usize) / 4], 0x0000000e);
+        let d = crate::rdna2::disassemble(&l.isa[..l.code_len]);
+        assert_eq!(d.iter().map(|i| i.mnemonic.as_str()).collect::<Vec<_>>(), ["s_load_dword", "s_getpc_b64", "s_add_u32", "s_addc_u32", "s_load_dword", "s_endpgm"]);
+    }
+
+    #[test]
+    fn getpc_into_data_block_after_program() {
+        let code = bytes(&[0xbe821f00, 0x8002ff02, 0x18, 0x82038003, 0xc0020300, 0xbf810000]);
+        let l = lower(&code, &[7, 0, 0, 0, 9, 0, 0, 0]).unwrap();
+        let w = words(&l.isa);
+        assert_eq!(l.code_len, 0x1c);
+        assert_eq!(w[2], 0x1c);
+        assert_eq!(w[(4 + w[2] as usize) / 4], 9);
+    }
+
+    #[test]
+    fn getpc_relocates_code_label() {
+        let code = bytes(&[0xbe821f00, 0x8002ff02, 0x0c, 0x82038003, 0x4a000080, 0xbf810000]);
+        let l = lower(&code, &[]).unwrap();
+        let w = words(&l.isa);
+        assert_eq!(w[2], 0x0c);
+        let code = bytes(&[0xbe821f00, 0x8002ff02, 0x10, 0x82038003, 0x4a000080, 0xbf810000]);
+        assert_eq!(words(&lower(&code, &[]).unwrap().isa)[2], 0x14);
+        let code = bytes(&[0xbe821f00, 0x8002ff02, 0x04, 0x82038003, 0x4a000080, 0xbf810000]);
+        assert!(lower(&code, &[]).unwrap_err().contains("inside an instruction"));
+    }
+
+    #[test]
+    fn getpc_unrecognised_forms_are_errors() {
+        let code = bytes(&[0xbe821f00, 0xc0020300, 0xbf810000]);
+        assert!(lower(&code, &[]).unwrap_err().contains("not consumed by s_add_u32"));
+        let code = bytes(&[0xbe821f00, 0x8002ff02, 0x40, 0x82038003, 0xbf810000]);
+        assert!(lower(&code, &[]).unwrap_err().contains("past the code section"));
+        let code = bytes(&[0xbf840001, 0xbe802000, 0xbf810000]);
+        assert!(lower(&code, &[]).unwrap_err().contains("computed address"));
+    }
+
+    #[test]
+    fn swappc_fetch_call_passes_through() {
+        let code = bytes(&[0xbe802100, 0xbe840303, 0xbe850380, 0xbf810000]);
+        let l = lower(&code, &[]).unwrap();
+        assert_eq!(words(&l.isa), [0xbe802100, 0xbe840303, 0xbe850380, 0xbf810000]);
+        let d = crate::rdna2::disassemble(&l.isa);
+        assert_eq!(d[0].mnemonic, "s_swappc_b64");
+    }
+
+    #[test]
+    fn unreachable_tail_after_branch_is_kept_verbatim() {
+        let code = bytes(&[0xbf820001, 0xbf800000, 0xbf810000]);
+        assert_eq!(lower(&code, &[]).unwrap().code_len, 12);
+        let code = bytes(&[0xbf810000, 0x0000000e, 0xbf810000]);
+        let l = lower(&code, &[]).unwrap();
+        assert_eq!(l.code_len, 4);
+        assert_eq!(words(&l.isa), [0xbf810000, 0x0000000e, 0xbf810000]);
+    }
+
     #[test]
     fn show_one() {
         let Ok(want) = std::env::var("TOMBOX_GCN_SHOW") else { return };
@@ -578,6 +748,7 @@ mod tests {
             return;
         }
         let mut ok = 0;
+        let mut getpcs = 0;
         let mut errs: BTreeMap<String, usize> = BTreeMap::new();
         let mut unnamed: BTreeMap<String, usize> = BTreeMap::new();
         for (name, blob) in &all {
@@ -585,6 +756,19 @@ mod tests {
             let insns = decode(&d.code);
             assert_eq!(insns.iter().map(|i| i.words.len() * 4).sum::<usize>(), d.code.len(), "{name}: decode does not land on the program end");
             assert_eq!(insns.last().map(|i| i.words[0]), Some(0xbf81_0000), "{name}: program does not end in s_endpgm");
+            if let Ok(l) = lower(&d.code, &d.data) {
+                let orig: Vec<u8> = d.code.iter().chain(d.data.iter()).copied().collect();
+                let ow = words(&orig);
+                let lw = words(&l.isa);
+                let olds: Vec<&Insn> = insns.iter().filter(|i| i.enc == Enc::Sop1 && (i.words[0] >> 8) & 0xff == 0x1f).collect();
+                let news: Vec<usize> = crate::rdna2::disassemble(&l.isa[..l.code_len]).iter().filter(|i| i.mnemonic == "s_getpc_b64").map(|i| i.offset).collect();
+                for (o, n) in olds.iter().zip(news.iter()) {
+                    let ot = o.offset + 4 + ow[o.offset / 4 + 2] as usize;
+                    let nt = n + 4 + lw[n / 4 + 2] as usize;
+                    assert_eq!(ow[ot / 4], lw[nt / 4], "{name}: getpc at {:#x} relocated target differs", o.offset);
+                    getpcs += 1;
+                }
+            }
             match to_rdna2(&d.code) {
                 Ok(l) => {
                     ok += 1;
@@ -600,7 +784,7 @@ mod tests {
                 }
             }
         }
-        eprintln!("durango: {ok}/{} lowered to RDNA2", all.len());
+        eprintln!("durango: {ok}/{} lowered to RDNA2, {getpcs} getpc targets verified", all.len());
         for (e, n) in &errs {
             eprintln!("  {n:4}  {e}");
         }

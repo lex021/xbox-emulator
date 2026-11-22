@@ -37,6 +37,8 @@ pub(crate) mod d3d;
 pub mod fma_probe;
 #[cfg(test)]
 mod sm5_helpers_tests;
+#[cfg(all(test, windows))]
+mod fma16_tests;
 
 #[cfg(windows)]
 fn dxil_disassembly(dxbc: &[u8]) -> Option<String> {

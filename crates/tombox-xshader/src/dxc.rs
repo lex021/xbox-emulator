@@ -130,15 +130,28 @@ pub fn compile_with(hlsl: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>
     Ok(code)
 }
 
+pub fn fma_defines(fma: crate::shader_cache::Fma, any_mode: bool) -> Vec<&'static str> {
+    let mut d = Vec::new();
+    if if any_mode { fma.any } else { fma.preserve } {
+        d.extend(["-D", "TB_FAST_FMA"]);
+    } else if any_mode && fma.hybrid {
+        d.extend(["-D", "TB_HYBRID_FMA"]);
+    }
+    if fma.f2h {
+        d.extend(["-D", "TB_FAST_F2H"]);
+    }
+    d
+}
+
 pub fn compile_fma(hlsl: &str, profile: &str, fma: crate::shader_cache::Fma, extra: &[&str]) -> Result<Vec<u8>, String> {
-    let with = |on: bool| -> Vec<&str> { if on { extra.iter().copied().chain(["-D", "TB_FAST_FMA"]).collect() } else { extra.to_vec() } };
+    let with = |any_mode: bool| -> Vec<&str> { extra.iter().copied().chain(fma_defines(fma, any_mode)).collect() };
     let minor = profile.rsplit('_').next().and_then(|m| m.parse::<u32>().ok()).unwrap_or(0);
     if minor < 2 {
-        return compile_args(hlsl, profile, &[], &with(fma.any));
+        return compile_args(hlsl, profile, &[], &with(true));
     }
-    let code = compile_args(hlsl, profile, &["-denorm", "preserve"], &with(fma.preserve))?;
+    let code = compile_args(hlsl, profile, &["-denorm", "preserve"], &with(false))?;
     if profile.starts_with("cs_") && disassemble(&code).map(|t| has_preserve_unselectable(&t)).unwrap_or(false) {
-        return compile_args(hlsl, profile, &["-denorm", "any"], &with(fma.any));
+        return compile_args(hlsl, profile, &["-denorm", "any"], &with(true));
     }
     Ok(code)
 }

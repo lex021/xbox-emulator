@@ -1,0 +1,683 @@
+{
+    "schema":  1,
+    "updated":  "2026-11-22T05:49:10Z",
+    "statuses":  [
+                     "Nothing",
+                     "Boots",
+                     "Menus",
+                     "Ingame",
+                     "Playable"
+                 ],
+    "titles":  {
+                   "fortnite-lobby":  {
+                                          "name":  "Fortnite (lobby, default ready-up path armed)",
+                                          "status":  "Boots",
+                                          "last":  {
+                                                       "run":  "20261121_223720",
+                                                       "date":  "2026-11-22T04:57:44Z",
+                                                       "build":  "7e8064f+44 modified built 2026-11-22T04:28:07Z",
+                                                       "commit":  "7e8064f",
+                                                       "modified_files":  44,
+                                                       "status":  "Boots",
+                                                       "status_basis":  "hotfix check at run.txt:3261",
+                                                       "furthest":  "hotfix check",
+                                                       "milestones":  [
+                                                                          "boot",
+                                                                          "first frame",
+                                                                          "hotfix check"
+                                                                      ],
+                                                       "run_result":  "ran to timeout",
+                                                       "seconds":  300.2,
+                                                       "fps_avg":  11.6,
+                                                       "fps_min":  8.9,
+                                                       "fps_max":  30.1,
+                                                       "frametime_p99_ms":  91.85,
+                                                       "meets_60fps":  false,
+                                                       "frames_drawn":  true,
+                                                       "captures":  [
+                                                                        {
+                                                                            "t":  20,
+                                                                            "verdict":  "drawn",
+                                                                            "mean":  63.9,
+                                                                            "std":  58.5,
+                                                                            "colours":  3156
+                                                                        }
+                                                                    ],
+                                                       "graphics_issues":  [
+                                                                               "captures: drawn x1"
+                                                                           ],
+                                                       "top_issue":  "First-chance exceptions: [EXC] code=0x40080201 addr=0x7ffdf0cb569a (KernelBase.dll +0xc569a) firstChance=1  (run.err.txt:6)",
+                                                       "screenshot":  "tools/dev/batch_runs/20261121_223720/fortnite-lobby.png",
+                                                       "d3d12_debug_layer":  false
+                                                   },
+                                          "history":  [
+                                                          {
+                                                              "run":  "20261121_223720",
+                                                              "date":  "2026-11-22T04:57:44Z",
+                                                              "build":  "7e8064f+44 modified built 2026-11-22T04:28:07Z",
+                                                              "commit":  "7e8064f",
+                                                              "modified_files":  44,
+                                                              "status":  "Boots",
+                                                              "status_basis":  "hotfix check at run.txt:3261",
+                                                              "furthest":  "hotfix check",
+                                                              "milestones":  [
+                                                                                 "boot",
+                                                                                 "first frame",
+                                                                                 "hotfix check"
+                                                                             ],
+                                                              "run_result":  "ran to timeout",
+                                                              "seconds":  300.2,
+                                                              "fps_avg":  11.6,
+                                                              "fps_min":  8.9,
+                                                              "fps_max":  30.1,
+                                                              "frametime_p99_ms":  91.85,
+                                                              "meets_60fps":  false,
+                                                              "frames_drawn":  true,
+                                                              "captures":  [
+                                                                               {
+                                                                                   "t":  20,
+                                                                                   "verdict":  "drawn",
+                                                                                   "mean":  63.9,
+                                                                                   "std":  58.5,
+                                                                                   "colours":  3156
+                                                                               }
+                                                                           ],
+                                                              "graphics_issues":  [
+                                                                                      "captures: drawn x1"
+                                                                                  ],
+                                                              "top_issue":  "First-chance exceptions: [EXC] code=0x40080201 addr=0x7ffdf0cb569a (KernelBase.dll +0xc569a) firstChance=1  (run.err.txt:6)",
+                                                              "screenshot":  "tools/dev/batch_runs/20261121_223720/fortnite-lobby.png",
+                                                              "d3d12_debug_layer":  false
+                                                          }
+                                                      ]
+                                      },
+                   "fortnite-play":  {
+                                         "name":  "Fortnite (ready up -\u003e offline single player match)",
+                                         "status":  "Boots",
+                                         "last":  {
+                                                      "run":  "20261121_223720",
+                                                      "date":  "2026-11-22T04:57:44Z",
+                                                      "build":  "7e8064f+44 modified built 2026-11-22T04:28:07Z",
+                                                      "commit":  "7e8064f",
+                                                      "modified_files":  44,
+                                                      "status":  "Boots",
+                                                      "status_basis":  "hotfix check at run.txt:3261",
+                                                      "furthest":  "hotfix check",
+                                                      "milestones":  [
+                                                                         "boot",
+                                                                         "first frame",
+                                                                         "hotfix check"
+                                                                     ],
+                                                      "run_result":  "ran to timeout",
+                                                      "seconds":  480.4,
+                                                      "fps_avg":  11,
+                                                      "fps_min":  8.8,
+                                                      "fps_max":  21.7,
+                                                      "frametime_p99_ms":  91.89,
+                                                      "meets_60fps":  false,
+                                                      "frames_drawn":  false,
+                                                      "captures":  [
+
+                                                                   ],
+                                                      "graphics_issues":  [
+                                                                              "no game window captured"
+                                                                          ],
+                                                      "top_issue":  "First-chance exceptions: [EXC] code=0x40080201 addr=0x7ffdf0cb569a (KernelBase.dll +0xc569a) firstChance=1  (run.err.txt:6)",
+                                                      "screenshot":  "",
+                                                      "d3d12_debug_layer":  false
+                                                  },
+                                         "history":  [
+                                                         {
+                                                             "run":  "20261121_223720",
+                                                             "date":  "2026-11-22T04:57:44Z",
+                                                             "build":  "7e8064f+44 modified built 2026-11-22T04:28:07Z",
+                                                             "commit":  "7e8064f",
+                                                             "modified_files":  44,
+                                                             "status":  "Boots",
+                                                             "status_basis":  "hotfix check at run.txt:3261",
+                                                             "furthest":  "hotfix check",
+                                                             "milestones":  [
+                                                                                "boot",
+                                                                                "first frame",
+                                                                                "hotfix check"
+                                                                            ],
+                                                             "run_result":  "ran to timeout",
+                                                             "seconds":  480.4,
+                                                             "fps_avg":  11,
+                                                             "fps_min":  8.8,
+                                                             "fps_max":  21.7,
+                                                             "frametime_p99_ms":  91.89,
+                                                             "meets_60fps":  false,
+                                                             "frames_drawn":  false,
+                                                             "captures":  [
+
+                                                                          ],
+                                                             "graphics_issues":  [
+                                                                                     "no game window captured"
+                                                                                 ],
+                                                             "top_issue":  "First-chance exceptions: [EXC] code=0x40080201 addr=0x7ffdf0cb569a (KernelBase.dll +0xc569a) firstChance=1  (run.err.txt:6)",
+                                                             "screenshot":  "",
+                                                             "d3d12_debug_layer":  false
+                                                         }
+                                                     ]
+                                     },
+                   "trackmania":  {
+                                      "name":  "Trackmania",
+                                      "status":  "Menus",
+                                      "last":  {
+                                                   "run":  "20261121_234245",
+                                                   "date":  "2026-11-22T05:49:10Z",
+                                                   "build":  "7e8064f+44 modified built 2026-11-22T05:42:39Z",
+                                                   "commit":  "7e8064f",
+                                                   "modified_files":  44,
+                                                   "status":  "Menus",
+                                                   "status_basis":  "menu / lobby at run.txt:75",
+                                                   "furthest":  "menu / lobby",
+                                                   "milestones":  [
+                                                                      "boot",
+                                                                      "first frame",
+                                                                      "menu / lobby"
+                                                                  ],
+                                                   "run_result":  "timeout (title exit code set)",
+                                                   "seconds":  180.5,
+                                                   "fps_avg":  143.5,
+                                                   "fps_min":  135.4,
+                                                   "fps_max":  144.1,
+                                                   "frametime_p99_ms":  8.06,
+                                                   "meets_60fps":  true,
+                                                   "frames_drawn":  false,
+                                                   "captures":  [
+                                                                    {
+                                                                        "t":  21,
+                                                                        "verdict":  "black",
+                                                                        "mean":  0,
+                                                                        "std":  0,
+                                                                        "colours":  1
+                                                                    },
+                                                                    {
+                                                                        "t":  46,
+                                                                        "verdict":  "black",
+                                                                        "mean":  0,
+                                                                        "std":  0,
+                                                                        "colours":  1
+                                                                    },
+                                                                    {
+                                                                        "t":  105,
+                                                                        "verdict":  "black",
+                                                                        "mean":  0,
+                                                                        "std":  0,
+                                                                        "colours":  1
+                                                                    },
+                                                                    {
+                                                                        "t":  165,
+                                                                        "verdict":  "black",
+                                                                        "mean":  0,
+                                                                        "std":  0,
+                                                                        "colours":  1
+                                                                    },
+                                                                    {
+                                                                        "t":  180,
+                                                                        "verdict":  "black",
+                                                                        "mean":  0,
+                                                                        "std":  0,
+                                                                        "colours":  1
+                                                                    }
+                                                                ],
+                                                   "graphics_issues":  [
+                                                                           "captures: black x5",
+                                                                           "no captured frame shows real content (black or uniform)"
+                                                                       ],
+                                                   "top_issue":  "Crashes and hangs: [EXC] code=0xC0000409 addr=0x7ffd096711db (d3d12_x.dll +0x3d11db) firstChance=0 fastfail/stack_buffer_overrun (run.err.txt:14)",
+                                                   "screenshot":  "tools/dev/batch_runs/20261121_234245/trackmania.png",
+                                                   "d3d12_debug_layer":  false
+                                               },
+                                      "history":  [
+                                                      {
+                                                          "run":  "20261121_223720",
+                                                          "date":  "2026-11-22T04:57:44Z",
+                                                          "build":  "7e8064f+44 modified built 2026-11-22T04:28:07Z",
+                                                          "commit":  "7e8064f",
+                                                          "modified_files":  44,
+                                                          "status":  "Menus",
+                                                          "status_basis":  "menu / lobby at run.txt:75",
+                                                          "furthest":  "menu / lobby",
+                                                          "milestones":  [
+                                                                             "boot",
+                                                                             "first frame",
+                                                                             "menu / lobby"
+                                                                         ],
+                                                          "run_result":  "timeout (title exit code set)",
+                                                          "seconds":  360.1,
+                                                          "fps_avg":  143.6,
+                                                          "fps_min":  136.5,
+                                                          "fps_max":  144.1,
+                                                          "frametime_p99_ms":  10.39,
+                                                          "meets_60fps":  true,
+                                                          "frames_drawn":  false,
+                                                          "captures":  [
+
+                                                                       ],
+                                                          "graphics_issues":  [
+                                                                                  "no game window captured"
+                                                                              ],
+                                                          "top_issue":  "exit -1073741819 (0xc0000005); Crashes and hangs: [EXC] code=0xC0000005 addr=0x7ff7f9120000 (GbxGame.exe +0x0) firstChance=1 ACCESS_VIOLATION (run.err.txt:13)",
+                                                          "screenshot":  "",
+                                                          "d3d12_debug_layer":  false
+                                                      },
+                                                      {
+                                                          "run":  "20261121_234245",
+                                                          "date":  "2026-11-22T05:49:10Z",
+                                                          "build":  "7e8064f+44 modified built 2026-11-22T05:42:39Z",
+                                                          "commit":  "7e8064f",
+                                                          "modified_files":  44,
+                                                          "status":  "Menus",
+                                                          "status_basis":  "menu / lobby at run.txt:75",
+                                                          "furthest":  "menu / lobby",
+                                                          "milestones":  [
+                                                                             "boot",
+                                                                             "first frame",
+                                                                             "menu / lobby"
+                                                                         ],
+                                                          "run_result":  "timeout (title exit code set)",
+                                                          "seconds":  180.5,
+                                                          "fps_avg":  143.5,
+                                                          "fps_min":  135.4,
+                                                          "fps_max":  144.1,
+                                                          "frametime_p99_ms":  8.06,
+                                                          "meets_60fps":  true,
+                                                          "frames_drawn":  false,
+                                                          "captures":  [
+                                                                           {
+                                                                               "t":  21,
+                                                                               "verdict":  "black",
+                                                                               "mean":  0,
+                                                                               "std":  0,
+                                                                               "colours":  1
+                                                                           },
+                                                                           {
+                                                                               "t":  46,
+                                                                               "verdict":  "black",
+                                                                               "mean":  0,
+                                                                               "std":  0,
+                                                                               "colours":  1
+                                                                           },
+                                                                           {
+                                                                               "t":  105,
+                                                                               "verdict":  "black",
+                                                                               "mean":  0,
+                                                                               "std":  0,
+                                                                               "colours":  1
+                                                                           },
+                                                                           {
+                                                                               "t":  165,
+                                                                               "verdict":  "black",
+                                                                               "mean":  0,
+                                                                               "std":  0,
+                                                                               "colours":  1
+                                                                           },
+                                                                           {
+                                                                               "t":  180,
+                                                                               "verdict":  "black",
+                                                                               "mean":  0,
+                                                                               "std":  0,
+                                                                               "colours":  1
+                                                                           }
+                                                                       ],
+                                                          "graphics_issues":  [
+                                                                                  "captures: black x5",
+                                                                                  "no captured frame shows real content (black or uniform)"
+                                                                              ],
+                                                          "top_issue":  "Crashes and hangs: [EXC] code=0xC0000409 addr=0x7ffd096711db (d3d12_x.dll +0x3d11db) firstChance=0 fastfail/stack_buffer_overrun (run.err.txt:14)",
+                                                          "screenshot":  "tools/dev/batch_runs/20261121_234245/trackmania.png",
+                                                          "d3d12_debug_layer":  false
+                                                      }
+                                                  ]
+                                  },
+                   "xdefiant":  {
+                                    "name":  "XDefiant",
+                                    "status":  "Nothing",
+                                    "last":  {
+                                                 "run":  "20261121_234245",
+                                                 "date":  "2026-11-22T05:49:10Z",
+                                                 "build":  "7e8064f+44 modified built 2026-11-22T05:42:39Z",
+                                                 "commit":  "7e8064f",
+                                                 "modified_files":  44,
+                                                 "status":  "Nothing",
+                                                 "status_basis":  "boot at tombox_compat.log:1",
+                                                 "furthest":  "boot",
+                                                 "milestones":  [
+                                                                    "boot"
+                                                                ],
+                                                 "run_result":  "crashed (exit -1073741819 (0xc0000005))",
+                                                 "seconds":  6.8,
+                                                 "fps_avg":  null,
+                                                 "fps_min":  null,
+                                                 "fps_max":  null,
+                                                 "frametime_p99_ms":  null,
+                                                 "meets_60fps":  false,
+                                                 "frames_drawn":  false,
+                                                 "captures":  [
+
+                                                              ],
+                                                 "graphics_issues":  [
+                                                                         "no game window captured"
+                                                                     ],
+                                                 "top_issue":  "exit -1073741819 (0xc0000005); Crashes and hangs: [EXC] code=0xC0000005 addr=0x7ff76b9c6b3e (Rogue_scarlett_rtx.exe +0x676b3e) firstChance=1 ACCESS_VIOLATION (run.err.txt:21)",
+                                                 "screenshot":  "",
+                                                 "d3d12_debug_layer":  false
+                                             },
+                                    "history":  [
+                                                    {
+                                                        "run":  "20261121_223720",
+                                                        "date":  "2026-11-22T04:57:44Z",
+                                                        "build":  "7e8064f+44 modified built 2026-11-22T04:28:07Z",
+                                                        "commit":  "7e8064f",
+                                                        "modified_files":  44,
+                                                        "status":  "Nothing",
+                                                        "status_basis":  "boot at tombox_compat.log:1",
+                                                        "furthest":  "boot",
+                                                        "milestones":  [
+                                                                           "boot"
+                                                                       ],
+                                                        "run_result":  "crashed (exit -1073741819 (0xc0000005))",
+                                                        "seconds":  5.7,
+                                                        "fps_avg":  null,
+                                                        "fps_min":  null,
+                                                        "fps_max":  null,
+                                                        "frametime_p99_ms":  null,
+                                                        "meets_60fps":  false,
+                                                        "frames_drawn":  false,
+                                                        "captures":  [
+
+                                                                     ],
+                                                        "graphics_issues":  [
+                                                                                "no game window captured"
+                                                                            ],
+                                                        "top_issue":  "exit -1073741819 (0xc0000005); Crashes and hangs: [EXC] code=0xC0000005 addr=0x7ffdea211989 (vcruntime140.dll +0x1989) firstChance=1 ACCESS_VIOLATION (run.err.txt:10)",
+                                                        "screenshot":  "",
+                                                        "d3d12_debug_layer":  false
+                                                    },
+                                                    {
+                                                        "run":  "20261121_234245",
+                                                        "date":  "2026-11-22T05:49:10Z",
+                                                        "build":  "7e8064f+44 modified built 2026-11-22T05:42:39Z",
+                                                        "commit":  "7e8064f",
+                                                        "modified_files":  44,
+                                                        "status":  "Nothing",
+                                                        "status_basis":  "boot at tombox_compat.log:1",
+                                                        "furthest":  "boot",
+                                                        "milestones":  [
+                                                                           "boot"
+                                                                       ],
+                                                        "run_result":  "crashed (exit -1073741819 (0xc0000005))",
+                                                        "seconds":  6.8,
+                                                        "fps_avg":  null,
+                                                        "fps_min":  null,
+                                                        "fps_max":  null,
+                                                        "frametime_p99_ms":  null,
+                                                        "meets_60fps":  false,
+                                                        "frames_drawn":  false,
+                                                        "captures":  [
+
+                                                                     ],
+                                                        "graphics_issues":  [
+                                                                                "no game window captured"
+                                                                            ],
+                                                        "top_issue":  "exit -1073741819 (0xc0000005); Crashes and hangs: [EXC] code=0xC0000005 addr=0x7ff76b9c6b3e (Rogue_scarlett_rtx.exe +0x676b3e) firstChance=1 ACCESS_VIOLATION (run.err.txt:21)",
+                                                        "screenshot":  "",
+                                                        "d3d12_debug_layer":  false
+                                                    }
+                                                ]
+                                },
+                   "terraria":  {
+                                    "name":  "Terraria",
+                                    "status":  "Nothing",
+                                    "last":  {
+                                                 "run":  "20261121_234245",
+                                                 "date":  "2026-11-22T05:49:10Z",
+                                                 "build":  "7e8064f+44 modified built 2026-11-22T05:42:39Z",
+                                                 "commit":  "7e8064f",
+                                                 "modified_files":  44,
+                                                 "status":  "Nothing",
+                                                 "status_basis":  "boot at tombox_compat.log:1",
+                                                 "furthest":  "boot",
+                                                 "milestones":  [
+                                                                    "boot"
+                                                                ],
+                                                 "run_result":  "crashed (exit -1073741819 (0xc0000005))",
+                                                 "seconds":  7,
+                                                 "fps_avg":  null,
+                                                 "fps_min":  null,
+                                                 "fps_max":  null,
+                                                 "frametime_p99_ms":  null,
+                                                 "meets_60fps":  false,
+                                                 "frames_drawn":  false,
+                                                 "captures":  [
+
+                                                              ],
+                                                 "graphics_issues":  [
+                                                                         "no game window captured"
+                                                                     ],
+                                                 "top_issue":  "exit -1073741819 (0xc0000005); Crashes and hangs: [EXC] code=0xC0000005 addr=0x7ff76be95109 (Terraria.exe +0x7c5109) firstChance=1 ACCESS_VIOLATION (run.err.txt:38)",
+                                                 "screenshot":  "",
+                                                 "d3d12_debug_layer":  false
+                                             },
+                                    "history":  [
+                                                    {
+                                                        "run":  "20261121_223720",
+                                                        "date":  "2026-11-22T04:57:44Z",
+                                                        "build":  "7e8064f+44 modified built 2026-11-22T04:28:07Z",
+                                                        "commit":  "7e8064f",
+                                                        "modified_files":  44,
+                                                        "status":  "Nothing",
+                                                        "status_basis":  "boot at tombox_compat.log:1",
+                                                        "furthest":  "boot",
+                                                        "milestones":  [
+                                                                           "boot"
+                                                                       ],
+                                                        "run_result":  "crashed (exit -1073741819 (0xc0000005))",
+                                                        "seconds":  6.8,
+                                                        "fps_avg":  null,
+                                                        "fps_min":  null,
+                                                        "fps_max":  null,
+                                                        "frametime_p99_ms":  null,
+                                                        "meets_60fps":  false,
+                                                        "frames_drawn":  false,
+                                                        "captures":  [
+
+                                                                     ],
+                                                        "graphics_issues":  [
+                                                                                "no game window captured"
+                                                                            ],
+                                                        "top_issue":  "exit -1073741819 (0xc0000005); Crashes and hangs: [EXC] code=0xC0000005 addr=0x7ff76be95109 (Terraria.exe +0x7c5109) firstChance=1 ACCESS_VIOLATION (run.err.txt:17)",
+                                                        "screenshot":  "",
+                                                        "d3d12_debug_layer":  false
+                                                    },
+                                                    {
+                                                        "run":  "20261121_234245",
+                                                        "date":  "2026-11-22T05:49:10Z",
+                                                        "build":  "7e8064f+44 modified built 2026-11-22T05:42:39Z",
+                                                        "commit":  "7e8064f",
+                                                        "modified_files":  44,
+                                                        "status":  "Nothing",
+                                                        "status_basis":  "boot at tombox_compat.log:1",
+                                                        "furthest":  "boot",
+                                                        "milestones":  [
+                                                                           "boot"
+                                                                       ],
+                                                        "run_result":  "crashed (exit -1073741819 (0xc0000005))",
+                                                        "seconds":  7,
+                                                        "fps_avg":  null,
+                                                        "fps_min":  null,
+                                                        "fps_max":  null,
+                                                        "frametime_p99_ms":  null,
+                                                        "meets_60fps":  false,
+                                                        "frames_drawn":  false,
+                                                        "captures":  [
+
+                                                                     ],
+                                                        "graphics_issues":  [
+                                                                                "no game window captured"
+                                                                            ],
+                                                        "top_issue":  "exit -1073741819 (0xc0000005); Crashes and hangs: [EXC] code=0xC0000005 addr=0x7ff76be95109 (Terraria.exe +0x7c5109) firstChance=1 ACCESS_VIOLATION (run.err.txt:38)",
+                                                        "screenshot":  "",
+                                                        "d3d12_debug_layer":  false
+                                                    }
+                                                ]
+                                },
+                   "minecraft":  {
+                                     "name":  "Minecraft Preview",
+                                     "status":  "Boots",
+                                     "last":  {
+                                                  "run":  "20261121_234245",
+                                                  "date":  "2026-11-22T05:49:10Z",
+                                                  "build":  "7e8064f+44 modified built 2026-11-22T05:42:39Z",
+                                                  "commit":  "7e8064f",
+                                                  "modified_files":  44,
+                                                  "status":  "Boots",
+                                                  "status_basis":  "first frame at tombox_compat.log:466",
+                                                  "furthest":  "first frame",
+                                                  "milestones":  [
+                                                                     "boot",
+                                                                     "first frame"
+                                                                 ],
+                                                  "run_result":  "ran to timeout",
+                                                  "seconds":  150.6,
+                                                  "fps_avg":  null,
+                                                  "fps_min":  null,
+                                                  "fps_max":  null,
+                                                  "frametime_p99_ms":  null,
+                                                  "meets_60fps":  false,
+                                                  "frames_drawn":  false,
+                                                  "captures":  [
+                                                                   {
+                                                                       "t":  20,
+                                                                       "verdict":  "black",
+                                                                       "mean":  0,
+                                                                       "std":  0,
+                                                                       "colours":  1
+                                                                   },
+                                                                   {
+                                                                       "t":  45,
+                                                                       "verdict":  "black",
+                                                                       "mean":  0,
+                                                                       "std":  0,
+                                                                       "colours":  1
+                                                                   },
+                                                                   {
+                                                                       "t":  105,
+                                                                       "verdict":  "black",
+                                                                       "mean":  0,
+                                                                       "std":  0,
+                                                                       "colours":  1
+                                                                   },
+                                                                   {
+                                                                       "t":  151,
+                                                                       "verdict":  "black",
+                                                                       "mean":  0,
+                                                                       "std":  0,
+                                                                       "colours":  1
+                                                                   }
+                                                               ],
+                                                  "graphics_issues":  [
+                                                                          "captures: black x4",
+                                                                          "no captured frame shows real content (black or uniform)"
+                                                                      ],
+                                                  "top_issue":  "D3D12 debug layer / DRED / device removal: [d3d12_xs] dred DRED auto-breadcrumbs and page-fault reporting FORCED_ON via D3D12GetDebugInterface (before device creation) (tombox_compat.log:62)",
+                                                  "screenshot":  "tools/dev/batch_runs/20261121_234245/minecraft.png",
+                                                  "d3d12_debug_layer":  false
+                                              },
+                                     "history":  [
+                                                     {
+                                                         "run":  "20261121_223720",
+                                                         "date":  "2026-11-22T04:57:44Z",
+                                                         "build":  "7e8064f+44 modified built 2026-11-22T04:28:07Z",
+                                                         "commit":  "7e8064f",
+                                                         "modified_files":  44,
+                                                         "status":  "Nothing",
+                                                         "status_basis":  "boot at tombox_compat.log:1",
+                                                         "furthest":  "boot",
+                                                         "milestones":  [
+                                                                            "boot"
+                                                                        ],
+                                                         "run_result":  "crashed (exit -1073741819 (0xc0000005))",
+                                                         "seconds":  5.9,
+                                                         "fps_avg":  null,
+                                                         "fps_min":  null,
+                                                         "fps_max":  null,
+                                                         "frametime_p99_ms":  null,
+                                                         "meets_60fps":  false,
+                                                         "frames_drawn":  false,
+                                                         "captures":  [
+
+                                                                      ],
+                                                         "graphics_issues":  [
+                                                                                 "no game window captured"
+                                                                             ],
+                                                         "top_issue":  "exit -1073741819 (0xc0000005); Crashes and hangs: [EXC] code=0xC0000005 addr=0x7ffdea211989 (vcruntime140.dll +0x1989) firstChance=1 ACCESS_VIOLATION (run.err.txt:12)",
+                                                         "screenshot":  "",
+                                                         "d3d12_debug_layer":  false
+                                                     },
+                                                     {
+                                                         "run":  "20261121_234245",
+                                                         "date":  "2026-11-22T05:49:10Z",
+                                                         "build":  "7e8064f+44 modified built 2026-11-22T05:42:39Z",
+                                                         "commit":  "7e8064f",
+                                                         "modified_files":  44,
+                                                         "status":  "Boots",
+                                                         "status_basis":  "first frame at tombox_compat.log:466",
+                                                         "furthest":  "first frame",
+                                                         "milestones":  [
+                                                                            "boot",
+                                                                            "first frame"
+                                                                        ],
+                                                         "run_result":  "ran to timeout",
+                                                         "seconds":  150.6,
+                                                         "fps_avg":  null,
+                                                         "fps_min":  null,
+                                                         "fps_max":  null,
+                                                         "frametime_p99_ms":  null,
+                                                         "meets_60fps":  false,
+                                                         "frames_drawn":  false,
+                                                         "captures":  [
+                                                                          {
+                                                                              "t":  20,
+                                                                              "verdict":  "black",
+                                                                              "mean":  0,
+                                                                              "std":  0,
+                                                                              "colours":  1
+                                                                          },
+                                                                          {
+                                                                              "t":  45,
+                                                                              "verdict":  "black",
+                                                                              "mean":  0,
+                                                                              "std":  0,
+                                                                              "colours":  1
+                                                                          },
+                                                                          {
+                                                                              "t":  105,
+                                                                              "verdict":  "black",
+                                                                              "mean":  0,
+                                                                              "std":  0,
+                                                                              "colours":  1
+                                                                          },
+                                                                          {
+                                                                              "t":  151,
+                                                                              "verdict":  "black",
+                                                                              "mean":  0,
+                                                                              "std":  0,
+                                                                              "colours":  1
+                                                                          }
+                                                                      ],
+                                                         "graphics_issues":  [
+                                                                                 "captures: black x4",
+                                                                                 "no captured frame shows real content (black or uniform)"
+                                                                             ],
+                                                         "top_issue":  "D3D12 debug layer / DRED / device removal: [d3d12_xs] dred DRED auto-breadcrumbs and page-fault reporting FORCED_ON via D3D12GetDebugInterface (before device creation) (tombox_compat.log:62)",
+                                                         "screenshot":  "tools/dev/batch_runs/20261121_234245/minecraft.png",
+                                                         "d3d12_debug_layer":  false
+                                                     }
+                                                 ]
+                                 }
+               }
+}

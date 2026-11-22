@@ -473,7 +473,14 @@ unsafe extern "system" fn create_cbv(this: *mut DeviceWrapper, pdesc: *const u8,
     let mut desc = [0u8; 16];
     unsafe { core::ptr::copy_nonoverlapping(pdesc, desc.as_mut_ptr(), 12) };
     let size = u32::from_le_bytes([desc[8], desc[9], desc[10], desc[11]]);
+    let loc = u64::from_le_bytes(desc[0..8].try_into().unwrap());
     let aligned = (size + 255) & !255;
+    if loc & 255 != 0 {
+        static MIS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        if MIS.fetch_add(1, Ordering::Relaxed) < 6 {
+            record("d3d12_xs", "CreateConstantBufferView", &format!("BufferLocation {loc:#x} is not 256-aligned (size {size}); PC D3D12 requires D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT"));
+        }
+    }
     if aligned != size {
         desc[8..12].copy_from_slice(&aligned.to_le_bytes());
         static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -482,6 +489,7 @@ unsafe extern "system" fn create_cbv(this: *mut DeviceWrapper, pdesc: *const u8,
         }
     }
     unsafe { f(real, desc.as_ptr(), dest) };
+    unsafe { crate::ecl_probe::after_device_call(real, "CreateConstantBufferView", || format!("BufferLocation={loc:#x} size {size} -> {aligned} dest={dest:#x}")) };
 }
 
 /// PC IID_ID3D12Resource = {696442be-a72e-4059-bc79-5b5c98040fad}
@@ -530,16 +538,14 @@ unsafe extern "system" fn create_committed_resource(
     }
     if hr >= 0 && !ppv.is_null() && !pdesc.is_null() {
         let heap_type = if pheap.is_null() { 0 } else { unsafe { *pheap } };
-        let backing = if heap_type == 1 { unsafe { crate::gpu_va::back_committed_texture(&desc_copy[..0x38]) } } else { None };
+        let xdesc: [u8; 0x38] = unsafe { core::ptr::read_unaligned(pdesc as *const [u8; 0x38]) };
+        let backing = if heap_type == 1 { unsafe { crate::gpu_va::back_committed_texture(&xdesc) } } else { None };
         unsafe { crate::gpu_va::note_resource(real, *ppv, &desc_copy[..0x38], init_state, backing) };
-        if let Some(va) = backing {
-            let res = unsafe { *ppv };
-            let addref: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(*real_vtbl(res).add(1)) };
-            unsafe { addref(res) };
-            let orig: [u8; 0x38] = desc_copy[..0x38].try_into().unwrap();
-            let mut xdesc = orig;
-            xdesc[0x30..0x34].copy_from_slice(&unsafe { core::ptr::read_unaligned((pdesc as *const u8).add(0x30) as *const u32) }.to_le_bytes());
-            crate::placed::register(res, crate::placed::Placed { va, desc: xdesc, init_state });
+        let res = unsafe { *ppv };
+        match backing {
+            Some(va) => unsafe { crate::gpu_va::adopt_backing(res, va, xdesc, init_state) },
+            None if heap_type == 1 && crate::gpu_va::is_texture_desc(&xdesc) => crate::gpu_va::note_committed_texture(res, xdesc),
+            None => {}
         }
         unsafe { crate::rtcap::register(*ppv, &desc_copy[..0x38], init_state) };
         if crate::rtcap::enabled() && desc_copy[0] == 1 && !pheap.is_null() {

@@ -383,7 +383,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
     // Wait for the previous copy before reusing the allocator.
-    if !crate::present_wait::wait_fence(st.fence, st.fence_value, 5000) {
+    if !crate::perf::timed(crate::perf::PWAIT, || crate::present_wait::wait_fence(st.fence, st.fence_value, 5000)) {
         return Err("timed out waiting for previous present copy".into());
     }
     let idx = vcall!(st.swapchain, 36, fn() -> u32);
@@ -455,7 +455,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
     vcall!(queue, 10, fn(u32, *const *mut c_void) -> (), 1, lists.as_ptr());
     st.fence_value += 1;
     vcall!(queue, 14, fn(*mut c_void, u64) -> i32, st.fence, st.fence_value);
-    let hr = vcall!(st.swapchain, 8, fn(u32, u32) -> i32, 0, 0);
+    let hr = crate::perf::timed(crate::perf::PFLIP, || vcall!(st.swapchain, 8, fn(u32, u32) -> i32, 0, 0));
     if hr < 0 {
         return Err(format!("swapchain Present hr={hr:#010x}"));
     }
@@ -485,6 +485,7 @@ unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes
     }
     let src = *pp;
     crate::perf::on_present();
+    crate::qwait::poll();
     crate::gpuprof::on_present();
     crate::hot_reload::on_present();
     crate::slowcall::time("PresentX upload pump", || crate::perf::timed(crate::perf::UPLOAD, || crate::upload::pump(queue)));
@@ -662,6 +663,9 @@ unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const
     if lists.is_null() || n == 0 {
         return f(queue, n, lists);
     }
+    crate::qwait::poll();
+    let title: Vec<*mut c_void> = (0..n as usize).map(|i| *lists.add(i)).collect();
+    let before = crate::ecl_probe::removed_reason(queue);
     let real: Vec<*mut c_void> =
         (0..n as usize).map(|i| crate::cmdlist_wrap::unwrap(*lists.add(i))).collect();
     let mut real = crate::cl2_state::skip_presubmitted(crate::list_split::expand(&real));
@@ -673,11 +677,33 @@ unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const
     crate::title_shadow::before_execute();
     crate::slowcall::time("queue ExecuteCommandLists replay hook", || crate::replay::on_execute(queue, &real));
     crate::slowcall::time("queue ExecuteCommandLists", || crate::gpu_wait::submit(queue, &real, f, REAL_QVT[14].load(Ordering::Relaxed), REAL_QVT[15].load(Ordering::Relaxed)));
+    crate::ecl_probe::check("ExecuteCommandLists", queue, REAL_QVT[18].load(Ordering::Relaxed), &title, &real, before);
     crate::title_shadow::after_execute(queue, REAL_QVT[14].load(Ordering::Relaxed), REAL_QVT[15].load(Ordering::Relaxed));
     crate::list_split::after_submit(queue, &real);
     crate::cl2_state::note_executed(queue, &real);
     crate::cl2_state::after_execute(queue, &split);
     crate::ts99::after_execute(queue, &real);
+}
+
+unsafe extern "system" fn wait_x(queue: *mut c_void, fence: *mut c_void, value: u64) -> i32 {
+    crate::qwait::note_title_wait(fence, value);
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> i32 = core::mem::transmute(REAL_QVT[15].load(Ordering::Relaxed));
+    f(queue, fence, value)
+}
+
+#[unsafe(naked)]
+unsafe extern "system" fn q_wait_dispatch() {
+    core::arch::naked_asm!(
+        "mov rax, [rsp]",
+        "sub rax, [rip + {base}]",
+        "cmp rax, [rip + {size}]",
+        "jb 2f",
+        "lea rax, [rip + {real}]",
+        "jmp qword ptr [rax + 120]",
+        "2:",
+        "jmp {x}",
+        base = sym EXE_BASE, size = sym EXE_SIZE, real = sym REAL_QVT, x = sym wait_x,
+    );
 }
 
 unsafe extern "system" fn queue_freq(queue: *mut c_void, out: *mut u64) -> i32 {
@@ -763,6 +789,7 @@ pub fn apply_queue_vtable(queue: *mut c_void) {
             install_qthunks();
             install_qlow();
             QUEUE_VT[10].store(q_exec_dispatch as usize, Ordering::Relaxed);
+            QUEUE_VT[15].store(q_wait_dispatch as usize, Ordering::Relaxed);
             QUEUE_VT[16].store(q_freq_dispatch as usize, Ordering::Relaxed);
             QUEUE_VT[17].store(q_calib_dispatch as usize, Ordering::Relaxed);
             XBOX_QVT[30].store(present_x as usize, Ordering::Relaxed);

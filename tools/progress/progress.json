@@ -1166,7 +1166,9 @@
     "console_batch5_verified_20261121": "Verifier PASS: wldp WldpSendSmartAppControlBlockToast (XmlDocument class absent from all 8 hives x3 dumps, no msxml6), hix_xs CollectHangSummary (console DLL passthrough, KMD emulated), netprofmsvc_c DllMain, xtffileio #4, xtfconsolecontrol #4. Held: kernelbase family xref (no registry keys/DACL), passwordless (fixed token, wrong user SID).",
     "xg_x_layout_failing_20261121": "4 xg_x layout oracle tests fail vs console (texture1d computer/layout, texture3d layout, computer with pitch): rows back to pending.",
     "xbtp_remoterun_closed_20261121": "XbtpWrapDispatcher: RegisterRedirect ported (console 0x1fcc0/AddRedirect 0x11618), SetSessionKey always S_OK like 0x1f700. xtfremoterun #4: unregistered images -> 0x80070002 regardless of disk, restricted token unless keep-token, only redirect pipes inherited (stricter than console), session-key gate is the hosting dispatcher (0x8C11040B), loopback only. Promoted on implementer tests per the 11-21 game-tests-over-verify rule.",
-    "family_xref_passwordless_20261121": "kernelbase FamilyXref now persists to emulated HKU store with Flags/InstallTime/DACL, served by reg hooks; passwordless uses caller token, XDefiant lsasrv table (0x86), UserConfig under caller SID. Gaps (BLOCKERS): RegGetValueW/RegEnumKeyExW/RegQueryInfoKeyW read-back not hooked. Sandbox fs::resolve mid-path drive escape fixed (STATUS_OBJECT_NAME_INVALID), 50k fuzz."
+    "family_xref_passwordless_20261121": "kernelbase FamilyXref now persists to emulated HKU store with Flags/InstallTime/DACL, served by reg hooks; passwordless uses caller token, XDefiant lsasrv table (0x86), UserConfig under caller SID. Gaps (BLOCKERS): RegGetValueW/RegEnumKeyExW/RegQueryInfoKeyW read-back not hooked. Sandbox fs::resolve mid-path drive escape fixed (STATUS_OBJECT_NAME_INVALID), 50k fuzz.",
+    "xg_x_dcc_20261121": "xg_x DCC: 0 call-sequence divergences on all 3 console builds (~4100 calls each); 29 encoder inputs rejected because the console result depends on heap/stack state; overruns rejected in bounds. xg_xs DCC back to stub (console writes caller stack addresses into output).",
+    "xg_layout_20261122": "xg_x layout rewritten from traced console model (tile/macro tables both hw levels, format table, planar, display MSAA, WithPitch applied); 0 mismatches vs 3 console builds. xg_xs 2D layout port unchanged: failing cases were console uninitialised/IAT reads."
   },
   "hooked": {
     "file": "crates/compat/compat-common/src/net_guard.rs",
@@ -3076,17 +3078,6 @@
   "console_pending": {
     "XVMAudioService.dll": [
       "DllGetClassObject"
-    ],
-    "xg_xs.dll": [
-      "XGComputeTexture2DLayout"
-    ],
-    "xg_x.dll": [
-      "XGDecodeDCC",
-      "XGEncodeDCC",
-      "XGComputeTexture1DLayout",
-      "XGComputeTexture3DLayout",
-      "XGCreateTexture1DComputer",
-      "XGCreateTextureComputerWithPitch"
     ],
     "gamecoreclient.dll": [
       "DllGetClassObject"
