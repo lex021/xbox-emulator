@@ -150,7 +150,10 @@ pub fn default_free(address: *mut c_void, _attributes: u64) {
         }
         None => {
             record(M, "XMemFreeDefault", &format!("untracked {address:p} -> HeapFree"));
-            unsafe { HeapFree(GetProcessHeap(), 0, address) };
+            let h = unsafe { GetProcessHeap() };
+            if unsafe { HeapValidate(h, 0, address) } != 0 {
+                unsafe { HeapFree(h, 0, address) };
+            }
         }
     }
 }

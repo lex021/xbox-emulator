@@ -79,6 +79,7 @@ extern "system" {
     pub fn GetProcessHeap() -> Handle;
     pub fn HeapAlloc(heap: Handle, flags: u32, bytes: usize) -> *mut c_void;
     pub fn HeapFree(heap: Handle, flags: u32, mem: *mut c_void) -> i32;
+    pub fn HeapValidate(heap: Handle, flags: u32, mem: *const c_void) -> i32;
     pub fn HeapCreate(options: u32, initial: usize, maximum: usize) -> Handle;
     pub fn HeapSummary(heap: Handle, flags: u32, summary: *mut HeapSummaryInfo) -> i32;
     pub fn VirtualAlloc(addr: *mut c_void, size: usize, alloc_type: u32, protect: u32) -> *mut c_void;
