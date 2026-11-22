@@ -55,6 +55,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Check out pinned Opus sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: xiph/opus
+          ref: 316c675fa1c9982d76e9cdcba7231076f75047da
+          path: third_party/opus
+          persist-credentials: false
       - name: Toolchain
         shell: bash
         run: |

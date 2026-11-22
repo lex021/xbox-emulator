@@ -2574,7 +2574,7 @@ impl<'a> Emitter<'a> {
                 }
                 let exits: Vec<String> = labels.iter().filter(|&&t| t > i).map(|t| format!("j{t}")).collect();
                 let exit = if exits.is_empty() { String::new() } else { format!(" && !({})", exits.join(" || ")) };
-                self.line(&format!("}} while (tb_c{i}{exit} && ++tb_guard < 65536u);"));
+                self.line(&format!("}} while (tb_c{i}{exit} && ++tb_guard < {}u);", loop_guard(65536)));
                 self.loop_depth = self.loop_depth.saturating_sub(1);
             }
         }
@@ -2622,7 +2622,7 @@ impl<'a> Emitter<'a> {
         let starts: Vec<usize> = leaders.into_iter().filter(|&s| s < n).collect();
         self.loop_depth = 0;
         self.line("uint tb_pc = 0u; uint tb_guard = 0u;");
-        self.line(&format!("[loop] while (tb_pc != {n}u && tb_guard++ < 1000000u) {{"));
+        self.line(&format!("[loop] while (tb_pc != {n}u && tb_guard++ < {}u) {{", loop_guard(1000000)));
         self.loop_depth += 1;
         // Flat `if (tb_sel == K)` tests on a snapshot of the block id (FXC mishandles a
         // `switch` whose selector is assigned inside its cases).
@@ -5382,6 +5382,8 @@ impl<'a> Emitter<'a> {
             1 => ("point", 1usize),
             2 => ("line", 2),
             3 => ("triangle", 3),
+            6 => ("lineadj", 4),
+            7 => ("triangleadj", 6),
             other => return Err(format!("GS input primitive {other} unsupported")),
         };
         let stream = match gi.output_topology {
@@ -6401,7 +6403,11 @@ impl<'a> Emitter<'a> {
             // thread-group id in the three SGPRs following the user-data (root-parameter)
             // registers, thread-group size in the ISA preamble dwords 1..3.
             let p = ex.isa_preamble;
-            let (tx, ty_, tz) = (p[1].max(1), p[2].max(1), p[3].max(1));
+            let (tx, ty_, tz) = if p[1] != 0 || p[2] != 0 || p[3] != 0 {
+                (p[1].max(1), p[2].max(1), p[3].max(1))
+            } else {
+                ex.psv_numthreads.map(|t| (t[0], t[1], t[2])).unwrap_or((1, 1, 1))
+            };
             let nparams = ex.root_sig.as_ref().map(|r| r.params.len()).unwrap_or(4);
             let g = self.cs_tgid_base(nparams);
             let _ = writeln!(h, "[numthreads({tx}, {ty_}, {tz})]
@@ -6509,7 +6515,17 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             for rname in ["s3", "v0", "v1"] {
                 self.regs.insert(rname.to_string());
             }
-            let _ = writeln!(init, "    s3 = 0x100u; v0 = 0x04000000u; v1 = 0x800u;");
+            let _ = if nv <= 3 {
+                writeln!(init, "    s3 = 0x100u; v0 = 0x04000000u; v1 = 0x800u;")
+            } else {
+                let pack = |a: u32, b: u32| (a * 0x400) | ((b * 0x400) << 16);
+                if nv > 4 {
+                    self.regs.insert("v2".to_string());
+                    writeln!(init, "    s3 = 0x100u; v0 = {:#x}u; v1 = {:#x}u; v2 = {:#x}u;", pack(0, 1), pack(2, 3), pack(4, 5))
+                } else {
+                    writeln!(init, "    s3 = 0x100u; v0 = {:#x}u; v1 = {:#x}u;", pack(0, 1), pack(2, 3))
+                }
+            };
         }
         if !is_ps && !self.is_gs {
             let is_durango = self.durango.is_some() || crate::gcn::is_durango(&self.ex.fssm);
@@ -6574,7 +6590,20 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
         let (init, body) = centroid::lower(ex, &pos_field, &init, &self.body);
         h.push_str(&init);
         h.push_str(&body);
+        if guard_mark() && !no_out && !self.is_gs && body.contains("uint tb_guard = 0u;") && h.contains("float4 o0 : SV_Target0;") {
+            let _ = writeln!(h, "    if (tb_guard >= {}u) o.o0 = float4(1000.0, 0.0, 1000.0, 1.0);", loop_guard(1000000).saturating_sub(1));
+        }
         h.push_str(if no_out || self.is_gs { "}\n" } else { "    return o;\n}\n" });
         Ok(h)
     }
+}
+
+pub fn loop_guard(default: u32) -> u32 {
+    static G: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    G.get_or_init(|| std::env::var("TOMBOX_XS_LOOP_GUARD").ok().and_then(|v| v.trim().parse().ok()).filter(|&n: &u32| n > 0)).map_or(default, |n| n.min(default))
+}
+
+pub fn guard_mark() -> bool {
+    static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *M.get_or_init(|| std::env::var("TOMBOX_XS_GUARD_MARK").map(|v| v == "1").unwrap_or(false))
 }

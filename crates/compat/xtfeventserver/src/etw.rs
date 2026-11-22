@@ -318,7 +318,7 @@ unsafe fn run_trace(s: &EtwSource) -> HRESULT {
     }
     let mut lf = vec![0u8; LOGFILE_SIZE];
     lf[8..16].copy_from_slice(&(s.logger_name.as_ptr() as u64).to_le_bytes());
-    lf[0x1a8..0x1b0].copy_from_slice(&(event_record_callback as usize as u64).to_le_bytes());
+    lf[0x1a8..0x1b0].copy_from_slice(&(event_record_callback as *const () as usize as u64).to_le_bytes());
     put32(&mut lf, 0x1c, PROCESS_TRACE_MODE);
     lf[0x1b8..0x1c0].copy_from_slice(&(s as *const EtwSource as u64).to_le_bytes());
     let c = OpenTraceW(lf.as_mut_ptr());
