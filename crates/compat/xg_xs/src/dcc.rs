@@ -255,7 +255,16 @@ fn enc_block(d: &mut Dcc) -> Result<u32, i32> {
         let fills = [unknowns(q(0, 3 * k)), unknowns(q(1, 3 * k + 1)), unknowns(q(2, 3 * k + 2))];
         let mut conv = match (vary >> 3 & 1 != 0, k) {
             (false, _) | (true, 0) => seen,
-            (true, k) => unknowns(100 + k),
+            (true, k) => {
+                let mut r = unknowns(100 + k);
+                let km = enc::conv_known();
+                for qd in 0..8 {
+                    if km >> qd & 1 != 0 {
+                        r[qd * 8..qd * 8 + 8].copy_from_slice(&seen[qd * 8..qd * 8 + 8]);
+                    }
+                }
+                r
+            }
         };
         if vary >> 3 & 1 == 0 && vary >> 8 & 0xff != 0 && k > 0 {
             let r = unknowns(100 + k);

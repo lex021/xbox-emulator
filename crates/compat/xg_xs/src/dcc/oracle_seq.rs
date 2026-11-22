@@ -231,7 +231,8 @@ fn on_fresh_thread(dec: usize, enc: usize, id: u64) -> Out {
 }
 
 pub(super) fn host_residue_sites(b: &super::oracle_cases::Build, c: &Case) -> Vec<(usize, usize, usize)> {
-    if c.enc { vec![(b.convs, 0x88, 0xff)] } else { vec![] }
+    let m = std::env::var("TOMBOX_DCC_POKE_MASK").ok().and_then(|x| usize::from_str_radix(&x, 16).ok()).unwrap_or(0xff & !super::enc::conv_known() as usize);
+    if c.enc { vec![(b.convs, 0x90, m)] } else { vec![] }
 }
 
 fn poked_call(o: &crate::oracle::Oracle, c: &Case, p: usize) -> Out {
@@ -755,11 +756,11 @@ fn dcc_watch_scratch() {
             let _ = perturbed_call(cd, ce, &c, 0);
             e = unsafe { pe.rsp() } + if dec { 0x30 } else { 0x48 };
             rs = unsafe { pr.rsp() };
-            println!("watch {id} site {site:#x} h {:#x} E {e:#x} temp E-{:#x}", o.h, e - (rs - 0x88));
+            println!("watch {id} site {site:#x} h {:#x} E {e:#x} temp E-{:#x}", o.h, e - (rs - 0x90));
             continue;
         }
         let qs = &quads[(pass - 1) * 3..((pass - 1) * 3 + 3).min(quads.len())];
-        let addrs: Vec<usize> = qs.iter().map(|q| rs - 0x88 + 8 * q).collect();
+        let addrs: Vec<usize> = qs.iter().map(|q| rs - 0x90 + 8 * q).collect();
         let w = super::watch::Watch::arm(&addrs, Some(o.h + site));
         let _ = perturbed_call(cd, ce, &c, 0);
         let ev = w.events();
@@ -1025,6 +1026,107 @@ fn oracle_dcc_accepted_cases_invariant() {
             }
         }
     }
-    println!("dcc accepted cases ({}): {acc} of {n} generator cases accepted natively; {runs} console runs under stack smears 00/ff/random, heap sprays, a relocated console DLL, two forwarding XMem allocation hooks and two rewrites of the host-CRT scratch residue; {} differ from native: {:?}", b.name, bad.len(), &bad[..bad.len().min(40)]);
+    println!("dcc accepted cases ({}): {acc} of {n} generator cases accepted natively; {runs} console runs under stack smears 00/ff/random, heap sprays, a relocated console DLL, two forwarding XMem allocation hooks and two rewrites of the allocator-dependent convert scratch quads; {} differ from native: {:?}", b.name, bad.len(), &bad[..bad.len().min(40)]);
+    assert!(bad.is_empty());
+}
+
+fn seq_id(seed: u64, j: u64) -> u64 {
+    if seed == 0 { j } else { seed.wrapping_mul(1_000_003).wrapping_add(j) % 1_000_000 }
+}
+
+fn seq_child(seed: u64, start: u64, end: u64) {
+    let o = oracle().expect("console xg_xs.dll");
+    arm_exit_on_fault();
+    let (nd, ne) = natives();
+    let (cd, ce) = (o.f("XGDecodeDCC") as usize, o.f("XGEncodeDCC") as usize);
+    use std::io::Write;
+    let mut so = std::io::stdout();
+    for j in start..end {
+        let c = case(seq_id(seed, j));
+        let n = call_via(nd, ne, &c, 0x3c);
+        writeln!(so, "@@C {j} {:08x}", n.hr as u32).unwrap();
+        so.flush().unwrap();
+        let k = call_via(cd, ce, &c, 0x3c);
+        writeln!(so, "@@R {j} {:08x} {:016x} {:08x} {:016x}", n.hr as u32, out_hash(&c, &n), k.hr as u32, out_hash(&c, &k)).unwrap();
+        so.flush().unwrap();
+    }
+    writeln!(so, "@@DONE").unwrap();
+    so.flush().unwrap();
+}
+
+#[test]
+fn oracle_dcc_call_sequences() {
+    if let Ok(spec) = std::env::var("TOMBOX_DCC_SEQ_CHILD") {
+        let v: Vec<u64> = spec.split('_').map(|x| x.parse().unwrap()).collect();
+        seq_child(v[0], v[1], v[2]);
+        std::process::exit(0);
+    }
+    let o = oracle().expect("console xg_xs.dll");
+    let b = build_of(&o);
+    let seqs: u64 = std::env::var("TOMBOX_DCC_SEQS").ok().and_then(|x| x.parse().ok()).unwrap_or(3);
+    let len: u64 = std::env::var("TOMBOX_DCC_SEQ_LEN").ok().and_then(|x| x.parse().ok()).unwrap_or(400);
+    let v0: u64 = std::env::var("TOMBOX_DCC_SEQ0").ok().and_then(|x| x.parse().ok()).unwrap_or(3000);
+    let plan: Vec<(u64, u64)> = std::iter::once((0u64, v0)).chain((1..=seqs).map(|s| (s, len))).collect();
+    let (mut calls, mut same, mut rejected, mut crashes, mut hangs, mut init_bad, mut init_crash) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut bad = Vec::new();
+    for &(seed, len) in &plan {
+        let mut j = 0u64;
+        while j < len {
+            let text = child("dcc::oracle_seq::oracle_dcc_call_sequences", "TOMBOX_DCC_SEQ_CHILD", format!("{seed}_{j}_{len}"));
+            let mut pending: Option<(u64, bool)> = None;
+            let mut done = false;
+            let mut code = 0u32;
+            for l in text.lines().filter_map(|l| l.find("@@").map(|k| &l[k..])) {
+                let t: Vec<&str> = l.split(' ').collect();
+                match t[0] {
+                    "@@C" => pending = Some((t[1].parse().unwrap(), t[2] == "00000000")),
+                    "@@R" => {
+                        pending = None;
+                        calls += 1;
+                        let id: u64 = t[1].parse().unwrap();
+                        j = id + 1;
+                        if !init_ok(&case(seq_id(seed, id))) {
+                            init_bad += 1;
+                            if t[2] == "00000000" {
+                                bad.push(format!("seed {seed} call {id}: native accepted an input whose init native rejects"));
+                            }
+                        }
+                        if t[2] == "00000000" {
+                            if t[2] == t[4] && t[3] == t[5] {
+                                same += 1;
+                            } else {
+                                bad.push(format!("seed {seed} call {id}: native {} {} console {} {}", t[2], t[3], t[4], t[5]));
+                            }
+                        } else {
+                            rejected += 1;
+                        }
+                    }
+                    "@@EXIT" => code = u32::from_str_radix(t[1], 16).unwrap(),
+                    "@@DONE" => done = true,
+                    _ => {}
+                }
+            }
+            if done {
+                break;
+            }
+            let (id, accepted) = pending.unwrap_or_else(|| panic!("seed {seed}: child made no progress from call {j} (exit {code:#x})"));
+            calls += 1;
+            if accepted {
+                bad.push(format!("seed {seed} call {id}: native S_OK but the console {} ({code:#x})", if code == HANG { "hung" } else { "crashed" }));
+            } else {
+                rejected += 1;
+            }
+            if !init_ok(&case(seq_id(seed, id))) {
+                init_bad += 1;
+                init_crash += 1;
+            }
+            if code == HANG { hangs += 1 } else { crashes += 1 }
+            j = id + 1;
+        }
+    }
+    for x in &bad[..bad.len().min(20)] {
+        println!("sequence divergence: {x}");
+    }
+    println!("xg_xs dcc call sequences ({}): case order 0..{v0} plus {seqs} random sequences of {len} mixed XGDecodeDCC/XGEncodeDCC calls in one process with no reset between calls; {calls} calls: {same} native S_OK equal to the console (hr, data, meta, sizes), {rejected} native E_INVALIDARG, of which {crashes} console crashes and {hangs} hangs (process restarted); {init_bad} calls with init-invalid arguments, {init_crash} of them console crashes; {} divergences", b.name, bad.len());
     assert!(bad.is_empty());
 }

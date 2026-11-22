@@ -450,6 +450,7 @@ struct Emitter<'a> {
     bl_loads: HashMap<usize, (u32, u8)>,
     bl_const: HashMap<u32, u32>,
     uses_f64: bool,
+    uses_d16: bool,
     uav_mips: BTreeSet<u32>,
     tex_mips: BTreeSet<u32>,
     sm6_minor: u32,
@@ -1134,6 +1135,7 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
         bl_loads: HashMap::new(),
         bl_const: HashMap::new(),
         uses_f64: false,
+        uses_d16: false,
         uav_mips: BTreeSet::new(),
         tex_mips: BTreeSet::new(),
         sm6_minor: 0,
@@ -6296,6 +6298,9 @@ impl<'a> Emitter<'a> {
         h.push_str(CUBE_HELPERS);
         if self.uses_f64 {
             h.push_str(F64_HELPERS);
+        }
+        if self.uses_d16 {
+            h.push_str(mtbuf::D16_HELPERS);
         }
         if self.uses_global {
             h.push_str(&global::helpers());

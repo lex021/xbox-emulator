@@ -74,7 +74,7 @@ fn from_title_builds_the_runtime_once_listens_on_0x1080_and_idles() {
     assert!(bind_xbtp(XbtpFns {
         init_system: xbtp::link::XbtpLinkInitializeSystem,
         create: xbtp::link::XbtpLinkCreateHandle,
-        listen: unsafe { core::mem::transmute::<usize, unsafe extern "C" fn(*mut u8, *mut c_void, u16, *mut usize) -> i32>(xbtp::link::XbtpLinkListen as usize) },
+        listen: unsafe { core::mem::transmute::<usize, unsafe extern "C" fn(*mut u8, *mut c_void, u16, *mut usize) -> i32>(xbtp::link::XbtpLinkListen as *const () as usize) },
         accept: xbtp::link::XbtpLinkAccept,
         close: xbtp::link::XbtpLinkCloseHandle,
     }));

@@ -164,6 +164,11 @@ pub fn run_console_conio(console: &str) {
     assert_eq!(u16_at(&r, 0x32) & 0xff, 0x41, "VkKeyScan of the console layout's VK_A character");
     let r = request(port, 9, &[]);
     assert_eq!(r[0x2c], 0, "unknown request code is left unhandled by the console server");
+    for (code, at) in [(3u8, 0x38usize), (4, 0x38), (6, 0x3c)] {
+        let r = request(port, code, &[]);
+        assert_eq!(r[0x2c], 1, "display request {code} handled");
+        assert_eq!(u32_at(&r, at), 0xC000_0001, "display request {code} fails STATUS_UNSUCCESSFUL with no ConDrv display");
+    }
     assert!(alpc::wait_for(|| cfgmgr::interface_registrations(conkbd::KEYBOARD_INTERFACE) >= 1, Duration::from_secs(5)), "console keyboard thread registered for keyboard arrival");
     assert_eq!(cfgmgr::interfaces(conkbd::KEYBOARD_INTERFACE), Vec::<String>::new());
     let link = conkbd::attach();
