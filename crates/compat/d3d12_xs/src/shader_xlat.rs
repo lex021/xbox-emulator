@@ -2,8 +2,8 @@
 //!
 //! Xbox shader blob (DXBC wrapper → XDAT → zlib → FSSM → RDNA2) → HLSL (tombox-xshader)
 //! → DXC (`dxcompiler.dll`, SM6 DXIL; FXC/`D3DCompile` SM5 DXBC as fallback) → cached bytecode.
-//! Each unique shader is translated once per process (keyed by an FNV-1a hash of its
-//! bytes). Failures are cached too and reported with the reason; failing shaders are
+//! Translation is cached by shader bytes, render-target formats and any external root
+//! signature. Failures are cached too and reported with the reason; failing shaders are
 //! dumped to `%TEMP%\tombox_shaders` so coverage can be extended offline with `xshader`.
 
 use compat_common::record;
@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 type Cached = Result<Arc<Vec<u8>>, Arc<String>>;
 static CACHE: OnceLock<Mutex<HashMap<u64, Arc<OnceLock<Cached>>>>> = OnceLock::new();
-static MESH_ROOT_CACHE: OnceLock<Mutex<HashMap<u64, HashMap<Vec<u8>, Arc<OnceLock<Cached>>>>>> = OnceLock::new();
+type RootTranslations = HashMap<Vec<u8>, Arc<OnceLock<Cached>>>;
+static PIPELINE_ROOT_CACHE: OnceLock<Mutex<HashMap<(u64, [u8; 8]), RootTranslations>>> = OnceLock::new();
 static OK: AtomicUsize = AtomicUsize::new(0);
 static FAIL: AtomicUsize = AtomicUsize::new(0);
 static DUMPED: AtomicUsize = AtomicUsize::new(0);
@@ -429,10 +430,10 @@ fn cell(key: u64) -> Arc<OnceLock<Cached>> {
     cache.lock().unwrap().entry(key).or_insert_with(|| Arc::new(OnceLock::new())).clone()
 }
 
-fn mesh_root_cell(hash: u64, root: &[u8]) -> Arc<OnceLock<Cached>> {
-    let cache = MESH_ROOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+fn pipeline_root_cell(hash: u64, root: &[u8], rtfmt: [u8; 8]) -> Arc<OnceLock<Cached>> {
+    let cache = PIPELINE_ROOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache.lock().unwrap();
-    let roots = cache.entry(hash).or_default();
+    let roots = cache.entry((hash, rtfmt)).or_default();
     if let Some(entry) = roots.get(root) {
         return entry.clone();
     }
@@ -626,12 +627,12 @@ pub fn needs_external_root_data(blob: &[u8]) -> bool {
         && tombox_xshader::Dxbc::parse(blob).is_ok_and(|dxbc| dxbc.chunk(b"RTS0").is_none())
 }
 
-pub fn translate_mesh_with_root(blob: &[u8], root: &[u8]) -> Cached {
+pub fn translate_with_pipeline_root(blob: &[u8], root: &[u8], rtfmt: [u8; 8]) -> Cached {
     let hash = fnv1a(blob);
-    let entry = mesh_root_cell(hash, root);
+    let entry = pipeline_root_cell(hash, root, rtfmt);
     entry.get_or_init(|| {
         crate::perf::timed(crate::perf::SHADER, || {
-            let result = std::panic::catch_unwind(|| translate_uncached_with(blob, hash, &[0; 8], None, Some(root)))
+            let result = std::panic::catch_unwind(|| translate_uncached_with(blob, hash, &rtfmt, None, Some(root)))
                 .unwrap_or_else(|_| Err("translator panicked".to_string()));
             finish_with(result, hash, blob.len(), None)
         })
@@ -647,7 +648,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mesh_pipeline_root_cache_separates_layouts_and_keeps_embedded_roots() {
+    fn pipeline_root_cache_separates_layouts_and_target_formats() {
         let body = [0; 24];
         let embedded = crate::device_wrap::wrap_root_signature(&body);
         assert!(!needs_external_root_data(&embedded));
@@ -657,10 +658,11 @@ mod tests {
         assert!(needs_external_root_data(&stripped));
         assert!(!needs_external_root_data(&stripped[..31]));
         let hash = fnv1a(&stripped);
-        let root_a = mesh_root_cell(hash, &[1, 2, 3]);
-        let root_b = mesh_root_cell(hash, &[1, 2, 4]);
-        assert!(Arc::ptr_eq(&root_a, &mesh_root_cell(hash, &[1, 2, 3])));
+        let root_a = pipeline_root_cell(hash, &[1, 2, 3], [0; 8]);
+        let root_b = pipeline_root_cell(hash, &[1, 2, 4], [0; 8]);
+        assert!(Arc::ptr_eq(&root_a, &pipeline_root_cell(hash, &[1, 2, 3], [0; 8])));
         assert!(!Arc::ptr_eq(&root_a, &root_b));
+        assert!(!Arc::ptr_eq(&root_a, &pipeline_root_cell(hash, &[1, 2, 3], [1; 8])));
         assert!(!Arc::ptr_eq(&root_a, &cell(cache_key(hash, &[0; 8]))));
     }
 

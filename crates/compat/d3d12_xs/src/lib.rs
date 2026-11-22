@@ -86,6 +86,12 @@ mod driver_unload_tests;
 mod title_heap;
 mod mesh_pso;
 mod console_slots_mesh;
+#[cfg(all(test, windows))]
+#[allow(dead_code)]
+#[path = "../../../tools/xreplay/src/d3d.rs"]
+mod d3d;
+#[cfg(all(test, windows))]
+mod mesh_pipeline_tests;
 mod cl_console_fix;
 mod device_console_fix;
 mod pso_ext;
