@@ -126,7 +126,8 @@ int tb_nrm(float v, uint k) { uint b = asuint(v); uint a = b & 0x7fffffffu; if (
 float tb_rev(float x) { return (abs(x) < 0.5) ? x : x - round(x); }
 float tb_ldexp32(float x, int e) { int k = clamp(e, -330, 330); return (float)((double)x * asdouble(0u, (uint)(k + 1023) << 20)); }
 float tb_rto(double s) { float f = (float)s; if ((double)f != s) { uint u = asuint(f); if (abs((double)f) > abs(s)) u -= 1u; f = asfloat(u | 1u); } return f; }
-float tb_fma16(float a, float b, float c) { precise float p = a * b; precise float s = p + c; if ((asuint(s) & 0x7fffffffu) >= 0x7f800000u) return s; precise float bb = s - p; precise float e = (p - (s - bb)) + (c - bb); uint u = asuint(s); if (e != 0.0) { if ((e > 0.0) != (s > 0.0)) u -= 1u; u |= 1u; } return asfloat(u); }
+// WARP can fold a literal +0 addend away. Derive the sign of an exact zero from the operands.
+float tb_fma16(float a, float b, float c) { precise float p = a * b; precise float s = p + c; if ((asuint(s) & 0x7fffffffu) == 0u) return asfloat((asuint(a) ^ asuint(b)) & asuint(c) & 0x80000000u); if ((asuint(s) & 0x7fffffffu) >= 0x7f800000u) return s; precise float bb = s - p; precise float e = (p - (s - bb)) + (c - bb); uint u = asuint(s); if (e != 0.0) { if ((e > 0.0) != (s > 0.0)) u -= 1u; u |= 1u; } return asfloat(u); }
 float tb_fma_rto(float a, float b, float c) { precise double p = (double)a * (double)b; precise double q = (double)c; precise double s = p + q; if (!(abs(s) < 1.0e300)) return (float)s; precise double bb = s - p; precise double e = (p - (s - bb)) + (q - bb); float f = (float)s; uint u = asuint(f); if ((double)f != s) { if (abs((double)f) > abs(s)) u -= 1u; u |= 1u; } else if (e != 0.0) { if ((e > 0.0) != (s > 0.0)) u -= 1u; u |= 1u; } return asfloat(u); }
 float tb_mull(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }
 #ifdef TB_FAST_FMA

@@ -251,7 +251,7 @@ fn vop2_ops(s: &mut Suite) {
         on(hldexp(a, x.d[1].wrapping_sub(x.d[3])).map(|r| (x.d[2] & 0xffff_0000) | r))
     });
     s.add("v_fmac_f16", "VOP2", "e32", Class::F16, &[vmov(OUT, v(12))], &[vop2(0x36, OUT, v(10), 11)], &[], &[Cmp::F16(0)], |x| on(hfma(x.d[0] & 0xffff, x.d[1] & 0xffff, x.d[2] & 0xffff).map(|r| (x.d[2] & 0xffff_0000) | r)));
-    let hk = [0x3e00u32, 0xc900, 0x0000, 0x7c00, 0x3555, 0x0200];
+    let hk = [0x3e00u32, 0xc900, 0x0000, 0x8000, 0x7c00, 0x3555, 0x0200];
     for (i, &k) in hk.iter().enumerate() {
         let tag = format!("K={k:04x} #{i}");
         s.add("v_fmamk_f16", "VOP2", &tag, Class::F16, &[vmov(OUT, v(12))], &[vop2(0x37, OUT, v(10), 11), k], &[], &[Cmp::F16(0)], move |x| on(hfma(x.d[0] & 0xffff, k, x.d[1] & 0xffff).map(|r| (x.d[2] & 0xffff_0000) | r)));
