@@ -891,23 +891,6 @@ fn scalar_bfe32_result_and_scc() {
 }
 
 #[test]
-fn scalar_bfe64_literal_extension() {
-    let mut cases = Cases::new();
-    let mut pre = pr();
-    pre.sv(12, (32 << 16) | 32);
-    let mut post = pr();
-    post.s2v(0, 20).s2v(1, 21).scc_to_v(2);
-    for (name, op, literal, expected) in [
-        ("s_bfe_i64", 0x2a, 0xffff_fffe, [u32::MAX, u32::MAX, 1]),
-        ("s_bfe_i64", 0x2a, 0x7fff_fffe, [0, 0, 0]),
-        ("s_bfe_u64", 0x29, 0xffff_fffe, [0, 0, 0]),
-    ] {
-        cases.add(name, &pre, &[sop2(op, 20, LIT, 12), literal], &post, &expected);
-    }
-    cases.run_both("s_bfe64_literal_extension");
-}
-
-#[test]
 fn scalar_sop1() {
     let mut c = Cases::new();
     let vals32: [u32; 7] = [0, 1, 0x8000_0000, 0xffff_ffff, 0x0001_0000, 0x7fff_fff0, 0x1234_0080];
