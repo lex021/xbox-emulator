@@ -66,9 +66,9 @@ $AllSpecs = @{
   }
   fortnite = [pscustomobject]@{
     RunTitle = 'Fortnite'; Proc = 'FortniteClient-XSX-Shipping'; Drive = 'K:'; Main = 'lobby'; Seed = ''
-    PadScreens = @()
+    PadScreens = @((Scr 'start' 'fortnite_press_start.png' 800 745 370 60), (Scr 'safezone' 'fortnite_safe_zone.png' 620 470 680 55))
     Scenes = [ordered]@{
-      lobby = @{ Pad = '0:connect'; Rx = 'to \[UI\.State\.Athena\.Frontend'; Screen = ''; Timeout = 240; After = 5 }
+      lobby = @{ Pad = '0:connect;/Setting user focus to widget Splash_Screen/+2:press a;?#safezone+1:press a'; Rx = 'to \[UI\.State\.Athena\.Frontend'; Screen = ''; Timeout = 240; After = 5 }
     }
     Milestones = @(
       @{ Name = 'login'; Src = 'ods'; Rx = [regex]'HandleLoginRequestComplete.*Result=2' },

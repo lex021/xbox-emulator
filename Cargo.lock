@@ -1085,6 +1085,7 @@ dependencies = [
 name = "xtfeventserver"
 version = "0.1.0"
 dependencies = [
+ "xbtp",
  "xtfcommon",
 ]
 
