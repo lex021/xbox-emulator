@@ -874,6 +874,40 @@ fn scalar_sop2() {
 }
 
 #[test]
+fn scalar_bfe32_result_and_scc() {
+    let mut cases = Cases::new();
+    for (offset, width, unsigned, signed) in [
+        (16, 0, 0, 0),
+        (31, 1, 1, u32::MAX),
+        (28, 8, 8, 0xffff_fff8),
+        (16, 32, 0x8123, 0xffff_8123),
+        (0, 32, 0x8123_4567, 0x8123_4567),
+    ] {
+        let control = (width << 16) | offset;
+        s2(&mut cases, "s_bfe_u32", 0x27, 0x8123_4567, control, 1, unsigned, nz(u64::from(unsigned)));
+        s2(&mut cases, "s_bfe_i32", 0x28, 0x8123_4567, control, 1, signed, nz(u64::from(signed)));
+    }
+    cases.run_both("s_bfe32_result_and_scc");
+}
+
+#[test]
+fn scalar_bfe64_literal_extension() {
+    let mut cases = Cases::new();
+    let mut pre = pr();
+    pre.sv(12, (32 << 16) | 32);
+    let mut post = pr();
+    post.s2v(0, 20).s2v(1, 21).scc_to_v(2);
+    for (name, op, literal, expected) in [
+        ("s_bfe_i64", 0x2a, 0xffff_fffe, [u32::MAX, u32::MAX, 1]),
+        ("s_bfe_i64", 0x2a, 0x7fff_fffe, [0, 0, 0]),
+        ("s_bfe_u64", 0x29, 0xffff_fffe, [0, 0, 0]),
+    ] {
+        cases.add(name, &pre, &[sop2(op, 20, LIT, 12), literal], &post, &expected);
+    }
+    cases.run_both("s_bfe64_literal_extension");
+}
+
+#[test]
 fn scalar_sop1() {
     let mut c = Cases::new();
     let vals32: [u32; 7] = [0, 1, 0x8000_0000, 0xffff_ffff, 0x0001_0000, 0x7fff_fff0, 0x1234_0080];
