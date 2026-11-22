@@ -240,6 +240,7 @@ pub struct Stats {
     pub writes: u64,
 }
 
+pub static COMPILE_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 static BAD: AtomicU64 = AtomicU64::new(0);
@@ -437,8 +438,14 @@ pub fn compile_cached_with(
     }
     let lookup_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let t1 = std::time::Instant::now();
-    let code = compile()?;
+    let code = compile();
     let dxc_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    let hook = COMPILE_HOOK.load(Ordering::Relaxed);
+    if hook != 0 {
+        let f: fn(u64) = unsafe { core::mem::transmute(hook) };
+        f((dxc_ms * 1000.0) as u64);
+    }
+    let code = code?;
     let _ = put(k, &code);
     Ok(Compiled { code, source: Source::Compiled, dxc_ms, lookup_ms })
 }

@@ -148,7 +148,10 @@ unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, bl
     if blob.is_null() || len == 0 || !enabled() {
         return unsafe { f(this, mask, blob, len, riid, ppv) };
     }
-    match patch_blob(unsafe { core::slice::from_raw_parts(blob, len) }) {
+    if check_on() {
+        log_root_regs(unsafe { core::slice::from_raw_parts(blob, len) });
+    }
+    let hr = match patch_blob(unsafe { core::slice::from_raw_parts(blob, len) }) {
         Ok(None) => unsafe { f(this, mask, blob, len, riid, ppv) },
         Ok(Some((b, p))) => {
             static N: AtomicUsize = AtomicUsize::new(0);
@@ -161,7 +164,13 @@ unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, bl
             record("d3d12_xs", "cbv_raw", &format!("root signature not rebound ({e}); created as given"));
             unsafe { f(this, mask, blob, len, riid, ppv) }
         }
+    };
+    if hr >= 0 && inherit_on() && !ppv.is_null() {
+        let rs = unsafe { *ppv } as usize;
+        let regs = root_cbv_regs(unsafe { core::slice::from_raw_parts(blob, len) });
+        dc_with(|d| { d.rs.insert(rs, regs); });
     }
+    hr
 }
 
 unsafe extern "system" fn create_cbv(this: *mut c_void, pdesc: *const u8, dest: usize) {
@@ -191,13 +200,57 @@ unsafe extern "system" fn create_cbv(this: *mut c_void, pdesc: *const u8, dest: 
 }
 
 unsafe extern "system" fn set_compute_root_cbv_x(this: *mut c_void, i: u32, va: u64) {
+    if check_on() {
+        check_root(i, va, true);
+    }
+    if crate::rtcap::enabled() {
+        crate::bindtrace::set_root_cbv(this as usize, true, i, va);
+    }
     let f: unsafe extern "system" fn(*mut c_void, u32, u64) = unsafe { core::mem::transmute(REAL_ROOT_SRV[0].load(Ordering::Relaxed)) };
     unsafe { f(this, i, va) }
 }
 
 unsafe extern "system" fn set_graphics_root_cbv_x(this: *mut c_void, i: u32, va: u64) {
+    if check_on() {
+        check_root(i, va, false);
+    }
+    if crate::rtcap::enabled() {
+        crate::bindtrace::set_root_cbv(this as usize, false, i, va);
+    }
+    if inherit_on() {
+        dc_with(|d| {
+            let l = d.lists.entry(this as usize).or_default();
+            if (i as usize) < 64 {
+                l.1 |= 1u64 << i;
+                l.2.insert(i, va);
+            }
+            d.last.entry(this as usize).or_default().insert(i, va);
+        });
+    }
     let f: unsafe extern "system" fn(*mut c_void, u32, u64) = unsafe { core::mem::transmute(REAL_ROOT_SRV[1].load(Ordering::Relaxed)) };
     unsafe { f(this, i, va) }
+}
+
+fn check_on() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("TOMBOX_CBRAW_CHECK").map(|v| v == "1").unwrap_or(false))
+}
+
+fn check_root(i: u32, va: u64, compute: bool) {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    static OK: AtomicUsize = AtomicUsize::new(0);
+    let what = match (crate::gpu_va::lookup_gpu(va), crate::gpu_va::lookup(va)) {
+        _ if va == 0 => Some("null VA".to_string()),
+        (Some((e, off)), _) if e.len.saturating_sub(off) < 0x800 => Some(format!("PC GPU VA in res {:#x} at +{off:#x} of {:#x}, only {:#x} bytes left", e.res, e.len, e.len.saturating_sub(off))),
+        (Some(_), _) => None,
+        (None, Some((e, off))) => Some(format!("not a PC GPU VA; title-memory VA of res {:#x} +{off:#x} (len {:#x})", e.res, e.len)),
+        (None, None) => Some("not inside any known buffer".to_string()),
+    };
+    match what {
+        Some(w) if N.fetch_add(1, Ordering::Relaxed) < 64 => record("d3d12_xs", "cbv_raw_check", &format!("root CBV param {i} compute={compute} va={va:#x}: {w}")),
+        None if OK.fetch_add(1, Ordering::Relaxed) == 0 => record("d3d12_xs", "cbv_raw_check", &format!("first good root CBV param {i} va={va:#x}")),
+        _ => {}
+    }
 }
 
 pub unsafe fn install_root_cbv_hooks(xbox_vt: &[AtomicUsize], real_vt: *const usize) {
@@ -220,6 +273,183 @@ pub fn hook_device(v: &mut [usize]) {
     PREV_CBV.store(v[17], Ordering::Relaxed);
     v[16] = create_root_signature as usize;
     v[17] = create_cbv as usize;
+}
+
+pub fn clamp_knob() -> Option<(u32, u32)> {
+    static K: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+    *K.get_or_init(|| {
+        let v = std::env::var("TOMBOX_CBRAW_CLAMP").ok()?;
+        let (a, b) = v.split_once(':')?;
+        let lim = b.trim().trim_start_matches("0x");
+        let lim = if lim == "z" { u32::MAX } else { u32::from_str_radix(lim, 16).ok()? };
+        Some((a.trim().parse().ok()?, lim))
+    })
+}
+
+pub fn clamp_reads(h: &str, slot: u32, lim: u32) -> String {
+    let decl = format!("ByteAddressBuffer tb_cbr{slot} : register(");
+    let Some(at) = h.find(&decl) else { return h.to_string() };
+    let eol = h[at..].find('\n').map(|i| at + i + 1).unwrap_or(h.len());
+    let body = h[eol..].replace(&format!("tb_cbr{slot}.Load4("), &format!("tb_cbc{slot}("));
+    if lim == u32::MAX {
+        return format!("{}uint4 tb_cbc{slot}(uint o) {{ uint4 v = tb_cbr{slot}.Load4(o); return (v.x == 0x7fc1d00du && v.y == 0x7fc1d00du) ? v : uint4(0u, 0u, 0u, 0u); }}\n{}", &h[..eol], body);
+    }
+    format!("{}uint4 tb_cbc{slot}(uint o) {{ return o < {lim:#x}u ? tb_cbr{slot}.Load4(o) : uint4(0u, 0u, 0u, 0u); }}\n{}", &h[..eol], body)
+}
+
+pub fn root_cbv_regs(blob: &[u8]) -> Vec<(usize, u32, u32)> {
+    let mut out = Vec::new();
+    let Some((o, n)) = crate::console_slots_mesh::rts0_range(blob) else { return out };
+    let Some(b) = blob.get(o..o + n) else { return out };
+    let (Ok(np), Ok(po)) = (rd(b, 4), rd(b, 8)) else { return out };
+    for i in 0..np as usize {
+        let at = po as usize + i * 12;
+        if let (Ok(PARAM_CBV), Ok(pl)) = (rd(b, at), rd(b, at + 8)) {
+            if let (Ok(r), Ok(sp)) = (rd(b, pl as usize), rd(b, pl as usize + 4)) {
+                out.push((i, r, sp));
+            }
+        }
+    }
+    out
+}
+
+fn log_root_regs(blob: &[u8]) {
+    let regs = root_cbv_regs(blob);
+    if regs.is_empty() {
+        return;
+    }
+    static SEEN: std::sync::Mutex<Vec<Vec<(usize, u32, u32)>>> = std::sync::Mutex::new(Vec::new());
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.contains(&regs) && g.len() < 64 {
+        record("d3d12_xs", "cbv_raw_check", &format!("root signature root CBV params (param, register b, space): {regs:?}"));
+        g.push(regs);
+    }
+}
+
+#[derive(Default)]
+struct DrawCheck {
+    rs: std::collections::HashMap<usize, Vec<(usize, u32, u32)>>,
+    lists: std::collections::HashMap<usize, (usize, u64, std::collections::HashMap<u32, u64>)>,
+    last: std::collections::HashMap<usize, std::collections::HashMap<u32, u64>>,
+    seen: std::collections::HashSet<(usize, u64)>,
+}
+
+static DC: std::sync::Mutex<Option<DrawCheck>> = std::sync::Mutex::new(None);
+static PREV_SET_RS: AtomicUsize = AtomicUsize::new(0);
+static PREV_DRAW_IDX: AtomicUsize = AtomicUsize::new(0);
+static PREV_DRAW: AtomicUsize = AtomicUsize::new(0);
+static PREV_RESET: AtomicUsize = AtomicUsize::new(0);
+static INHERITED: AtomicUsize = AtomicUsize::new(0);
+const XBOX_SLOT_RESET: usize = 10;
+const XBOX_SLOT_SET_GRAPHICS_RS: usize = 34;
+const XBOX_SLOT_DRAW: usize = 12;
+const XBOX_SLOT_DRAW_INDEXED: usize = 13;
+
+fn dc_with<R>(f: impl FnOnce(&mut DrawCheck) -> R) -> R {
+    let mut g = DC.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(DrawCheck::default))
+}
+
+unsafe extern "system" fn set_graphics_rs_checked(this: *mut c_void, rs: *mut c_void) {
+    dc_with(|d| {
+        let l = d.lists.entry(this as usize).or_default();
+        if l.0 != rs as usize {
+            *l = (rs as usize, 0, std::collections::HashMap::new());
+        }
+    });
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void) = unsafe { core::mem::transmute(PREV_SET_RS.load(Ordering::Relaxed)) };
+    unsafe { f(this, rs) }
+}
+
+fn inherit_on() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| enabled() && (check_on() || std::env::var("TOMBOX_CBRAW_INHERIT").map(|v| v == "1").unwrap_or(false)))
+}
+
+unsafe extern "system" fn reset_checked(this: *mut c_void, alloc: *mut c_void, pso: *mut c_void) -> i32 {
+    dc_with(|d| {
+        d.lists.remove(&(this as usize));
+        d.last.remove(&(this as usize));
+    });
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = unsafe { core::mem::transmute(PREV_RESET.load(Ordering::Relaxed)) };
+    unsafe { f(this, alloc, pso) }
+}
+
+pub fn inherit_plan(regs: &[(usize, u32, u32)], mask: u64, last: &std::collections::HashMap<u32, u64>) -> Vec<(u32, u64)> {
+    regs.iter()
+        .filter(|(i, _, _)| *i < 64 && mask & (1u64 << i) == 0)
+        .filter_map(|(i, _, _)| last.get(&(*i as u32)).map(|va| (*i as u32, *va)))
+        .collect()
+}
+
+fn check_draw(list: usize) {
+    let (plan, msg) = dc_with(|d| {
+        let (rs, mask, vas) = d.lists.get(&list).cloned().unwrap_or_default();
+        let Some(regs) = d.rs.get(&rs).cloned() else { return (Vec::new(), None) };
+        let plan = d.last.get(&list).map(|last| inherit_plan(&regs, mask, last)).unwrap_or_default();
+        if let Some(l) = d.lists.get_mut(&list) {
+            for (i, va) in &plan {
+                l.1 |= 1u64 << i;
+                l.2.insert(*i, *va);
+            }
+        }
+        if !check_on() {
+            return (plan, None);
+        }
+        let unset: Vec<String> = regs.iter().filter(|(i, _, _)| *i >= 64 || mask & (1u64 << i) == 0).map(|(i, r, sp)| {
+            let inh = plan.iter().find(|(p, _)| *p as usize == *i).map(|(_, va)| format!(" inherited {va:#x}")).unwrap_or_else(|| " never set on this list".to_string());
+            format!("param {i} (b{r} space{sp}){inh}")
+        }).collect();
+        if unset.is_empty() {
+            return (plan, None);
+        }
+        let _ = vas;
+        let key = (rs, mask);
+        if d.seen.len() >= 64 || !d.seen.insert(key) {
+            return (plan, None);
+        }
+        (plan, Some(format!("draw on list {list:#x} with root signature {rs:#x}: root CBVs not set since SetGraphicsRootSignature: [{}]", unset.join(", "))))
+    });
+    if !plan.is_empty() {
+        let f: unsafe extern "system" fn(*mut c_void, u32, u64) = unsafe { core::mem::transmute(REAL_ROOT_SRV[1].load(Ordering::Relaxed)) };
+        for (i, va) in &plan {
+            unsafe { f(list as *mut c_void, *i, *va) };
+        }
+        let n = INHERITED.fetch_add(plan.len(), Ordering::Relaxed);
+        if n == 0 {
+            record("d3d12_xs", "cbv_raw", "a draw used a root signature whose root CBV was not set since SetGraphicsRootSignature; the value last set at that parameter index on this list is re-applied, as console user-data registers keep it (TOMBOX_CBRAW_INHERIT=1)");
+        }
+    }
+    if let Some(m) = msg {
+        record("d3d12_xs", "cbv_raw_check", &m);
+    }
+}
+
+unsafe extern "system" fn draw_indexed_checked(this: *mut c_void, a: u32, b: u32, c: u32, d: i32, e: u32) {
+    check_draw(this as usize);
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32) = unsafe { core::mem::transmute(PREV_DRAW_IDX.load(Ordering::Relaxed)) };
+    unsafe { f(this, a, b, c, d, e) }
+}
+
+unsafe extern "system" fn draw_checked(this: *mut c_void, a: u32, b: u32, c: u32, d: u32) {
+    check_draw(this as usize);
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32) = unsafe { core::mem::transmute(PREV_DRAW.load(Ordering::Relaxed)) };
+    unsafe { f(this, a, b, c, d) }
+}
+
+pub fn install_draw_check(xbox_vt: &[AtomicUsize]) {
+    if !inherit_on() || xbox_vt.len() <= XBOX_SLOT_SET_GRAPHICS_RS || REAL_ROOT_SRV[1].load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    PREV_RESET.store(xbox_vt[XBOX_SLOT_RESET].load(Ordering::Relaxed), Ordering::Relaxed);
+    xbox_vt[XBOX_SLOT_RESET].store(reset_checked as usize, Ordering::Relaxed);
+    PREV_SET_RS.store(xbox_vt[XBOX_SLOT_SET_GRAPHICS_RS].load(Ordering::Relaxed), Ordering::Relaxed);
+    PREV_DRAW_IDX.store(xbox_vt[XBOX_SLOT_DRAW_INDEXED].load(Ordering::Relaxed), Ordering::Relaxed);
+    PREV_DRAW.store(xbox_vt[XBOX_SLOT_DRAW].load(Ordering::Relaxed), Ordering::Relaxed);
+    xbox_vt[XBOX_SLOT_SET_GRAPHICS_RS].store(set_graphics_rs_checked as usize, Ordering::Relaxed);
+    xbox_vt[XBOX_SLOT_DRAW_INDEXED].store(draw_indexed_checked as usize, Ordering::Relaxed);
+    xbox_vt[XBOX_SLOT_DRAW].store(draw_checked as usize, Ordering::Relaxed);
+    record("d3d12_xs", "cbv_raw", "root CBV inheritance across root signature changes installed");
 }
 
 #[cfg(test)]
@@ -281,6 +511,17 @@ mod tests {
         assert!(patch_rts0(&mut b).is_err());
         let b = rts0(2, &[[3, 1, 0, 0]], false);
         assert_eq!(patch_blob(&b).unwrap(), None);
+    }
+
+    #[test]
+    fn unset_root_cbvs_inherit_the_value_last_set_at_their_index() {
+        let regs = vec![(0usize, 1u32, 0u32), (5, 13, 0), (6, 13, 0)];
+        let last: std::collections::HashMap<u32, u64> = [(0u32, 0x1000u64), (5, 0x2000), (6, 0x3000), (7, 0x4000)].into_iter().collect();
+        assert_eq!(inherit_plan(&regs, 1 << 0 | 1 << 5, &last), vec![(6, 0x3000)]);
+        assert_eq!(inherit_plan(&regs, 0, &last), vec![(0, 0x1000), (5, 0x2000), (6, 0x3000)]);
+        assert!(inherit_plan(&regs, 1 | 1 << 5 | 1 << 6, &last).is_empty());
+        let partial: std::collections::HashMap<u32, u64> = [(5u32, 0x2000u64)].into_iter().collect();
+        assert_eq!(inherit_plan(&regs, 0, &partial), vec![(5, 0x2000)]);
     }
 
     #[test]

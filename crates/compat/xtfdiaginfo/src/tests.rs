@@ -10,6 +10,7 @@ use crate::system;
 use crate::titles;
 use crate::titlememory;
 use crate::processdelta;
+use crate::conndiag;
 use crate::xmemi::{self, XMem, XMemBasicInformation};
 use crate::OperationFn;
 use core::ffi::c_void;
@@ -35,6 +36,10 @@ pub(crate) fn test_imports() -> Result<Imports, HRESULT> {
             logging_instance: transmute(xtfbaseservices::manager::LoggingManager_Instance as *const () as usize),
             get_logging_properties: transmute(xtfbaseservices::manager::LoggingManager_GetLoggingProperties as *const () as usize),
             set_logging_properties: transmute(xtfbaseservices::manager::LoggingManager_SetLoggingProperties as *const () as usize),
+            link_create_handle: transmute(xbtp::link::XbtpLinkCreateHandle as *const () as usize),
+            link_connect_by_name: transmute(xbtp::link::XbtpLinkConnectByName as *const () as usize),
+            link_query_handle_information: transmute(xbtp::link::XbtpLinkQueryHandleInformation as *const () as usize),
+            link_close_handle: transmute(xbtp::link::XbtpLinkCloseHandle as *const () as usize),
         })
     }
 }
@@ -718,22 +723,26 @@ fn entry_point_validates_guids_and_registers_handlers() {
     unsafe {
         let mut out: *mut c_void = null_mut();
         let other = GUID::new(1, 2, 3, [0; 8]);
-        assert_eq!(extension_entry_point(&other, &IID_XBTP_EXTENSION_METADATA_IMPL, &mut out, &IMPLEMENTED_HANDLERS), E_INVALIDARG);
-        assert_eq!(extension_entry_point(&DIAGINFO_EXTENSION_ID, &other, &mut out, &IMPLEMENTED_HANDLERS), E_INVALIDARG);
+        assert_eq!(extension_entry_point(&other, &IID_XBTP_EXTENSION_METADATA_IMPL, &mut out, &CONSOLE_HANDLERS), E_INVALIDARG);
+        assert_eq!(extension_entry_point(&DIAGINFO_EXTENSION_ID, &other, &mut out, &CONSOLE_HANDLERS), E_INVALIDARG);
         assert!(out.is_null());
-        assert_eq!(extension_entry_point(&DIAGINFO_EXTENSION_ID, &IID_XBTP_EXTENSION_METADATA_IMPL, &mut out, &IMPLEMENTED_HANDLERS), S_OK);
+        assert_eq!(extension_entry_point(&DIAGINFO_EXTENSION_ID, &IID_XBTP_EXTENSION_METADATA_IMPL, &mut out, &CONSOLE_HANDLERS), S_OK);
         assert!(!out.is_null());
         let count: unsafe extern "system" fn(Obj, *mut u32) -> HRESULT = transmute(slot(out, 3));
         let mut n = 0u32;
         assert_eq!(count(out, &mut n), S_OK);
-        assert_eq!(n, IMPLEMENTED_HANDLERS.len() as u32);
+        assert_eq!(n, CONSOLE_HANDLERS.len() as u32);
         release(out);
-        let mut pos = 0;
-        for (id, _) in IMPLEMENTED_HANDLERS.iter() {
-            let p = CONSOLE_REGISTRATION_ORDER.iter().position(|x| x == id).unwrap();
-            assert!(p >= pos);
-            pos = p;
-        }
+        let ids: Vec<u32> = CONSOLE_HANDLERS.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, CONSOLE_REGISTRATION_ORDER.to_vec());
+        let mut exported: *mut c_void = null_mut();
+        assert_eq!(XtfOrdinal_4(&other, &IID_XBTP_EXTENSION_METADATA_IMPL, &mut exported), E_INVALIDARG);
+        assert_eq!(XtfOrdinal_4(&DIAGINFO_EXTENSION_ID, &IID_XBTP_EXTENSION_METADATA_IMPL, &mut exported), S_OK);
+        let mut n2 = 0u32;
+        let count2: unsafe extern "system" fn(Obj, *mut u32) -> HRESULT = transmute(slot(exported, 3));
+        assert_eq!(count2(exported, &mut n2), S_OK);
+        assert_eq!(n2, 14);
+        release(exported);
         let dup = [(OP_SYSTEM_UP_TIME, system::system_up_time_handler as OperationFn), (OP_SYSTEM_UP_TIME, system::system_up_time_handler as OperationFn)];
         let mut out2: *mut c_void = null_mut();
         assert!(extension_entry_point(&DIAGINFO_EXTENSION_ID, &IID_XBTP_EXTENSION_METADATA_IMPL, &mut out2, &dup) < 0);
@@ -1228,5 +1237,766 @@ fn export_table_matches_console_dll() {
         if e.status != "missing" {
             assert!(xtfcommon::exports::source_defines(concat!(env!("CARGO_MANIFEST_DIR"), "/src"), &e));
         }
+    }
+}
+
+#[link(name = "ws2_32")]
+extern "system" {
+    fn WSAStartup(version: u16, data: *mut u8) -> i32;
+}
+
+fn wsa_init() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| unsafe {
+        let mut data = [0u8; 0x200];
+        assert_eq!(WSAStartup(0x0202, data.as_mut_ptr()), 0);
+    });
+}
+
+static SYSTEM_PIPE_SERVED: AtomicU32 = AtomicU32::new(0);
+static SYSTEM_PIPE_OPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static SYSTEM_PROCESSES: Mutex<String> = Mutex::new(String::new());
+static SYSTEM_OPEN_IDS: Mutex<Vec<(GUID, GUID)>> = Mutex::new(Vec::new());
+static CONNDIAG_LOCK: Mutex<()> = Mutex::new(());
+
+#[repr(C)]
+struct ClientSessionVtbl {
+    qi: QiFn,
+    add_ref: RefFn,
+    release: RefFn,
+    send_begin: unsafe extern "system" fn(Obj, u32, Obj, *mut u32) -> HRESULT,
+    unused4: unsafe extern "system" fn(Obj) -> HRESULT,
+    unused5: unsafe extern "system" fn(Obj) -> HRESULT,
+    unused6: unsafe extern "system" fn(Obj) -> HRESULT,
+    receive_end: unsafe extern "system" fn(Obj, u32, u32, *mut u32, *mut Obj) -> HRESULT,
+}
+
+#[repr(C)]
+struct ClientSession {
+    vtbl: *const ClientSessionVtbl,
+    refs: AtomicU32,
+}
+
+unsafe extern "system" fn cs_qi(this: Obj, _iid: *const GUID, out: *mut Obj) -> HRESULT {
+    *out = this;
+    cs_add_ref(this);
+    S_OK
+}
+
+unsafe extern "system" fn cs_add_ref(this: Obj) -> u32 {
+    (*(this as *mut ClientSession)).refs.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+unsafe extern "system" fn cs_release(this: Obj) -> u32 {
+    let n = (*(this as *mut ClientSession)).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if n == 0 {
+        drop(Box::from_raw(this as *mut ClientSession));
+    }
+    n
+}
+
+unsafe extern "system" fn cs_send_begin(_this: Obj, op: u32, _msg: Obj, exchange: *mut u32) -> HRESULT {
+    SYSTEM_PIPE_OPS.lock().unwrap_or_else(|e| e.into_inner()).push(op);
+    *exchange = 7;
+    S_OK
+}
+
+unsafe extern "system" fn cs_unused(_this: Obj) -> HRESULT {
+    E_NOTIMPL
+}
+
+unsafe extern "system" fn cs_receive_end(_this: Obj, _timeout: u32, exchange: u32, status: *mut u32, out: *mut Obj) -> HRESULT {
+    assert_eq!(exchange, 7);
+    *status = 0;
+    let body = SYSTEM_PROCESSES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    *out = new_message(Some(&body)).detach();
+    S_OK
+}
+
+static CLIENT_SESSION_VTBL: ClientSessionVtbl = ClientSessionVtbl { qi: cs_qi, add_ref: cs_add_ref, release: cs_release, send_begin: cs_send_begin, unused4: cs_unused, unused5: cs_unused, unused6: cs_unused, receive_end: cs_receive_end };
+
+unsafe extern "system" fn fake_get_pipe_name_to_system(out: *mut BSTR) -> HRESULT {
+    let n = wz("\\\\.\\pipe\\XTF_CONNDIAG_TEST_SYSTEM");
+    *out = SysAllocString(n.as_ptr());
+    S_OK
+}
+
+unsafe extern "system" fn fake_open_pipe_session(_pipe: *const u16, ext: *const GUID, iid: *const GUID, out: *mut Obj) -> HRESULT {
+    SYSTEM_OPEN_IDS.lock().unwrap_or_else(|e| e.into_inner()).push((*ext, *iid));
+    if SYSTEM_PIPE_SERVED.load(Ordering::Acquire) == 0 {
+        return hr_from_win32(2);
+    }
+    *out = Box::into_raw(Box::new(ClientSession { vtbl: &CLIENT_SESSION_VTBL, refs: AtomicU32::new(1) })) as Obj;
+    S_OK
+}
+
+fn xtfmsg_resolver(name: &[u8]) -> Option<usize> {
+    Some(match name {
+        b"XbtpCreateMessage\0" => xbtp::xbtp2_ext::XbtpCreateMessage as *const () as usize,
+        b"XbtpCreateJsonObject\0" => xbtp::xbtp2_json::XbtpCreateJsonObject as *const () as usize,
+        b"XbtpCreateJsonArray\0" => xbtp::xbtp2_json::XbtpCreateJsonArray as *const () as usize,
+        b"XbtpGetJsonObjectFromUtf8\0" => xbtp::xbtp2_json::XbtpGetJsonObjectFromUtf8 as *const () as usize,
+        b"?LogInfoV@@YAXPEBDPEAD@Z\0" => xbtp::base::LogInfoV as *const () as usize,
+        b"?LogWarningV@@YAXPEBDPEAD@Z\0" => xbtp::base::LogWarningV as *const () as usize,
+        b"?XbtpGetPipeNameToSystem@@YAJPEAPEAG@Z\0" => fake_get_pipe_name_to_system as *const () as usize,
+        b"?XbtpOpenPipeSession@@YAJPEBGAEBU_GUID@@1PEAPEAX@Z\0" => fake_open_pipe_session as *const () as usize,
+        _ => return None,
+    })
+}
+
+fn conndiag_setup(served: bool, processes: &str) -> std::sync::MutexGuard<'static, ()> {
+    let g = CONNDIAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    wsa_init();
+    assert!(xtfmsg::xbtp::bind_static_imports(xtfmsg_resolver));
+    SYSTEM_PIPE_SERVED.store(served as u32, Ordering::Release);
+    SYSTEM_PIPE_OPS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    SYSTEM_OPEN_IDS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *SYSTEM_PROCESSES.lock().unwrap_or_else(|e| e.into_inner()) = processes.to_string();
+    g
+}
+
+fn set_system_processes(processes: &str) {
+    *SYSTEM_PROCESSES.lock().unwrap_or_else(|e| e.into_inner()) = processes.to_string();
+}
+
+fn new_session() -> MockSession {
+    MockSession { vtbl: &MS_VTBL, sent: Mutex::new(Vec::new()), accept: u32::MAX, child: Mutex::new(None) }
+}
+
+fn sent_of(s: &MockSession) -> Vec<Ptr> {
+    s.sent.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|t| unsafe { parse(t) }).collect()
+}
+
+unsafe fn run_handler(session: &MockSession, json: Option<&str>) -> HRESULT {
+    let req = new_message(json);
+    let rep = new_reply();
+    let hr = conndiag::connection_diagnostic_handler(session as *const MockSession as usize, req.0 as usize, rep.0 as usize);
+    assert_eq!(reply_text(&rep), "");
+    hr
+}
+
+unsafe fn test_name(m: &Ptr) -> (f64, f64, String) {
+    (num(m, "diagMessageType").unwrap(), num(m, "diagTestType").unwrap(), text(m, "diagTestMessage").unwrap())
+}
+
+unsafe fn test_result(m: &Ptr) -> (f64, f64, HRESULT) {
+    assert!(text(m, "diagTestMessage").is_none());
+    (num(m, "diagMessageType").unwrap(), num(m, "diagTestType").unwrap(), num(m, "diagTestResult").unwrap() as i32)
+}
+
+unsafe fn bag_of(m: &Ptr) -> Option<Vec<(String, String)>> {
+    let b = child(m, "propertyBag")?;
+    let names = array_strings(&b, "propertyBagNames");
+    let values = array_strings(&b, "propertyBagValues");
+    assert_eq!(names.len(), values.len());
+    Some(names.into_iter().zip(values).collect())
+}
+
+fn kv(p: &[(&str, &str)]) -> Vec<(String, String)> {
+    p.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+}
+
+fn wv(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+const HR_HOST_UNREACH_ICMP: HRESULT = 0x8007_2AFBu32 as i32;
+const HR_WSAEHOSTUNREACH: HRESULT = 0x8007_2751u32 as i32;
+const HR_WSAHOST_NOT_FOUND: HRESULT = 0x8007_2AF9u32 as i32;
+const HR_WSAECONNREFUSED: HRESULT = 0x8007_274Du32 as i32;
+const SYSTEM_LIST_WITH_HOST: &str = r#"{"Processes":[{"ProcessName":"\\Device\\HarddiskVolume1\\Windows\\System32\\svchost.exe"},{"ProcessName":"\\Device\\HarddiskVolume1\\Windows\\System32\\XtfHost.exe"}]}"#;
+
+#[test]
+fn conndiag_offline_policy_classes() {
+    use crate::offline::*;
+    assert_eq!(classify_host("127.0.0.1"), HostClass::Local);
+    assert_eq!(classify_host("::1"), HostClass::Local);
+    assert_eq!(classify_host("localhost"), HostClass::Local);
+    assert_eq!(classify_host("10.1.2.3"), HostClass::RemoteLiteral);
+    assert_eq!(classify_host("fe80::1%4"), HostClass::RemoteLiteral);
+    assert_eq!(classify_host("devpc.example"), HostClass::RemoteName);
+    assert_eq!(classify_host(""), HostClass::Default);
+}
+
+#[test]
+fn conndiag_resolve_trims_and_prefers_ipv4() {
+    let _g = conndiag_setup(false, "");
+    unsafe {
+        let mut a = conndiag::SocketAddress::default();
+        assert_eq!(conndiag::resolve(&wv("  127.0.0.1\t"), &mut a), S_OK);
+        assert_eq!(a.length, 0x10);
+        assert_eq!(a.family(), conndiag::AF_INET);
+        assert_eq!(&a.addr[4..8], &[127, 0, 0, 1]);
+        let mut b = conndiag::SocketAddress::default();
+        assert_eq!(conndiag::resolve(&wv("::1"), &mut b), S_OK);
+        assert_eq!(b.length, 0x1c);
+        assert_eq!(b.family(), conndiag::AF_INET6);
+        assert_eq!(b.addr[8 + 15], 1);
+        let mut c = conndiag::SocketAddress::default();
+        assert_eq!(conndiag::resolve(&wv("devpc.example"), &mut c), HR_WSAHOST_NOT_FOUND);
+        assert_eq!(c.length, 0);
+    }
+}
+
+#[test]
+fn conndiag_ping_loopback_is_real_and_remote_is_unreachable() {
+    let _g = conndiag_setup(false, "");
+    unsafe {
+        assert_eq!(conndiag::ping_address(&wv("127.0.0.1")), S_OK);
+        assert_eq!(conndiag::ping_address(&wv("::1")), S_OK);
+        assert_eq!(conndiag::ping_address(&wv("192.168.77.5")), HR_HOST_UNREACH_ICMP);
+        assert_eq!(conndiag::ping_address(&wv("2001:db8::5")), HR_HOST_UNREACH_ICMP);
+        assert_eq!(conndiag::ping_address(&wv("devpc.example")), HR_WSAHOST_NOT_FOUND);
+    }
+}
+
+#[test]
+fn conndiag_connect_test_reaches_loopback_listener_only() {
+    let _g = conndiag_setup(false, "");
+    unsafe {
+        assert_eq!(conndiag::connect_test(&wv("192.168.77.5")), HR_WSAEHOSTUNREACH);
+        assert_eq!(conndiag::connect_test(&wv("2001:db8::5")), HR_WSAEHOSTUNREACH);
+        assert_eq!(conndiag::connect_test(&wv("devpc.example")), HR_WSAHOST_NOT_FOUND);
+        if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", conndiag::XBTP_PC_PORT)) {
+            assert_eq!(conndiag::connect_test(&wv("127.0.0.1")), S_OK);
+            drop(l);
+        }
+        let hr = conndiag::connect_test(&wv("127.0.0.1"));
+        assert!(hr == S_OK || hr == HR_WSAECONNREFUSED, "{:x}", hr);
+    }
+}
+
+#[test]
+fn conndiag_handler_requires_body_and_address_array() {
+    let _g = conndiag_setup(true, SYSTEM_LIST_WITH_HOST);
+    unsafe {
+        let s = new_session();
+        assert_eq!(run_handler(&s, None), conndiag::E_UNEXPECTED);
+        assert!(run_handler(&s, Some(r#"{"other":1}"#)) < 0);
+        assert!(run_handler(&s, Some(r#"{"diagAddressArray":"x"}"#)) < 0);
+        assert!(s.sent.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn conndiag_handler_runs_every_console_test_against_the_offline_network() {
+    let _g = conndiag_setup(true, SYSTEM_LIST_WITH_HOST);
+    unsafe {
+        let s = new_session();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", conndiag::XBTP_PC_PORT)).ok();
+        let hr = run_handler(&s, Some(r#"{"diagAddressArray":["127.0.0.1","192.168.77.5","devpc.example"]}"#));
+        let listened = listener.is_some();
+        drop(listener);
+        assert_eq!(hr, S_OK);
+        let m = sent_of(&s);
+        assert_eq!(m.len(), 3 * 6 + 6);
+        let addrs = ["127.0.0.1", "192.168.77.5", "devpc.example"];
+        for (k, a) in addrs.iter().enumerate() {
+            let b = k * 6;
+            assert_eq!(test_name(&m[b]), (1.0, 11.0, format!("Ping address [{}]", a)));
+            assert!(bag_of(&m[b]).is_none());
+            let (t, ty, ping) = test_result(&m[b + 1]);
+            assert_eq!((t, ty), (2.0, 11.0));
+            assert!(bag_of(&m[b + 1]).is_none());
+            assert_eq!(test_name(&m[b + 2]), (1.0, 13.0, format!("XBTP Link [{}]", a)));
+            let (t, ty, link) = test_result(&m[b + 3]);
+            assert_eq!((t, ty), (2.0, 13.0));
+            let lb = bag_of(&m[b + 3]).unwrap();
+            assert_eq!(lb.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), vec!["TCPConnections", "XTDConnections"]);
+            assert_eq!(test_name(&m[b + 4]), (1.0, 2.0, format!("Connect to XBTP on PC [{}, Port 4201]", a)));
+            let (t, ty, tcp) = test_result(&m[b + 5]);
+            assert_eq!((t, ty), (2.0, 2.0));
+            assert_eq!(bag_of(&m[b + 5]).unwrap(), kv(&[("Port", "4201"), ("Service", "XBTP")]));
+            assert_eq!(lb, kv(&[("TCPConnections", "0"), ("XTDConnections", "0")]));
+            match k {
+                0 => {
+                    assert_eq!(link, S_OK);
+                    assert_eq!(ping, S_OK);
+                    if listened {
+                        assert_eq!(tcp, S_OK);
+                    } else {
+                        assert!(tcp == S_OK || tcp == HR_WSAECONNREFUSED, "{:x}", tcp);
+                    }
+                }
+                1 => {
+                    assert_eq!(ping, HR_HOST_UNREACH_ICMP);
+                    assert_eq!(tcp, HR_WSAEHOSTUNREACH);
+                    assert_eq!(link, S_OK);
+                }
+                _ => {
+                    assert_eq!(ping, HR_WSAHOST_NOT_FOUND);
+                    assert_eq!(tcp, HR_WSAHOST_NOT_FOUND);
+                    assert_eq!(link, HR_WSAHOST_NOT_FOUND);
+                }
+            }
+        }
+        let b = 18;
+        assert_eq!(test_name(&m[b]), (1.0, 8.0, "Process running [xtfhost.exe]".to_string()));
+        let (_, ty, proc_hr) = test_result(&m[b + 1]);
+        assert_eq!(ty, 8.0);
+        assert_eq!(proc_hr, conndiag::HR_FILE_NOT_FOUND);
+        assert_eq!(bag_of(&m[b + 1]).unwrap(), kv(&[("ProcessName", "xtfhost.exe")]));
+        assert_eq!(test_name(&m[b + 2]), (1.0, 15.0, "Get process list for [SYSTEM]".to_string()));
+        assert_eq!(test_result(&m[b + 3]), (2.0, 15.0, S_OK));
+        assert_eq!(bag_of(&m[b + 3]).unwrap(), kv(&[("TargetVM", "SYSTEM")]));
+        assert_eq!(test_name(&m[b + 4]), (1.0, 16.0, "Process running [xtfhost.exe] on [SYSTEM]".to_string()));
+        assert_eq!(test_result(&m[b + 5]), (2.0, 16.0, S_OK));
+        assert_eq!(bag_of(&m[b + 5]).unwrap(), kv(&[("ProcessName", "xtfhost.exe"), ("TargetVM", "SYSTEM")]));
+        assert_eq!(*SYSTEM_PIPE_OPS.lock().unwrap(), vec![conndiag::CONSOLE_GET_RUNNING_PROCESSES_OPERATION_ID]);
+        let ids = SYSTEM_OPEN_IDS.lock().unwrap().clone();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].0, GUID::new(0x5b45d0e0, 0x858b, 0x49fd, [0xa3, 0x32, 0x7b, 0xdf, 0x8d, 0x25, 0x82, 0x44]));
+        assert_eq!(ids[0].1, GUID::new(0xcf84f553, 0xcd9b, 0x4608, [0x96, 0x40, 0x28, 0x71, 0x4e, 0x5e, 0xd4, 0x40]));
+    }
+}
+
+#[test]
+fn conndiag_unreachable_system_vm_fails_the_operation_after_its_result() {
+    let _g = conndiag_setup(false, "");
+    unsafe {
+        let s = new_session();
+        let hr = run_handler(&s, Some(r#"{"diagAddressArray":[]}"#));
+        assert_eq!(hr, hr_from_win32(2));
+        let m = sent_of(&s);
+        assert_eq!(m.len(), 4);
+        assert_eq!(test_result(&m[1]).1, 8.0);
+        assert_eq!(test_result(&m[3]), (2.0, 15.0, hr_from_win32(2)));
+        assert!(SYSTEM_PIPE_OPS.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn conndiag_cross_vm_list_matches_leaf_name_case_insensitively() {
+    let _g = conndiag_setup(true, r#"{"Processes":[{"ProcessName":""},{"Pid":4},{"ProcessName":"C:\\x\\notxtfhost.exe"}]}"#);
+    unsafe {
+        let s = new_session();
+        assert_eq!(run_handler(&s, Some(r#"{"diagAddressArray":[]}"#)), S_OK);
+        let m = sent_of(&s);
+        assert_eq!(m.len(), 6);
+        assert_eq!(test_result(&m[5]), (2.0, 16.0, conndiag::HR_FILE_NOT_FOUND));
+        set_system_processes(r#"{"Processes":[{"ProcessName":"XTFHOST.EXE"}]}"#);
+        let s2 = new_session();
+        assert_eq!(run_handler(&s2, Some(r#"{"diagAddressArray":[]}"#)), S_OK);
+        assert_eq!(test_result(&sent_of(&s2)[5]), (2.0, 16.0, S_OK));
+    }
+}
+
+#[test]
+fn conndiag_process_running_test_counts_host_xtfhost_images() {
+    let _g = conndiag_setup(true, SYSTEM_LIST_WITH_HOST);
+    unsafe {
+        let dir = std::env::temp_dir().join(format!("xtfdiaginfo-conndiag-{}", GetCurrentProcessId()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("xtfhost.exe");
+        std::fs::copy(r"C:\Windows\System32\cmd.exe", &exe).unwrap();
+        let spawn = || Command::new(&exe).args(["/c", "pause"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let mut first = spawn();
+        let mut n = 0u32;
+        assert_eq!(conndiag::get_process_count(conndiag::XTFHOST_IMAGE, &mut n), S_OK);
+        assert_eq!(n, 1);
+        let s = new_session();
+        assert_eq!(conndiag::is_process_running_test(&s as *const MockSession as Obj), S_OK);
+        let mut second = spawn();
+        assert_eq!(conndiag::get_process_count(conndiag::XTFHOST_IMAGE, &mut n), S_OK);
+        assert_eq!(n, 2);
+        assert_eq!(conndiag::is_process_running_test(&s as *const MockSession as Obj), conndiag::HR_FILE_NOT_FOUND);
+        let _ = second.kill();
+        let _ = second.wait();
+        let _ = first.kill();
+        let _ = first.wait();
+        assert_eq!(conndiag::get_process_count(conndiag::XTFHOST_IMAGE, &mut n), conndiag::HR_FILE_NOT_FOUND);
+        assert_eq!(n, 0);
+        let m = sent_of(&s);
+        assert_eq!(test_result(&m[1]), (2.0, 8.0, S_OK));
+        assert_eq!(test_result(&m[3]), (2.0, 8.0, conndiag::HR_FILE_NOT_FOUND));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn conndiag_real_system_pipe_is_not_served_on_pc() {
+    unsafe {
+        let mut pipe: BSTR = null_mut();
+        assert_eq!(xbtp::xbtp2_sys::XbtpGetPipeNameToSystem(&mut pipe), S_OK);
+        assert_eq!(String::from_utf16(wslice(pipe)).unwrap(), r"\\.\SEVPIPE\XTF_TITLE_TO_SYSTEM");
+        let mut out: *mut c_void = null_mut();
+        let ext = GUID::new(0x5b45d0e0, 0x858b, 0x49fd, [0xa3, 0x32, 0x7b, 0xdf, 0x8d, 0x25, 0x82, 0x44]);
+        let iid = GUID::new(0xcf84f553, 0xcd9b, 0x4608, [0x96, 0x40, 0x28, 0x71, 0x4e, 0x5e, 0xd4, 0x40]);
+        let hr = xbtp::api::XbtpOpenPipeSession(pipe, &ext as *const GUID as *const _, &iid as *const GUID as *const _, &mut out);
+        assert_eq!(hr, 0x8C11_0303u32 as i32);
+        assert!(out.is_null());
+        SysFreeString(pipe);
+    }
+}
+
+use crate::trace;
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn OpenProcessToken(process: HANDLE, access: u32, token: *mut HANDLE) -> BOOL;
+    fn GetTokenInformation(token: HANDLE, class: u32, info: *mut c_void, len: u32, ret: *mut u32) -> BOOL;
+}
+
+fn is_elevated() -> bool {
+    unsafe {
+        let mut t: HANDLE = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), 8, &mut t) == 0 {
+            return false;
+        }
+        let mut e = 0u32;
+        let mut n = 0u32;
+        let ok = GetTokenInformation(t, 20, &mut e as *mut u32 as *mut c_void, 4, &mut n);
+        CloseHandle(t);
+        ok != 0 && e != 0
+    }
+}
+
+static TRACE_LOCK: Mutex<()> = Mutex::new(());
+static XCRD_OPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static XCRD_DIR: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+static XCRD_FAIL: Mutex<Vec<(&'static str, HRESULT)>> = Mutex::new(Vec::new());
+
+fn xrec(s: String) {
+    XCRD_OPS.lock().unwrap_or_else(|e| e.into_inner()).push(s);
+}
+
+fn xfail(op: &str) -> Option<HRESULT> {
+    XCRD_FAIL.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(o, _)| *o == op).map(|(_, h)| *h)
+}
+
+fn xops() -> Vec<String> {
+    XCRD_OPS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn xclear() {
+    XCRD_OPS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    XCRD_FAIL.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+fn xset_fail(op: &'static str, hr: HRESULT) {
+    XCRD_FAIL.lock().unwrap_or_else(|e| e.into_inner()).push((op, hr));
+}
+
+unsafe extern "system" fn fx_open(out: *mut *mut c_void) -> HRESULT {
+    xrec("open".into());
+    if let Some(h) = xfail("open") {
+        return h;
+    }
+    *out = 0x1000 as *mut c_void;
+    S_OK
+}
+
+unsafe extern "system" fn fx_close(a: *mut c_void) -> HRESULT {
+    xrec(format!("close {:#x}", a as usize));
+    S_OK
+}
+
+unsafe extern "system" fn fx_build(out: *mut *mut u16, index: i32, name: *const u16, flags: u32) -> HRESULT {
+    xrec(format!("build {} {} {}", index, String::from_utf16_lossy(wslice(name)), flags));
+    *out = SysAllocString(wz("T:\\XtfTitleTraceStorage.xvd").as_ptr());
+    S_OK
+}
+
+unsafe extern "system" fn fx_delete(_a: *mut c_void, _p: *const u16, flags: u32) -> HRESULT {
+    xrec(format!("delete {}", flags));
+    xfail("delete").unwrap_or(trace::HR_FILE_NOT_FOUND)
+}
+
+unsafe extern "system" fn fx_create(_a: *mut c_void, _p: *const u16, id: *const u8, flags: u32, size: u64, t: u32, c: u32, out_id: *mut u8, id2: *const u8, sb: *const u8, sbl: u32, p2: *const u16) -> HRESULT {
+    assert!(id.is_null() && out_id.is_null() && id2.is_null() && sb.is_null() && sbl == 0 && p2.is_null());
+    xrec(format!("create {} {:#x} {} {}", flags, size, t, c));
+    xfail("create").unwrap_or(S_OK)
+}
+
+unsafe extern "system" fn fx_mount(out: *mut *mut c_void, _a: *mut c_void, _p: *const u16, flags: u32) -> HRESULT {
+    xrec(format!("mount {:#x}", flags));
+    if let Some(h) = xfail("mount") {
+        return h;
+    }
+    *out = 0x2000 as *mut c_void;
+    S_OK
+}
+
+unsafe extern "system" fn fx_unmount(_a: *mut c_void, h: *mut c_void) -> HRESULT {
+    xrec(format!("unmount {:#x}", h as usize));
+    S_OK
+}
+
+unsafe extern "system" fn fx_query(out: *mut *mut u16, _h: *const c_void) -> HRESULT {
+    xrec("query".into());
+    if let Some(h) = xfail("query") {
+        return h;
+    }
+    let mut d = XCRD_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    d.push(0);
+    *out = SysAllocString(d.as_ptr());
+    S_OK
+}
+
+unsafe extern "system" fn fx_free(p: *mut c_void) -> HRESULT {
+    xrec("free".into());
+    SysFreeString(p as BSTR);
+    S_OK
+}
+
+fn fake_xcrd() -> trace::XCrd {
+    trace::XCrd { open_adapter: fx_open, close_adapter: fx_close, build_path: fx_build, delete_xvd: fx_delete, create_xvd: fx_create, mount: fx_mount, unmount: fx_unmount, query_device_path: fx_query, free_device_path_buffer: fx_free, resolve_path: None }
+}
+
+struct TraceSessions;
+
+impl Drop for TraceSessions {
+    fn drop(&mut self) {
+        unsafe {
+            trace::stop_etw_trace(&[], &trace::TRACE_SESSION_GUID, trace::TRACE_SESSION_NAME, None);
+            trace::stop_etw_trace(&[], &trace::STATE_SESSION_GUID, trace::STATE_SESSION_NAME, None);
+        }
+        let mut x = trace::XVD.lock().unwrap_or_else(|e| e.into_inner());
+        x.handle = usize::MAX;
+        x.directory = None;
+        trace::SERVER.lock().unwrap_or_else(|e| e.into_inner()).trace_type = 0;
+    }
+}
+
+fn trace_setup(tag: &str) -> (std::sync::MutexGuard<'static, ()>, std::path::PathBuf, TraceSessions) {
+    let g = TRACE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("xtfdiag_trace_{}_{}", tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    *XCRD_DIR.lock().unwrap_or_else(|e| e.into_inner()) = dir.to_string_lossy().encode_utf16().collect();
+    xclear();
+    trace::bind_xcrd(Some(fake_xcrd()));
+    {
+        let mut x = trace::XVD.lock().unwrap_or_else(|e| e.into_inner());
+        x.handle = usize::MAX;
+        x.directory = None;
+        let mut s = trace::SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        s.trace_type = 0;
+        s.start_tick = 0;
+    }
+    (g, dir, TraceSessions)
+}
+
+fn strs(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+fn mount_ops() -> Vec<String> {
+    strs(&["open", "build 0 XtfTitleTraceStorage.xvd 0", "delete 0", "create 0 0x44000 0 0", "mount 0x0", "query", "free", "free", "close 0x1000"])
+}
+
+fn unmount_ops() -> Vec<String> {
+    strs(&["open", "unmount 0x2000", "close 0x1000"])
+}
+
+fn state_files(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir.join("GameCoreTrace")).map(|r| r.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("xbtitlestate_") && n.ends_with(".etl")).collect()).unwrap_or_default()
+}
+
+#[test]
+fn trace_route_guards_and_unknown_operations() {
+    let (_g, _dir, _s) = trace_setup("route");
+    unsafe {
+        let mut r: Obj = null_mut();
+        assert_eq!(trace::TRACE_SERVER.route(3, null_mut(), null_mut()), E_POINTER);
+        assert_eq!(trace::TRACE_SERVER.route(99, null_mut(), &mut r), S_OK);
+        assert!(r.is_null());
+        let mut b = Bstr::null();
+        process_operation_request(&trace::TRACE_SERVER, wz("{\"version\":1,\"opid\":7}").as_ptr(), b.out());
+        assert_eq!(num(&parse(&bstr_text(&b)), "opresult"), Some(0.0));
+        process_operation_request(&trace::TRACE_SERVER, wz("{\"version\":1,\"opid\":4}").as_ptr(), b.out());
+        assert_eq!(num(&parse(&bstr_text(&b)), "opresult"), Some(trace::E_ILLEGAL_STATE_CHANGE as f64));
+        assert!(xops().is_empty());
+    }
+}
+
+#[test]
+fn trace_start_validates_trace_type_before_touching_the_xvd() {
+    let (_g, _dir, _s) = trace_setup("types");
+    unsafe {
+        assert_eq!(trace::trace_start(null_mut()), E_INVALIDARG);
+        assert_eq!(trace::trace_start(parse("{\"TraceType\":0}").0), E_INVALIDARG);
+        assert_eq!(trace::trace_start(parse("{\"TraceType\":4}").0), E_INVALIDARG);
+        assert!(trace::trace_start(parse("{}").0) < 0);
+        assert!(xops().is_empty());
+        trace::SERVER.lock().unwrap().trace_type = 2;
+        assert_eq!(trace::trace_start(parse("{\"TraceType\":2}").0), trace::E_ILLEGAL_STATE_CHANGE);
+        assert!(xops().is_empty());
+    }
+}
+
+#[test]
+fn xbox_live_trace_type_creates_the_xvd_then_unmounts_it() {
+    let (_g, dir, _s) = trace_setup("xbl");
+    unsafe {
+        let mut r: Obj = null_mut();
+        assert_eq!(trace::TRACE_SERVER.route(3, parse("{\"TraceType\":3}").0, &mut r), trace::E_ILLEGAL_METHOD_CALL);
+        let mut want = mount_ops();
+        want.extend(unmount_ops());
+        assert_eq!(xops(), want);
+        assert_eq!(trace::xvd_handle(), usize::MAX);
+        assert!(trace::trace_directory().is_none());
+        assert_eq!(trace::trace_type(), 0);
+        assert_eq!(trace::trace_stop(&mut r), trace::E_ILLEGAL_STATE_CHANGE);
+        assert!(r.is_null());
+        assert_eq!(trace::trace_stop(null_mut()), E_POINTER);
+        assert!(!dir.join("GameCoreTrace").exists());
+    }
+}
+
+#[test]
+fn create_and_mount_failures_release_what_they_took() {
+    let (_g, dir, _s) = trace_setup("mountfail");
+    unsafe {
+        xset_fail("mount", 0x8007_0005u32 as i32);
+        assert_eq!(trace::create_and_mount_trace_xvd(), 0x8007_0005u32 as i32);
+        assert_eq!(xops(), strs(&["open", "build 0 XtfTitleTraceStorage.xvd 0", "delete 0", "create 0 0x44000 0 0", "mount 0x0", "free", "close 0x1000"]));
+        assert_eq!(trace::xvd_handle(), usize::MAX);
+        xclear();
+        xset_fail("query", E_OUTOFMEMORY);
+        assert_eq!(trace::create_and_mount_trace_xvd(), E_OUTOFMEMORY);
+        assert_eq!(xops(), strs(&["open", "build 0 XtfTitleTraceStorage.xvd 0", "delete 0", "create 0 0x44000 0 0", "mount 0x0", "query", "unmount 0x2000", "free", "close 0x1000"]));
+        xclear();
+        xset_fail("delete", trace::HR_SHARING_VIOLATION);
+        assert_eq!(trace::create_and_mount_trace_xvd(), trace::HR_SHARING_VIOLATION);
+        assert_eq!(xops(), strs(&["open", "build 0 XtfTitleTraceStorage.xvd 0", "delete 0", "free", "close 0x1000"]));
+        xclear();
+        assert_eq!(trace::create_and_mount_trace_xvd(), S_OK);
+        assert_eq!(trace::xvd_handle(), 0x2000);
+        assert_eq!(trace::trace_directory().unwrap(), dir.to_string_lossy().encode_utf16().collect::<Vec<u16>>());
+        xclear();
+        assert_eq!(trace::create_and_mount_trace_xvd(), trace::HR_SHARING_VIOLATION);
+        assert_eq!(trace::mount_trace_xvd(), trace::HR_SHARING_VIOLATION);
+        assert!(xops().is_empty());
+        trace::unmount_trace_xvd();
+        assert_eq!(xops(), unmount_ops());
+        assert_eq!(trace::xvd_handle(), usize::MAX);
+        assert!(trace::trace_directory().is_none());
+        xclear();
+        trace::unmount_trace_xvd();
+        assert!(xops().is_empty());
+    }
+}
+
+#[test]
+fn advanced_multiplayer_trace_runs_real_etw_or_returns_the_access_error() {
+    let (_g, dir, _s) = trace_setup("amp");
+    unsafe {
+        let mut none: Obj = null_mut();
+        let hr = trace::TRACE_SERVER.route(3, parse("{\"TraceType\":2}").0, &mut none);
+        assert!(dir.join("GameCoreTrace").is_dir());
+        if is_elevated() {
+            assert_eq!(hr, S_OK);
+            assert_eq!(trace::trace_type(), 2);
+            assert_eq!(xops(), mount_ops());
+            assert!(dir.join("GameCoreTrace").join("xbtitletrace.etl").is_file());
+            assert_eq!(state_files(&dir).len(), 1);
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            let mut r = Ptr::null();
+            assert_eq!(trace::TRACE_SERVER.route(4, null_mut(), r.out()), S_OK);
+            assert!(!r.is_null());
+            assert_eq!(num(&r, "TraceType"), Some(2.0));
+            assert!(num(&r, "TraceEventsLost").unwrap() >= 0.0);
+            assert!(num(&r, "TraceDurationMs").unwrap() >= 1000.0);
+            assert_eq!(trace::trace_type(), 0);
+            assert_eq!(trace::xvd_handle(), usize::MAX);
+            assert!(xops().ends_with(&unmount_ops()));
+        } else {
+            assert_eq!(hr, 0x8007_0005u32 as i32);
+            let mut want = mount_ops();
+            want.extend(unmount_ops());
+            assert_eq!(xops(), want);
+            assert_eq!(trace::trace_type(), 0);
+            assert_eq!(trace::xvd_handle(), usize::MAX);
+            assert!(state_files(&dir).is_empty());
+            let mut r: Obj = null_mut();
+            assert_eq!(trace::trace_stop(&mut r), trace::E_ILLEGAL_STATE_CHANGE);
+        }
+    }
+}
+
+#[test]
+fn log_network_state_succeeds_with_or_without_session_rights() {
+    let (_g, dir, _s) = trace_setup("state");
+    unsafe {
+        assert_eq!(trace::create_and_mount_trace_xvd(), S_OK);
+        let mut none: Obj = null_mut();
+        assert_eq!(trace::TRACE_SERVER.route(12, null_mut(), &mut none), S_OK);
+        assert!(dir.join("GameCoreTrace").is_dir());
+        assert_eq!(state_files(&dir).len(), if is_elevated() { 1 } else { 0 });
+        {
+            let mut x = trace::XVD.lock().unwrap();
+            x.handle = usize::MAX;
+            x.directory = None;
+        }
+        assert_eq!(trace::log_network_state(), S_OK);
+    }
+}
+
+#[test]
+fn pending_trace_xvd_restarts_the_recorded_trace_type() {
+    let (_g, dir, _s) = trace_setup("pending");
+    unsafe {
+        let pending = dir.join("PendingGameCoreTrace");
+        std::fs::write(&pending, 3u32.to_le_bytes()).unwrap();
+        assert_eq!(trace::TRACE_SERVER.check_pending(), trace::E_ILLEGAL_METHOD_CALL);
+        assert!(!pending.exists());
+        let mut want = strs(&["open", "build 0 XtfTitleTraceStorage.xvd 0", "mount 0x40", "query", "free", "free", "close 0x1000"]);
+        want.extend(unmount_ops());
+        assert_eq!(xops(), want);
+        assert_eq!(trace::xvd_handle(), usize::MAX);
+        xclear();
+        assert_eq!(trace::TRACE_SERVER.check_pending(), trace::HR_FILE_NOT_FOUND);
+        assert!(xops().ends_with(&unmount_ops()));
+        xclear();
+        std::fs::write(&pending, [1u8, 0]).unwrap();
+        assert_eq!(trace::TRACE_SERVER.check_pending(), trace::E_UNEXPECTED);
+        assert!(!pending.exists());
+        assert!(xops().ends_with(&unmount_ops()));
+        xclear();
+        xset_fail("mount", HR_PATH_NOT_FOUND);
+        assert_eq!(trace::TRACE_SERVER.check_pending(), HR_PATH_NOT_FOUND);
+        assert_eq!(xops(), strs(&["open", "build 0 XtfTitleTraceStorage.xvd 0", "mount 0x40", "free", "close 0x1000"]));
+        assert_eq!(trace::trace_type(), 0);
+    }
+}
+
+#[test]
+fn etw_properties_match_the_console_layout() {
+    unsafe {
+        let file = wz("C:\\t\\x.etl");
+        let p = trace::build_properties(&file[..file.len() - 1], 0x200, 16, 0x400, &trace::TRACE_SESSION_GUID);
+        let b = &p.bytes;
+        let u = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        assert_eq!(b.len(), 0x4b8);
+        assert_eq!(u(0), 0x4b8);
+        assert_eq!(&b[0x18..0x1c], &0xcff86b4cu32.to_le_bytes());
+        assert_eq!((u(0x28), u(0x2c), u(0x30), u(0x34), u(0x38), u(0x3c), u(0x40)), (2, 0x20000, 0x200, 16, 36, 0x400, 2));
+        assert_eq!(u(0x48), 0x80ff_0480);
+        assert_eq!((u(0x480), u(0x484), u(0x488)), (0x2000d, 0x10009, 0x50007));
+        assert_eq!(u16::from_le_bytes([b[0x4a8], b[0x4a9]]), 3);
+        assert_eq!((u(0x70), u(0x74)), (0x78, 0x280));
+        let name: Vec<u16> = b[0x78..0x78 + 20].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        assert_eq!(String::from_utf16_lossy(&name), "C:\\t\\x.etl");
+        let q = trace::build_properties(&[], 0x400, 4, 0, &trace::STATE_SESSION_GUID);
+        assert_eq!(u32::from_le_bytes(q.bytes[0x40..0x44].try_into().unwrap()), 0);
+        assert_eq!(trace::TRACE_PROVIDERS.len(), 64);
+        assert_eq!(trace::TRACE_PROVIDERS[0].guid, trace::WPP_CONTROL_GUID);
+        assert_eq!(trace::TRACE_PROVIDERS[8].any, 0x00ff_ffff_ffff_ffbe);
+        let t = trace::SystemTime { year: 2026, month: 3, day_of_week: 0, day: 4, hour: 5, minute: 6, second: 7, milliseconds: 0 };
+        assert_eq!(trace::state_file_name(&t), "xbtitlestate_20260304_050607.etl");
+    }
+}
+
+#[test]
+fn wpp_control_guid_registers_and_stays_quiet_until_enabled() {
+    let (_g, _dir, _s) = trace_setup("wpp");
+    unsafe {
+        assert_eq!(trace::wpp_init(), 0);
+        assert_ne!(trace::WPP.registration.load(Ordering::Acquire), 0);
+        assert_eq!(trace::wpp_init(), 0);
+        assert!(!trace::wpp_message(&trace::STATE_HEADER_GUID, 0xe, 0));
+        trace::wpp_cleanup();
+        assert_eq!(trace::WPP.registration.load(Ordering::Acquire), 0);
     }
 }

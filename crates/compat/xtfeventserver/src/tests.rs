@@ -607,10 +607,10 @@ fn protocol1_event_queues_descriptor_fields_tl_schema_and_record() {
         (*src).dispatcher = d.0;
         (*src).running.store(1, Ordering::Release);
         let user = [9u8, 8, 7];
-        let tl = b"\x10\x00\x00MyEvent\x00".to_vec();
+        let tl = vec![b"\x10\x00\x00MyEvent\x00".to_vec()];
         let mut ext = vec![[0u8; 16]];
         ext[0][2..4].copy_from_slice(&etw::EXT_TYPE_EVENT_SCHEMA_TL.to_le_bytes());
-        let rec = synthetic_record(&user, &mut ext, &[tl]);
+        let rec = synthetic_record(&user, &mut ext, &tl);
         let mut full = rec.clone();
         full[0x68..0x70].copy_from_slice(&(src as u64).to_le_bytes());
         etw::event_record_callback(full.as_mut_ptr());
@@ -633,7 +633,10 @@ fn protocol1_event_queues_descriptor_fields_tl_schema_and_record() {
         assert_eq!(num(&j, "EventDescriptorLevel"), Some(4.0));
         assert_eq!(num(&j, "DescriptorOpcode"), Some(1.0));
         assert_eq!(num(&j, "DescriptorTask"), Some(0x99 as f64));
-        assert_eq!(text(&j, "Schema_TL").as_deref(), Some("MyEvent"));
+        let mut w = Bstr::null();
+        assert_eq!(obj_stringify(j.0, w.out()), S_OK);
+        let all = String::from_utf16_lossy(core::slice::from_raw_parts(w.0, SysStringLen(w.0) as usize));
+        assert_eq!(text(&j, "Schema_TL").as_deref(), Some("MyEvent"), "{}", all);
         drop(q);
         drop(j);
         drop(Box::from_raw(src as *mut EtwSource));
@@ -675,7 +678,10 @@ fn dispatcher_rejects_bad_events_and_sends_queued_binary_events() {
         assert_eq!((v.queue_json_with_binary_event)(disp, wz("").as_ptr(), null_mut(), 0, core::ptr::null()), E_INVALIDARG);
         assert_eq!((v.queue_json_with_binary_event)(disp, wz("A").as_ptr(), null_mut(), 3, core::ptr::null()), E_INVALIDARG);
         assert_eq!((v.queue_binary_event)(disp, wz("First").as_ptr(), 2, [7u8, 8].as_ptr()), S_OK);
-        assert_eq!((v.queue_json_event)(disp, wz("Second").as_ptr(), null_mut()), S_OK);
+        let mut j = Ptr::null();
+        assert_eq!(xbtp::xbtp2_json::XbtpCreateJsonObject(j.out()), S_OK);
+        assert_eq!(obj_set_number(j.0, wz("k").as_ptr(), 5.0), S_OK);
+        assert_eq!((v.queue_json_event)(disp, wz("Second").as_ptr(), j.0), S_OK);
         assert_eq!(dispatcher::handle_events(disp), E_FAIL);
         let sent = s.sent.lock().unwrap();
         assert_eq!(sent.len(), 2);

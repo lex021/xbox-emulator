@@ -1,4 +1,4 @@
-﻿param(
+param(
   [switch]$DryRun,
   [switch]$SkipBuild,
   [ValidateSet('release', 'dev-fast')][string]$Profile = 'release',
@@ -433,12 +433,14 @@ public static class TbFrame2 {
     return s;
   }
   public static string CaptureDir;
+  public static int OutW, OutH;
   static int seq;
   public static Shot Grab(uint[] pids, string path) { return string.IsNullOrEmpty(CaptureDir) ? Capture(pids, path) : Backbuffer(pids, path, 3000); }
   public static Shot Backbuffer(uint[] pids, string path, int timeoutMs) {
     int w, h;
     IntPtr hw = Find(pids, out w, out h);
     if (hw == IntPtr.Zero) return null;
+    if (OutW > 0 && OutH > 0) { w = OutW; h = OutH; }
     var s = new Shot { W = w, H = h };
     Directory.CreateDirectory(CaptureDir);
     if (Directory.GetFiles(CaptureDir, "alive.*").Length == 0) { s.Method = "backbuffer: title has not presented yet"; s.Verdict = "no present"; return s; }

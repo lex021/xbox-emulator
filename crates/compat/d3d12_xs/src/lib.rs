@@ -40,6 +40,8 @@ mod mip_bind;
 mod present;
 mod overlay;
 mod frame_csv;
+mod frame_ev;
+mod xlat_index;
 mod overlay_font;
 mod overlay_sensors;
 #[cfg(test)]

@@ -148,6 +148,10 @@ pub(crate) fn configs() -> Vec<(u32, u32, u32, u32, u32)> {
 fn oracle_dcc_init() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
+    if !crate::dcc_oracle::rvas_22000(&o) {
+        println!("oracle_dcc_init: skipped, its console RVAs are the 22000 build's");
+        return;
+    }
     let hl = holes(&o);
     let nh = hl.iter().filter(|&&x| x).count();
     let mut cases = 0u64;
@@ -193,6 +197,10 @@ fn oracle_dcc_init() {
 fn oracle_dcc_bits() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
+    if !crate::dcc_oracle::rvas_22000(&o) {
+        println!("oracle_dcc_bits: skipped, its console RVAs are the 22000 build's");
+        return;
+    }
     type Seg = unsafe extern "system" fn(*const u32, *mut u32) -> *mut u32;
     type Cmp = unsafe extern "system" fn(*const u32, u32) -> u8;
     type Msk = unsafe extern "system" fn(u32) -> u32;
@@ -233,4 +241,8 @@ fn oracle_dcc_bits() {
     }
     println!("dcc bits: {} cases, {} mismatches, {} overflow metas", cases, bad, invalid);
     assert_eq!(bad, 0);
+}
+
+pub(crate) fn rvas_22000(o: &crate::oracle::Oracle) -> bool {
+    o.f("XGEncodeDCC") as usize - o.h == 0xa960
 }

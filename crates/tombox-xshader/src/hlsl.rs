@@ -33,6 +33,7 @@ mod centroid;
 mod durango;
 mod mixed;
 mod mimg_d16;
+mod atomic;
 use mimg_d16::{mimg_data_regs, Lane};
 
 pub struct Translated {
@@ -2422,7 +2423,9 @@ impl<'a> Emitter<'a> {
     }
 
     fn lds_order(&mut self, writes: bool, reads: bool) {
-        let hazard = (reads && self.lds_w_pending) || (writes && self.lds_r_pending);
+        let crossed = (reads && self.lds_w_pending) || (writes && self.lds_r_pending);
+        let wave_write = self.one_wave_lds() && writes && self.lds_w_pending;
+        let hazard = crossed || wave_write;
         if hazard && self.brace_depth == 0 && self.loop_depth == 0 {
             self.line("GroupMemoryBarrierWithGroupSync();");
             self.lds_w_pending = false;
@@ -2633,7 +2636,7 @@ impl<'a> Emitter<'a> {
                 }
                 let exits: Vec<String> = labels.iter().filter(|&&t| t > i).map(|t| format!("j{t}")).collect();
                 let exit = if exits.is_empty() { String::new() } else { format!(" && !({})", exits.join(" || ")) };
-                self.line(&format!("}} while (tb_c{i}{exit} && ++tb_guard < 65536u);"));
+                self.line(&format!("}} while (tb_c{i}{exit} && ++tb_guard < {}u);", loop_guard(65536)));
                 self.loop_depth = self.loop_depth.saturating_sub(1);
             }
         }
@@ -2681,7 +2684,7 @@ impl<'a> Emitter<'a> {
         let starts: Vec<usize> = leaders.into_iter().filter(|&s| s < n).collect();
         self.loop_depth = 0;
         self.line("uint tb_pc = 0u; uint tb_guard = 0u;");
-        self.line(&format!("[loop] while (tb_pc != {n}u && tb_guard++ < 1000000u) {{"));
+        self.line(&format!("[loop] while (tb_pc != {n}u && tb_guard++ < {}u) {{", loop_guard(1000000)));
         self.loop_depth += 1;
         // Flat `if (tb_sel == K)` tests on a snapshot of the block id (FXC mishandles a
         // `switch` whose selector is assigned inside its cases).
@@ -3113,13 +3116,8 @@ impl<'a> Emitter<'a> {
                 let d = d.ok_or("no dst")?;
                 let (a, b) = (r(&s[0])?, r(&s[1])?);
                 if m == "s_bfe_u64" || m == "s_bfe_i64" {
-                    // A 32-bit literal is extended according to the type of SRC0.
-                    let upper = match (&s[0], m) {
-                        (Opnd::Literal(v), "s_bfe_i64") if *v & 0x8000_0000 != 0 => Opnd::ConstInt(-1),
-                        (src, _) => hi(src),
-                    };
-                    self.touch(&upper);
-                    let ah = r(&upper)?;
+                    self.touch(&hi(&s[0]));
+                    let ah = r(&hi(&s[0]))?;
                     let t = self.tmp;
                     self.tmp += 1;
                     self.line(&format!(
@@ -5149,59 +5147,10 @@ impl<'a> Emitter<'a> {
                 _ => return Err("unresolved atomic target".into()),
             };
             let vdata = ins.dst[0];
-            self.touch(&vdata);
-            let val = r(&vdata)?;
-            if matches!(
-                ins.mnemonic.as_str(),
-                "buffer_atomic_smin" | "buffer_atomic_smax" | "buffer_atomic_cmpswap" | "buffer_atomic_inc" | "buffer_atomic_dec"
-            ) {
-                let t = self.tmp;
-                self.tmp += 1;
-                if ins.mnemonic == "buffer_atomic_cmpswap" {
-                    let cmp = match vdata {
-                        Opnd::Vgpr(n) => Opnd::Vgpr(n + 1),
-                        _ => return Err("bad vdata".into()),
-                    };
-                    self.touch(&cmp);
-                    self.line(&format!(
-                        "uint t{t} = 0u; if (exec_lo & 1u) {{ InterlockedCompareExchange({target}, {}, {val}, t{t}); }}",
-                        r(&cmp)?
-                    ));
-                } else {
-                    let c = format!("t{t}c");
-                    let new = match ins.mnemonic.as_str() {
-                        "buffer_atomic_smin" => format!("asuint(min(asint({c}), asint({val})))"),
-                        "buffer_atomic_smax" => format!("asuint(max(asint({c}), asint({val})))"),
-                        "buffer_atomic_inc" => format!("(({c} >= {val}) ? 0u : ({c} + 1u))"),
-                        _ => format!("((({c} == 0u) || ({c} > {val})) ? {val} : ({c} - 1u))"),
-                    };
-                    self.line(&format!(
-                        "uint t{t} = 0u; if (exec_lo & 1u) {{ uint {c} = {target}; [allow_uav_condition] for (uint t{t}i = 0u; t{t}i < 1024u; t{t}i++) {{ uint t{t}p = 0u; InterlockedCompareExchange({target}, {c}, {new}, t{t}p); if (t{t}p == {c}) break; {c} = t{t}p; }} t{t} = {c}; }}"
-                    ));
-                }
-                if glc {
-                    self.wv(&vdata, &format!("t{t}"))?;
-                }
-                return Ok(());
-            }
-            let (func, arg) = match ins.mnemonic.as_str() {
-                "buffer_atomic_add" => ("InterlockedAdd", val),
-                "buffer_atomic_sub" => ("InterlockedAdd", format!("(0u - {val})")),
-                "buffer_atomic_inc" => ("InterlockedAdd", "1u".to_string()),
-                "buffer_atomic_dec" => ("InterlockedAdd", "0xffffffffu".to_string()),
-                "buffer_atomic_umin" => ("InterlockedMin", val),
-                "buffer_atomic_umax" => ("InterlockedMax", val),
-                "buffer_atomic_and" => ("InterlockedAnd", val),
-                "buffer_atomic_or" => ("InterlockedOr", val),
-                "buffer_atomic_xor" => ("InterlockedXor", val),
-                "buffer_atomic_swap" => ("InterlockedExchange", val),
-                other => return Err(format!("{other} unsupported")),
-            };
-            let t = self.tmp;
-            self.tmp += 1;
-            self.line(&format!("uint t{t} = 0u; if (exec_lo & 1u) {{ {func}({target}, {arg}, t{t}); }}"));
+            let op = ins.mnemonic.strip_prefix("buffer_atomic_").ok_or_else(|| format!("{} unsupported", ins.mnemonic))?;
+            let old = self.atomic_rmw(op, &target, vdata).map_err(|_| format!("{} unsupported", ins.mnemonic))?;
             if glc {
-                self.wv(&vdata, &format!("t{t}"))?;
+                self.wv(&vdata, &old)?;
             }
             return Ok(());
         }
@@ -5442,6 +5391,8 @@ impl<'a> Emitter<'a> {
             1 => ("point", 1usize),
             2 => ("line", 2),
             3 => ("triangle", 3),
+            6 => ("lineadj", 4),
+            7 => ("triangleadj", 6),
             other => return Err(format!("GS input primitive {other} unsupported")),
         };
         let stream = match gi.output_topology {
@@ -5679,7 +5630,7 @@ impl<'a> Emitter<'a> {
             return Ok(());
         }
         // Texel-addressed ops (no sampler): image_load / image_store, on SRVs or UAVs.
-        if matches!(ins.mnemonic.as_str(), "image_load" | "image_load_mip" | "image_store" | "image_store_mip" | "image_atomic_add" | "image_atomic_umax") {
+        if matches!(ins.mnemonic.as_str(), "image_load" | "image_load_mip" | "image_store" | "image_store_mip") || ins.mnemonic.starts_with("image_atomic_") {
             let with_mip = ins.mnemonic == "image_load_mip" || ins.mnemonic == "image_store_mip";
             let store = ins.mnemonic.starts_with("image_store");
             let (slot, dim, is_uav) = match rs.first() {
@@ -5722,20 +5673,21 @@ impl<'a> Emitter<'a> {
             } else {
                 format!("uav{slot}")
             };
-            if ins.mnemonic.starts_with("image_atomic_") {
-                // Image atomics → Interlocked* on a RWTexture<uint> texel; vdata carries the
-                // operand in and the previous value out.
+            if let Some(op) = ins.mnemonic.strip_prefix("image_atomic_") {
                 if !as_uint {
                     return Err("image atomic on a non-UAV table".into());
                 }
-                let func = if ins.mnemonic == "image_atomic_add" { "InterlockedAdd" } else { "InterlockedMax" };
+                let dmask_32 = if op == "cmpswap" { 0x3 } else { 0x1 };
+                if ins.aux.mask != dmask_32 {
+                    return Err(format!("{} with dmask {:#x}: only 32-bit image atomics are supported", ins.mnemonic, ins.aux.mask));
+                }
+                let glc = ins.raw.first().is_some_and(|w| (w >> 13) & 1 != 0);
                 let o = Opnd::Vgpr(vd);
-                self.touch(&o);
-                let t = self.tmp;
-                self.tmp += 1;
-                self.line(&format!("uint t{t} = 0u;"));
-                self.line(&format!("if (exec_lo & 1u) {func}({uobj}[uint{ncoord}({})], {}, t{t});", c.join(", "), r(&o)?));
-                return self.wv(&o, &format!("t{t}"));
+                let old = self.atomic_rmw(op, &format!("{uobj}[uint{ncoord}({})]", c.join(", ")), o)?;
+                if glc {
+                    self.wv(&o, &old)?;
+                }
+                return Ok(());
             }
             if store && as_uint {
                 let v = self.mimg_store_lanes(ins, vd, Lane::Uint, "0u")?;
@@ -6472,7 +6424,11 @@ impl<'a> Emitter<'a> {
             // thread-group id in the three SGPRs following the user-data (root-parameter)
             // registers, thread-group size in the ISA preamble dwords 1..3.
             let p = ex.isa_preamble;
-            let (tx, ty_, tz) = (p[1].max(1), p[2].max(1), p[3].max(1));
+            let (tx, ty_, tz) = if p[1] != 0 || p[2] != 0 || p[3] != 0 {
+                (p[1].max(1), p[2].max(1), p[3].max(1))
+            } else {
+                ex.psv_numthreads.map(|t| (t[0], t[1], t[2])).unwrap_or((1, 1, 1))
+            };
             let nparams = ex.root_sig.as_ref().map(|r| r.params.len()).unwrap_or(4);
             let g = self.cs_tgid_base(nparams);
             let fused_groups = match cooperative_gws {
@@ -6594,7 +6550,17 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             for rname in ["s3", "v0", "v1"] {
                 self.regs.insert(rname.to_string());
             }
-            let _ = writeln!(init, "    s3 = 0x100u; v0 = 0x04000000u; v1 = 0x800u;");
+            let _ = if nv <= 3 {
+                writeln!(init, "    s3 = 0x100u; v0 = 0x04000000u; v1 = 0x800u;")
+            } else {
+                let pack = |a: u32, b: u32| (a * 0x400) | ((b * 0x400) << 16);
+                if nv > 4 {
+                    self.regs.insert("v2".to_string());
+                    writeln!(init, "    s3 = 0x100u; v0 = {:#x}u; v1 = {:#x}u; v2 = {:#x}u;", pack(0, 1), pack(2, 3), pack(4, 5))
+                } else {
+                    writeln!(init, "    s3 = 0x100u; v0 = {:#x}u; v1 = {:#x}u;", pack(0, 1), pack(2, 3))
+                }
+            };
         }
         if !is_ps && !self.is_gs {
             let is_durango = self.durango.is_some() || crate::gcn::is_durango(&self.ex.fssm);
@@ -6659,7 +6625,20 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
         let (init, body) = centroid::lower(ex, &pos_field, &init, &self.body);
         h.push_str(&init);
         h.push_str(&body);
+        if guard_mark() && !no_out && !self.is_gs && body.contains("uint tb_guard = 0u;") && h.contains("float4 o0 : SV_Target0;") {
+            let _ = writeln!(h, "    if (tb_guard >= {}u) o.o0 = float4(1000.0, 0.0, 1000.0, 1.0);", loop_guard(1000000).saturating_sub(1));
+        }
         h.push_str(if no_out || self.is_gs { "}\n" } else { "    return o;\n}\n" });
         Ok(h)
     }
+}
+
+pub fn loop_guard(default: u32) -> u32 {
+    static G: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    G.get_or_init(|| std::env::var("TOMBOX_XS_LOOP_GUARD").ok().and_then(|v| v.trim().parse().ok()).filter(|&n: &u32| n > 0)).map_or(default, |n| n.min(default))
+}
+
+pub fn guard_mark() -> bool {
+    static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *M.get_or_init(|| std::env::var("TOMBOX_XS_GUARD_MARK").map(|v| v == "1").unwrap_or(false))
 }

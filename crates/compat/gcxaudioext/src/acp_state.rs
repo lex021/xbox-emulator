@@ -1,7 +1,7 @@
 use core::ffi::c_void;
 use std::sync::Mutex;
 
-use crate::{wide, xmem_proc, GetModuleHandleW, GetProcAddress, LoadLibraryW, XAUDIO_HEAP_ATTRIBUTES};
+use crate::{xmem_proc, wide, GetModuleHandleW, GetProcAddress, LoadLibraryW, XAUDIO_HEAP_ATTRIBUTES};
 
 pub const ACP_STATE_SIZE: usize = 0x3c0;
 pub const SHAPE_ALLOCATOR_SIZE: usize = 0x6c;
@@ -26,6 +26,7 @@ pub const OWNER_SHARED: u8 = 0x04;
 pub const OWNER_LOCAL: u8 = 0x02;
 pub const OWNER_XMA_IN_USE: u8 = 0x01;
 pub const XMA_KIND: usize = 4;
+pub const XMA_CONTEXT_SIZE: usize = 0x40;
 const E_OUTOFMEMORY: i32 = 0x8007_000Eu32 as i32;
 const E_NOINTERFACE_HAL: i32 = 0x8007_007Eu32 as i32;
 
@@ -73,7 +74,6 @@ struct Globals {
     objects: u32,
     initialized: bool,
     allocated: bool,
-    xma_cursor: usize,
 }
 
 struct Shared(Globals);
@@ -92,7 +92,6 @@ static GLOBALS: Mutex<Shared> = Mutex::new(Shared(Globals {
     objects: 0,
     initialized: false,
     allocated: false,
-    xma_cursor: 0,
 }));
 
 fn globals() -> std::sync::MutexGuard<'static, Shared> {
@@ -121,6 +120,67 @@ pub fn xma_side_arrays() -> (usize, usize) {
     (g.0.xma_read, g.0.xma_write)
 }
 
+pub unsafe fn alloc_xma_context(a: *mut ShapeAllocator) -> Result<u32, i32> {
+    let mut sh = globals();
+    let g = &mut sh.0;
+    let o = &mut *a;
+    let k = XMA_KIND;
+    let n = g.owners[k].len() as u32;
+    let mut take = |i: u32, o: &mut ShapeAllocator| -> bool {
+        if i >= n || g.owners[k][i as usize] & OWNER_XMA_IN_USE != 0 {
+            return false;
+        }
+        o.begin[k] = i + 1;
+        if o.begin[k] >= o.end[k] {
+            o.begin[k] = o.base[k];
+        }
+        g.owners[k][i as usize] |= OWNER_XMA_IN_USE;
+        if g.shadow[k] != 0 {
+            core::ptr::write_bytes((g.shadow[k] + i as usize * XMA_CONTEXT_SIZE) as *mut u8, 0, XMA_CONTEXT_SIZE);
+        }
+        true
+    };
+    for i in o.begin[k]..o.end[k] {
+        if take(i, o) {
+            return Ok(i);
+        }
+    }
+    let stop = o.begin[k];
+    for i in o.base[k]..stop {
+        if take(i, o) {
+            return Ok(i);
+        }
+    }
+    Err(E_OUTOFMEMORY)
+}
+
+pub fn free_xma_context(i: u32) {
+    let mut sh = globals();
+    if let Some(b) = sh.0.owners[XMA_KIND].get_mut(i as usize) {
+        *b &= !OWNER_XMA_IN_USE;
+    }
+}
+
+pub fn apu_address_valid(p: *const c_void, alignment: u32) -> bool {
+    static F: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let f = *F.get_or_init(|| unsafe {
+        let name = wide("AcpHal.dll");
+        let mut m = GetModuleHandleW(name.as_ptr());
+        if m == 0 {
+            m = LoadLibraryW(name.as_ptr());
+        }
+        if m == 0 {
+            return 0;
+        }
+        GetProcAddress(m, b"ApuIsVirtualAddressValid\0".as_ptr()) as usize
+    });
+    if f == 0 {
+        return false;
+    }
+    let f: unsafe extern "system" fn(*const c_void, u32) -> i32 = unsafe { core::mem::transmute(f) };
+    unsafe { f(p, alignment) & 0xff != 0 }
+}
+
 pub fn shape_table_address() -> *mut ShapeTable {
     let g = globals();
     &g.0.table as *const ShapeTable as *mut ShapeTable
@@ -133,7 +193,6 @@ struct Hal {
     alloc_shape: unsafe extern "system" fn(*mut u8) -> i32,
     release_shape: unsafe extern "system" fn() -> i32,
     create: unsafe extern "system" fn(*mut *mut c_void) -> i32,
-    is_va_valid: Option<unsafe extern "system" fn(*const c_void, u32) -> i32>,
 }
 
 static HAL: std::sync::OnceLock<Option<Hal>> = std::sync::OnceLock::new();
@@ -149,18 +208,10 @@ fn hal() -> Option<&'static Hal> {
             return None;
         }
         let p = |n: &[u8]| GetProcAddress(m, n.as_ptr()) as usize;
-        let v = [
-            p(b"ApuAlloc\0"),
-            p(b"ApuFree\0"),
-            p(b"ApuMapVirtualAddress\0"),
-            p(b"AcpHalAllocateShapeContexts\0"),
-            p(b"AcpHalReleaseShapeContexts\0"),
-            p(b"AcpHalCreate\0"),
-        ];
+        let v = [p(b"ApuAlloc\0"), p(b"ApuFree\0"), p(b"ApuMapVirtualAddress\0"), p(b"AcpHalAllocateShapeContexts\0"), p(b"AcpHalReleaseShapeContexts\0"), p(b"AcpHalCreate\0")];
         if v.iter().any(|&x| x == 0) {
             return None;
         }
-        let is_va = p(b"ApuIsVirtualAddressValid\0");
         Some(Hal {
             alloc: core::mem::transmute(v[0]),
             free: core::mem::transmute(v[1]),
@@ -168,58 +219,9 @@ fn hal() -> Option<&'static Hal> {
             alloc_shape: core::mem::transmute(v[3]),
             release_shape: core::mem::transmute(v[4]),
             create: core::mem::transmute(v[5]),
-            is_va_valid: if is_va != 0 { Some(core::mem::transmute(is_va)) } else { None },
         })
     })
     .as_ref()
-}
-
-pub fn apu_address_valid(p: *const c_void, align: u32) -> bool {
-    let Some(h) = hal() else { return false };
-    if let Some(f) = h.is_va_valid {
-        unsafe { f(p, align) != 0 }
-    } else {
-        let a = unsafe { (h.map_va)(p) };
-        let al = if align == 0 { 1 } else { align };
-        a != 0 && (a & al.wrapping_sub(1) == 0)
-    }
-}
-
-pub unsafe fn alloc_xma_context(alloc: *mut ShapeAllocator) -> Result<u32, i32> {
-    if alloc.is_null() {
-        return Err(E_OUTOFMEMORY);
-    }
-    let a = &*alloc;
-    let begin = a.begin[XMA_KIND] as usize;
-    let end = a.end[XMA_KIND] as usize;
-    if begin >= end {
-        return Err(E_OUTOFMEMORY);
-    }
-    let mut sh = globals();
-    let g = &mut sh.0;
-    let owners = &mut g.owners[XMA_KIND];
-    if owners.len() < end {
-        return Err(E_OUTOFMEMORY);
-    }
-    let count = end - begin;
-    for offset in 0..count {
-        let i = begin + (g.xma_cursor + offset) % count;
-        if (owners[i] & OWNER_XMA_IN_USE) == 0 {
-            owners[i] |= OWNER_XMA_IN_USE;
-            g.xma_cursor = (i - begin + 1) % count;
-            return Ok(i as u32);
-        }
-    }
-    Err(E_OUTOFMEMORY)
-}
-
-pub fn free_xma_context(context: u32) {
-    let mut sh = globals();
-    let g = &mut sh.0;
-    let i = context as usize;
-    if i < g.owners[XMA_KIND].len() {
-        g.owners[XMA_KIND][i] &= !OWNER_XMA_IN_USE;
-    }
 }
 
 pub unsafe fn heap_alloc(size: usize) -> *mut u8 {
@@ -290,7 +292,6 @@ unsafe fn release_globals(g: &mut Globals) {
     g.saved = [0; 6];
     g.allocated = false;
     g.initialized = false;
-    g.xma_cursor = 0;
 }
 
 unsafe fn alloc_shadow(h: &Hal, g: &mut Globals, k: usize) -> i32 {

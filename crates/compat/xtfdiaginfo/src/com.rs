@@ -121,6 +121,26 @@ pub unsafe fn obj_set_object(o: Obj, name: *const u16, v: Obj) -> HRESULT {
     f(o, name, v)
 }
 
+pub unsafe fn obj_get_array(o: Obj, name: *const u16, out: *mut Obj) -> HRESULT {
+    let f: unsafe extern "system" fn(Obj, *const u16, *mut Obj) -> HRESULT = transmute(slot(o, 10));
+    f(o, name, out)
+}
+
+pub unsafe fn arr_get_string(a: Obj, i: u32, out: *mut BSTR) -> HRESULT {
+    let f: unsafe extern "system" fn(Obj, u32, *mut BSTR) -> HRESULT = transmute(slot(a, 8));
+    f(a, i, out)
+}
+
+pub unsafe fn arr_get_object(a: Obj, i: u32, out: *mut Obj) -> HRESULT {
+    let f: unsafe extern "system" fn(Obj, u32, *mut Obj) -> HRESULT = transmute(slot(a, 9));
+    f(a, i, out)
+}
+
+pub unsafe fn arr_get_count(a: Obj, out: *mut u32) -> HRESULT {
+    let f: unsafe extern "system" fn(Obj, *mut u32) -> HRESULT = transmute(slot(a, 11));
+    f(a, out)
+}
+
 pub unsafe fn obj_set_array(o: Obj, name: *const u16, v: Obj) -> HRESULT {
     let f: unsafe extern "system" fn(Obj, *const u16, Obj) -> HRESULT = transmute(slot(o, 11));
     f(o, name, v)

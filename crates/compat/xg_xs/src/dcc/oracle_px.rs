@@ -38,6 +38,10 @@ pub(crate) fn px_states() -> Vec<Dcc> {
 fn oracle_dcc_px_helpers() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
+    if !crate::dcc_oracle::rvas_22000(&o) {
+        println!("oracle_dcc_px_helpers: skipped, its console RVAs are the 22000 build's");
+        return;
+    }
     type F1 = unsafe extern "system" fn(u32) -> u32;
     type F3 = unsafe extern "system" fn(u32, i32, i32) -> u32;
     type F4 = unsafe extern "system" fn(u32, u32, i32, i32) -> u32;
@@ -107,6 +111,10 @@ fn oracle_dcc_px_helpers() {
 fn oracle_dcc_px_get_set() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
+    if !crate::dcc_oracle::rvas_22000(&o) {
+        println!("oracle_dcc_px_get_set: skipped, its console RVAs are the 22000 build's");
+        return;
+    }
     let cget: Get = unsafe { core::mem::transmute(o.h + 0x3fc60) };
     let cset: Set = unsafe { core::mem::transmute(o.h + 0x45860) };
     let cget_swz: Get = unsafe { core::mem::transmute(o.h + 0x370e0) };
@@ -183,6 +191,10 @@ fn oracle_dcc_px_get_set() {
 fn oracle_dcc_px_relayout() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
+    if !crate::dcc_oracle::rvas_22000(&o) {
+        println!("oracle_dcc_px_relayout: skipped, its console RVAs are the 22000 build's");
+        return;
+    }
     let lay: Lay = unsafe { core::mem::transmute(o.h + 0x4ac90) };
     let conv: Conv = unsafe { core::mem::transmute(o.h + 0x4adc0) };
     let hl = holes(&o);

@@ -14,10 +14,12 @@ param(
   [int]$LockWaitMinutes = 45,
   [switch]$NoWaitUser,
   [string]$Seed = 'default',
-  [switch]$ListScenes
+  [switch]$ListScenes,
+  [switch]$Fps
 )
 
 $ErrorActionPreference = 'Stop'
+if ($Fps -and -not $Env.ContainsKey('TOMBOX_FRAME_CSV')) { $Env['TOMBOX_FRAME_CSV'] = '1' }
 $Root = 'D:\TomBox'
 $Dev = Join-Path $Root 'tools\dev'
 $Runs = Join-Path $Dev 'batch_runs'
@@ -68,7 +70,7 @@ $AllSpecs = @{
     RunTitle = 'Fortnite'; Proc = 'FortniteClient-XSX-Shipping'; Drive = 'K:'; Main = 'lobby'; Seed = ''
     PadScreens = @((Scr 'start' 'fortnite_press_start.png' 800 745 370 60), (Scr 'safezone' 'fortnite_safe_zone.png' 620 470 680 55))
     Scenes = [ordered]@{
-      lobby = @{ Pad = '0:connect;/Setting user focus to widget Splash_Screen/+2:press a;?#safezone+1:press a'; Rx = 'to \[UI\.State\.Athena\.Frontend'; Screen = ''; Timeout = 240; After = 5 }
+      lobby = @{ Pad = '0:connect;/Setting user focus to widget Splash_Screen/+2:press a;?#safezone+1:press a;/to \[UI\.State\.Startup\.SubgameSelect/+4:press a'; Rx = 'to \[UI\.State\.Athena\.Frontend'; Screen = ''; Timeout = 240; After = 5 }
     }
     Milestones = @(
       @{ Name = 'login'; Src = 'ods'; Rx = [regex]'HandleLoginRequestComplete.*Result=2' },
@@ -82,7 +84,7 @@ $AllSpecs = @{
       (Scr 'welcome' 'minecraft_welcome.png' 675 340 260 32 200 1049))
     Scenes = [ordered]@{
       welcome = @{ Pad = '0:connect'; Rx = ''; Screen = 'welcome'; Timeout = 120; After = 1 }
-      menu = @{ Pad = '0:connect;#welcome+1:press a'; Rx = ''; Screen = ''; ArmAfter = 'press a'; NotScreen = 'welcome'; Timeout = 150; After = 3 }
+      menu = @{ Pad = '0:connect;#welcome+1:press a'; Rx = ''; Screen = ''; ArmAfter = 'press a'; NotScreen = 'welcome'; MinMean = 12; Timeout = 150; After = 3 }
     }
     Milestones = @(
       @{ Name = 'graphics context'; Src = 'ods'; Rx = [regex]'graphics context was gained' },
@@ -104,6 +106,7 @@ if ($ListScenes) {
   return
 }
 $Spec = $AllSpecs[$Title]
+$CapOutH = @($Spec.PadScreens | ForEach-Object { $_.CapH } | Where-Object { $_ })[0]; if (-not $CapOutH) { $CapOutH = 1080 }
 if ($Seed -ne 'default') { $Spec.Seed = $Seed }
 if (-not $Scene -or $Scene -eq 'main') { $Scene = $Spec.Main }
 if (-not $Spec.Scenes.Contains($Scene)) { throw "scene '$Scene' is not defined for $Title (scenes: $($Spec.Scenes.Keys -join ', '))" }
@@ -116,6 +119,7 @@ $SceneRx = if ($Sc.Rx) { [regex]$Sc.Rx } else { $null }
 $SceneScreen = if ($Sc.Screen) { $Spec.PadScreens | Where-Object { $_.Name -eq $Sc.Screen } | Select-Object -First 1 } else { $null }
 if ($Sc.Screen -and -not $SceneScreen) { throw "scene screen '$($Sc.Screen)' has no reference for $Title" }
 $MotionCmd = if ($Sc.Contains('Motion')) { [string]$Sc.Motion } else { '' }
+$MinMean = if ($Sc.Contains('MinMean')) { [double]$Sc.MinMean } else { 0.0 }
 $ArmCmd = if ($Sc.Contains('ArmAfter')) { [string]$Sc.ArmAfter } else { '' }
 $NotScreen = if ($Sc.Contains('NotScreen')) { $Spec.PadScreens | Where-Object { $_.Name -eq $Sc.NotScreen } | Select-Object -First 1 } else { $null }
 if ($Sc.Contains('NotScreen') -and -not $NotScreen) { throw "scene NotScreen '$($Sc.NotScreen)' has no reference for $Title" }
@@ -268,7 +272,7 @@ function Save-Frame([uint32[]]$Pids, [double]$El, [string]$Tag) {
 function Get-Probe([uint32[]]$Pids, [string]$Png) {
   try { $s = [TbFrame2]::Grab($Pids, $Png) } catch { return $null }
   if (-not $s -or $s.Verdict -in 'hung', 'no present', 'capture error') { return $null }
-  return [pscustomobject]@{ Png = $Png; Drawn = [bool]$s.Drawn; Verdict = $s.Verdict }
+  return [pscustomobject]@{ Png = $Png; Drawn = ([bool]$s.Drawn -and [double]$s.Mean -ge $MinMean); Verdict = $s.Verdict; Mean = [double]$s.Mean }
 }
 
 function Get-ScreenScore($Def, [string]$Png) {
@@ -289,7 +293,7 @@ Say "fast_run $Title scene=$Scene target=$Target seconds=$Seconds after=$AfterSc
 $need = @()
 if ($SceneRx) { $need += "log /$SceneRx/" }
 if ($SceneScreen) { $need += "screen #$($SceneScreen.Name)" }
-$need += 'drawn frame'
+$need += $(if ($MinMean -gt 0) { "drawn frame (mean >= $MinMean)" } else { 'drawn frame' })
 if ($MotionCmd) { $need += "motion after pad '$MotionCmd'" }
 if ($ArmCmd) { $need[-1] = $need[-1] + " (checked only after pad '$ArmCmd')" }
 if ($NotScreen) { $need += "screen #$($NotScreen.Name) gone" }
@@ -335,6 +339,7 @@ try {
   $env:TOMBOX_CAPTURE_DIR = $CapDir
   $env:TOMBOX_PAD_DIR = $PadDir
   [TbFrame2]::CaptureDir = $CapDir
+  [TbFrame2]::OutW = 1920; [TbFrame2]::OutH = $CapOutH
   if ($Title -ne 'trackmania') {
     $tg = Join-Path $TestRoot "$($Spec.RunTitle)\gdkroot"
     $nSeed = Reset-TestGdkRoot $tg $Spec.Seed
@@ -377,6 +382,7 @@ try {
   $ps = Start-Process -FilePath 'powershell.exe' -ArgumentList $ra -RedirectStandardOutput (Join-Path $Out 'launcher.txt') -RedirectStandardError (Join-Path $Out 'launcher.err.txt') -WindowStyle Hidden -PassThru
   foreach ($k in $oldEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $oldEnv[$k]) }
   [TbFrame2]::CaptureDir = $CapDir
+  [TbFrame2]::OutW = 1920; [TbFrame2]::OutH = $CapOutH
 
   $streams = @(
     [pscustomobject]@{ Src = 'ods'; Path = (Join-Path $Live 'run.txt'); Pos = 0L; Rest = '' },
@@ -553,10 +559,23 @@ if (Test-Path -LiteralPath $compat) {
 }
 Say 'FRAMES:'
 foreach ($f in $frames) { Say "  $f" }
+$fpsResult = $null
+$fcsv = Join-Path $Out 'tombox_frames.csv'
+if (Test-Path -LiteralPath $fcsv) {
+  $fromMs = 0.0
+  if ($sceneAt -and $ms.Contains('first present')) { $fromMs = [Math]::Max(0.0, ($sceneAt - [double]$ms['first present']) * 1000.0) }
+  Say ("FPS ({0}):" -f $(if ($sceneAt) { "from scene +2 s" } else { 'whole run after first present +2 s' }))
+  try {
+    $fs = & (Join-Path $Dev 'frame_stats.ps1') -Csv $fcsv -FromMs $fromMs -SkipSeconds 2
+    foreach ($l in $fs) { Say ('  ' + $l) }
+    $fpsResult = & (Join-Path $Dev 'frame_stats.ps1') -Csv $fcsv -FromMs $fromMs -SkipSeconds 2 -Json | ConvertFrom-Json
+  } catch { Say ('  ' + $_.Exception.Message) 'Yellow' }
+  if ($sceneAt) { Say ("  game speed: compare the in-game timer in two frames above against their wall times (frame names carry +seconds since launch)") 'DarkGray' }
+} elseif ($Fps) { Say 'FPS: no tombox_frames.csv written' 'Yellow' }
 Say "LOGS: $Out (tombox_compat.log, run.txt = ODS, run.err.txt = trace, game_log.txt, launcher.txt, fast_run.txt)"
 $result = [ordered]@{
   title = $Title; scene = $Scene; reached = [bool]$sceneAt; scene_s = $(if ($sceneAt) { [Math]::Round($sceneAt, 1) } else { $null })
   scene_game_s = $(if ($null -ne $sceneOdsMs) { [Math]::Round($sceneOdsMs / 1000.0, 1) } else { $null }); result = $kind; elapsed_s = [Math]::Round($elapsed, 1)
-  not_reached = ($why -join '; '); milestones = $ms; frames = @($frames); out = $Out; target = $Target; id = $Id
+  not_reached = ($why -join '; '); milestones = $ms; frames = @($frames); fps = $fpsResult; out = $Out; target = $Target; id = $Id
 }
 [IO.File]::WriteAllText((Join-Path $Out 'result.json'), ($result | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding $false))

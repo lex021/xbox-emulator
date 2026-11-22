@@ -409,6 +409,10 @@ pub(super) fn smear(v: u8) -> u8 {
 fn oracle_dcc_relayout_stack_residue() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
+    if !crate::dcc_oracle::rvas_22000(&o) {
+        println!("oracle_dcc_relayout_stack_residue: skipped, its console RVAs are the 22000 build's");
+        return;
+    }
     let lay: Lay = unsafe { core::mem::transmute(o.h + 0x4ac90) };
     let c = Con::new(&o, 1, 1, 0, 0, 0).unwrap();
     let mut d = c.pull();
@@ -440,6 +444,10 @@ fn oracle_dcc_relayout_stack_residue() {
 fn oracle_dcc_dec_helpers() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
+    if !crate::dcc_oracle::rvas_22000(&o) {
+        println!("oracle_dcc_dec_helpers: skipped, its console RVAs are the 22000 build's");
+        return;
+    }
     let wd: Wd = unsafe { core::mem::transmute(o.h + 0x31410) };
     let lo: Clr = unsafe { core::mem::transmute(o.h + 0x31770) };
     let hi: Clr = unsafe { core::mem::transmute(o.h + 0x31820) };
@@ -486,6 +494,10 @@ fn oracle_dcc_dec_helpers() {
 fn oracle_dcc_dec_stages() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
+    if !crate::dcc_oracle::rvas_22000(&o) {
+        println!("oracle_dcc_dec_stages: skipped, its console RVAs are the 22000 build's");
+        return;
+    }
     let hl = holes(&o);
     let metas = valid_metas();
     let st = states();
@@ -730,6 +742,10 @@ fn drive(c: &Con, d: &Dcc, v: u8) -> Dcc {
 fn oracle_dcc_dec_undefined_classes() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
+    if !crate::dcc_oracle::rvas_22000(&o) {
+        println!("oracle_dcc_dec_undefined_classes: skipped, its console RVAs are the 22000 build's");
+        return;
+    }
     let metas = valid_metas();
     let st = states();
     let mut r = Rng(0x0dd_c1a5);

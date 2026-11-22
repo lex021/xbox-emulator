@@ -727,23 +727,35 @@ elease`, the log shows one install and every interface is emulated.
   - The dccx verifier's 49 "stable" rejections are not fixed by the inputs: oracle_xgx_dcc_rejected_cases_depend_on_process_heap reruns each in child processes under 5 heap/stack states and all 49 change (40 fault, 9 return other bytes). Verifier rerun with the new DLL: 29 fresh-process-stable rejections remain, all encoder, all within those 49 (24 packed-stream overrun, 5 bit-plane loop past the codec object); 0 decoder; 0 mismatches. The verifier's "0 stable rejections" bar is therefore NOT met. Those 29 are rejected because the console's result there depends on heap and stack contents, which the console's own test shows; a native port cannot reproduce such a result. Case 696 (native S_OK, Trackmania 0xC0000374 in the verifier run) returns native's hash in 9/9 isolated runs on all three builds; the heap was corrupted earlier in that dccx process. The 97 rows with no Trackmania record were all rerun alone: 64 match native and 33 are native-rejected. Verification was stopped at this point.
   - Encoder overrun rule: if a block's packed stream exceeds 256 bytes, the export returns E_INVALIDARG and writes nothing at or past that block, and never outside the caller's buffers (xgx_dcc_export_overrun_rejects_in_bounds, 289/289 with guard tails intact).
   - The oracle tests (oracle.rs, dcc_codec console()) now panic when the console DLL or xmem.dll is missing.
-- OPEN 11-21, xg_xs XGDecodeDCC / XGEncodeDCC (rows 14 and 16 set back to stub after the dccx verifier failed them). The stage ports are exact. When native is fed the console's own 64-byte relayout/convert scratch at every call (oracle_dcc_cases_feedall / _decfeed, #[ignore], need TOMBOX_DCC_* id files), encode matches 258/258 runs and decode 201/210 cases. What is left is predicting that scratch.
-  - Console builds: Fortnite 10.0.19041.3948 (sha256 9059f503, enc 0x70a0, driver 0x2bf10, relay 0x4b440, convert 0x4b570); XDefiant = Terraria 10.0.22000.4429 (da98c940, enc 0xa960, driver 0x26220, relay 0x4ac90, convert 0x4adc0); Trackmania 10.0.22621.1852 (ccb054ab, enc 0xb7e0, driver 0x29890, relay 0x3e240, convert 0x3e370). The scratch residue differs per build: Fortnite's convert residue is all zero; 22000 and 22621 share 3d 0x7 | ff x8 | E-0x1968 | 0 x24 | 3d 0x7 | 32 0x7. Channel and colour locals sit at different offsets on 22621. Selection is dcc::xg_build() (legacy_19041, else console_os_build; the oracle sets it from the XGEncodeDCC RVA).
-  - E is the export's entry rsp. The console writes caller-stack addresses into its scratch, and from there into the output (encode convert bytes 16..23 = E-0x1968; decode buf0 and relay scratch = E-0x14b0). They sit at a fixed offset from E on every thread (oracle_dcc_cases_rsp), so they are deterministic per caller. The verifier calls native and console from the same frame. Next step: a naked export stub that passes E into dcc::ENTRY; nothing sets it yet, so P is treated as unknown in production.
-  - Encoder model (dcc.rs enc_block / enc::run_model): the scratch bytes the console fills deterministically are modelled; every other byte is unknown. The block is accepted only if 5 different assignments of the unknown bytes give the same dst/meta/size.
-    - 22000 results with E supplied (oracle_dcc_cases_model): 54 of the 86 verifier stable-reject ids match on the main thread and on a worker thread; 0 mismatches.
-    - 22 ids need relay-1 entry bytes 39/47 left by the export's CFG vcalls after init. These bytes differ between host processes, so they are caller-dependent.
-    - 10 ids need more channel 0x27330 locals.
-    - 22621: 8 ids match and 0 mismatch; its colour locals are not modelled.
-    - 19041: not verified; the model test hits an int3 under the Fortnite DLL.
-  - Decoder: native still rejects every block whose output takes never-written scratch. Not modelled:
-    - the convert/relay residue (tid-swizzle and dedelta locals, E-0x16b8 on the main thread vs E-0x1708 on another thread, a return address, encoded pointers);
-    - 430, 1331, 2210 and 2977, whose unwritten buf0 segments are a reused heap block (0x5ed820) that still holds init's freed structures, including E-0x14b0;
-    - 50, 149, 262, 411 and 1757, which still differ even when fed, because they read pre-driver stack outside the four sites.
-  - Proof that the old main-thread "stable" set is caller-dependent: oracle_dcc_cases_thread reruns the console on a spawned thread (1 MB or 8 MB stack, extra depth). 264 of the 296 stable-reject ids change output. The vsprintf IAT-hook proof and the forced !a.2[0] difference were removed from oracle_dcc_enc_undefined_classes, which now records only real caller-wrapper differences.
-  - Oracle tests now panic when the console xg_xs.dll or xmem.dll is missing (oracle.rs oracle()).
-  - Verified: CARGO_TARGET_DIR=target-dccenc cargo test -p xg_xs dcc -- --test-threads=1 gives 21 passed, 0 failed, 18 ignored (the env-gated diagnostics).
-  - Still to check before e2e: whether the console leaves dst bytes past the reported size as leftover buffer contents (compare by prefilling b1 with 0x11 and 0x22 around call1(0x26220)).
+- OPEN 11-22 (narrowed), xg_xs XGDecodeDCC / XGEncodeDCC. Rows 14 and 16 stay stub. Every native result now equals the console under every reachable process state, but two classes of native E_INVALIDARG are still not proven caller- or process-dependent.
+  - Builds: Fortnite 19041 (9059f503), XDefiant = Terraria 22000 (da98c940), Trackmania 22621 (ccb054ab); selection dcc::xg_build().
+  - Done 11-22:
+    - Naked export stubs pass the entry rsp E into dcc::ENTRY (oracle_dcc_export_entry_matches_console, all 3 builds).
+    - 19041 format 104: its console table (0x57e2c, stride 0x3c) has idx 0 where 22000/22621 have 2. dcc::fmt_row gives E_INVALIDARG there; the console int3s in init. All other 120 formats match on all builds.
+    - Convert scratch: the real temp is call-site rsp-0x90. Writers on 22000/22621: q0 con+0x3fc6a; q1-q4 and q7 ntdll pushes reached from the console's own sprintf (0x4eaf8 -> ucrtbase); q5/q6 ucrtbase+0xd514; bytes 16..23 = E-0x1968. q5 changes under a forwarding XMem hook, so it is unknown. The rest are taken as the observed values. On 19041 the temp is zeroed by host msvcrt (0x7bd76..0x7bd8a), so all 64 bytes are taken as 0.
+    - oracle_dcc_accepted_cases_invariant (3000 generator cases): every natively accepted case is re-run on the console 10 ways (stack smears 00/ff/random, heap sprays, relocated console DLL, 2 forwarding XMem hooks, 2 rewrites of the allocator-dependent convert quad). 0 differ on all 3 builds (22000: 1474 accepted, 22621: 1455, 19041: 1447).
+    - oracle_dcc_rejected_cases_depend_on_process_state runs every native rejection in child processes under 11 states: original, relocated DLL, 4 smear/spray patterns, 2 XMem hooks, 7 or 23 held XMemAllocDefault blocks (attr 0x480009e), and a fresh thread.
+      - 22000: 1236 rejections. 352 change with stack/heap at fixed E; 264 change when other XMem blocks are held; 261 deterministic div0 (c0000094); 354 deterministic /GS (c0000409); 5 stable S_OK.
+    - oracle_dcc_call_sequences: 3000 ordered plus 3x400 random mixed calls in one process, both codecs, init-invalid ids included.
+      - 22000: 4200 calls, 2071 equal, 2129 native E_INVALIDARG (1256 console crashes, all 402 init-invalid calls crash), 0 divergences.
+  - Still open:
+    - 22000 decoder ids 50, 149, 262, 411, 1757. The console output is stable in every state above, and native rejects. The holes are console-written stack locals in driver 0x23210's frame:
+      - dconv temp q3 = unpack 0x23560's [rbp-0x38] row 1 (0x23d95);
+      - dconv temp q7 = the 16-byte .rdata constant at 0x7a940 (tid 0x244d8, 0x24543);
+      - drelay0 q7 = seg_info 0x4af40 out[0..1];
+      - drelay1 initial = drelay0's final relay temp (0x4ad37).
+      Seeding exactly those makes native accept, but the output is still wrong in more bytes (constant run cf 0e 81 c0 16 2f ...). Id 723 shows the same. These need a full model of the driver-frame locals; on 22621/19041 the same ids are proven process-dependent.
+    - The convert quads other than q5 are host CRT/ntdll stack residue from the console's own sprintf. They are stable on this PC under every state, and console ucrtbase/ntdll exist in the dumps, but the values are not derived from those console DLLs. Veto point: if host-CRT residue must not be modelled, set dcc::enc::conv_known to 0 (q2 E-relative excepted). Then 23 accepted 22000 ids and the 9 ids 81 175 325 674 741 1051 1074 1103 1322 return to unproven rejections.
+    - 22621: relay-3 entry now models the colour locals (bytes 56..63 = 8, 52..55 = 0, 24..51 carried from the previous relay; writer con+0x2b4c8). 19 ids that had been console-stable rejections (81 175 325 674 741 1051 1074 1103 1322 1457 1731 1796 1959 2280 2314 2416 2640 2793 2810) are now accepted and equal the console. Accepted-invariance: 1474 accepted, 0 differ. The partition (run before this fix) found no other stable S_OK class among the 1255 rejections.
+    - 19041: the first 112 of 1241 native rejections in the partition already include 52 console-stable S_OK, stopped there. In that sample:
+      - 21 decoder;
+      - 18 need relay-1 entry bytes;
+      - 15 need relay-3 entry bytes;
+      - 3 need relay-3 entry plus convert q6/q7.
+      The 19041 relay entry locals (channel and colour) and the decoder frame locals are not modelled. This is the largest remaining gap.
+    - 19041 encoder bug (pre-existing, independent of the convert model): oracle_dcc_enc_e2e under the Fortnite DLL finds 153 blocks where native returns S_OK with meta ff and size 256 but the console compresses (meta 66/f6/d6/5b/6f, size 128..224). It is mostly format 5, sw 0/1, dims 0/3/4. The 3000-case generator in the invariance and sequence oracles does not reach these inputs, so they stay at 0 divergences. Native gives wrong S_OK output here, so the 19041 encoder choose/plan path must be diffed against 0x70a0 before any implemented status.
+    - Twelve 22000-RVA-hardcoded DCC stage oracles (dcc_oracle, oracle_dec, oracle_enc, oracle_px) now skip on other builds instead of crashing. Non-DCC oracle tests (oracle_all_formats, oracle_bvh_computer, oracle_3d_random, oracle_optimal_swizzle_and_buffer) still crash or fail under the 22621 DLL. That is outside these rows.
+    - Pre-existing: exports_table::export_table_matches_source fails while these rows say stub, because the exports are real fns. It passes once the rows become implemented.
 
 ## RDNA2 s_sendmsghalt / s_trap (tombox-xshader, all titles) - 2026-11-21, scalar
 - DONE, s_trap translates as a no-op, because titles run with no trap handler and the hardware does not take the trap:
@@ -1039,3 +1051,38 @@ Headless runs straight into each title's test scene, on the staged release of 11
 - 🟥 **Minecraft (1 of 6 boots): AV in the compat xmem.dll.**
   - Crash at xmem.dll+0x3278e1 at +54.9 s, after `graphics context was gained` and before the first-run dialog draws.
   - Release 07:40. Run: fast_20261122_081738_minecraft_c3_mcmenu.
+
+### Update 2026-11-22 09:15 (scenes sub-chat)
+- Fortnite lobby: FIXED in the working tree (d3d12_xs device_wrap.rs register_pso). The derived-PSO E_INVALIDARG came from dangling title pointers in the PsoRecord snapshot that slot 55 builds derived PSOs from: the root signature was not AddRef'd, and CachedPSO and semantic-name pointers were kept raw. Every one-field bisection variant of a failing derived desc still failed, which points at one of these desc-wide fields. Lobby reached 3/3 headless (dev-fast).
+- Fortnite lobby fps: 12.1 fps (ft 82.8 ms) on dev-fast vs 23.5 fps on the 11-21 release. Re-measure on the lead's next release build.
+- Minecraft menu: still black after the first-run dialog. Only ~5 graphics PSOs are ever created, so the title never starts drawing the menu. The screen-reader dialog is not triggered by the NarratorRunning mutex check (OpenMutexA finds nothing on this host), and its button label is not drawn. Nothing points at the xmem heap accounting yet; it has no off-switch, so it is not A/B-tested.
+- XDefiant menu: in the 08:41 run (another agent) the compute PSO OOM and the AV are gone, but the menu is black at 0.7 fps.
+
+### Update 2026-11-22 09:45 (scenes sub-chat)
+- Fortnite lobby on release (09:14 build): reached 2/2 at +45.0 / +42.0 s. It runs at 12.1 fps, GPU-bound (present_wait 78.8 ms/f). The 11-21 batch run at the same start screen was 11.0 fps (present_copy 89.6 ms/f), so this is not a regression against that run; where the 23.5 fps figure came from is unknown.
+- Minecraft menu: the menu IS rendered (debug line FPS 60.1, logo, Play/Marketplace) but appears on only a few presented frames; most presents are black. The panorama background and button labels are missing even when it shows. PresentX gets 1 plane and the same source resource every frame, and that resource is "not a registered RT". The menu is probably rendered into another resource that aliases the same memory, reaching the presented one only now and then. Next step: TOMBOX_RTCAP draw attribution and the alias/placed-resource paths.
+- Minecraft: the xmem heap accounting is ruled out. New switch TOMBOX_XMEM_HEAPACCT=0; with accounting off and on, both runs show the same intermittent menu.
+- Minecraft: the "second process" (hook_thread, PID line) was DiscordHook64.dll, the host's Discord overlay injected at +93 s. It is host contamination of test runs; one 4.26 s host present followed.
+- d3d12_xs slot_audit::done_slots_have_real_handlers: FIXED on the test side. Slots 31-35/69/83/85/88/89 hold deliberate console E_NOTIMPL handlers (device_console_fix::notimpl_x, console_slots::dev_notimpl, console_slots_dev2::scarlett_notimpl). The linker folded them with dev_stub's identical body, so SymFromAddr named them dev_stub. dev_stub now counts hits (DEV_STUB_HITS) and can no longer be folded; d3d12_xs lib 475/0.
+- Minecraft menu, RTCAP 09:44 (TOMBOX_RTCAP=1, capture ~15 s after the A press):
+  - Where it draws: the menu goes into MSAA target 1920x1049 fmt 28 (res #007, MSAA depth #008). Every frame the title resolves it (ResolveSubresource, Xbox cmdlist slot 19) into one of 3 rotating 1904x1041 present buffers. The sizes differ, so resolve_x.rs issues PC ResolveSubresourceRegion [0,0,1904,1041] instead (slot 64 on the real PC list, which is correct).
+  - What reads back: all 3 present buffers and the non-MSAA 1920x1049 target #005 are black, yet a menu frame does reach the screen now and then.
+  - Suspect 1: the size mismatch itself. The title created its present buffers at 1904x1041 and its render targets at the 1920x1049 window client size, so it saw a window resize between the two (window clamp / fit_window_to_aspect). On a console the output size never changes.
+  - Suspect 2: resolve states. Present buffers record COMMON (state 0x0), the source records RESOLVE_SOURCE.
+  - Next: dump the MSAA source (rtcap skips multisampled targets), and run once with the window size held fixed so both sizes match.
+  - Note: TOMBOX_PRESENT_PROBE=30 always samples the same one of the 3 present buffers (30 is a multiple of 3); use a period that is not a multiple of 3.
+  - Suspect 3: Minecraft Maps all 3 present buffers (map_x: committed RT textures given console CPU memory, served through the placed-texture uploader). The uploader logs them as "NOT mirrored (render target)", so CPU zeros should not overwrite the resolve, but this path is not ruled out.
+
+### Update 2026-11-22 10:07 (Trackmania hang agent)
+- Trackmania Training: still DEVICE_HUNG in the first lighting PS draw (f861c56a34758d84, VS 5cba0860bcfa69b1), with no page fault.
+- What the cb13 values do:
+  - TOMBOX_CBRAW_CLAMP=13:z keeps every cb13 read but zeroes the values. That run has no hang but is black (fast_20261122_100442_trackmania_cbtouch).
+  - Zeroing past 0x470 does not help (cbclamp).
+  - So the constant VALUES drive the hang, not the memory read.
+  - But a single dispatcher loop capped at 64 steps, with all vector reads dropped, still hangs (dropall64).
+  - Open question: which bounded path hangs. Next step: WARP one-draw replay with the real cb13 bytes.
+- Console behaviour gap, root CBV inheritance:
+  - Many draws use a root signature whose b13 root CBV was never set after the last SetGraphicsRootSignature. Seen with TOMBOX_CBRAW_CHECK=1 in fast_20261122_095850_trackmania_rsunset.
+  - On the console the user-data registers keep their values; on PC the bindings are undefined.
+  - cbv_raw::install_draw_check re-applies the value last set at each param index. It is opt-in with TOMBOX_CBRAW_INHERIT=1 and not yet proven. It does not fix the hang (fast_20261122_100119_trackmania_a6f3c23d).
+- gpu_va gap: many root CBV VAs (0x80xxxxx..0x82xxxxx) are missing from gpu_va's GPU ranges, while bindtrace finds them inside buffer 0x67bf6e80. The overlap eviction in gpu_va::insert_into may be dropping big buffers.

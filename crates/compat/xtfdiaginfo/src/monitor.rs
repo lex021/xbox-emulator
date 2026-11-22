@@ -18,6 +18,7 @@ pub const THREAD_MODE_BACKGROUND_BEGIN: i32 = 0x10000;
 pub trait OperationService: Sync {
     unsafe fn route(&self, op: u32, body: Obj, response: *mut Obj) -> HRESULT;
     unsafe fn check_pending(&self) -> HRESULT;
+    unsafe fn thread_start(&self) {}
 }
 
 pub fn pipe_name(pid: u32) -> Vec<u16> {
@@ -155,6 +156,7 @@ impl OperationRequestMonitor {
     }
 
     pub unsafe fn run(&mut self) -> u32 {
+        self.service.thread_start();
         SetThreadPriority(self.thread, THREAD_MODE_BACKGROUND_BEGIN);
         self.create_pipe();
         let hr = self.service.check_pending();

@@ -50,4 +50,41 @@ fn main() {
     };
     let code = compiled.unwrap_or_else(|e| checked_in(&dir, &e));
     std::fs::write(&out, code).expect("write query_accum.dxil");
+    translator_hash();
+}
+
+fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect(&p, out);
+        } else {
+            out.push(p);
+        }
+    }
+}
+
+fn translator_hash() {
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let xshader = manifest.join("..").join("..").join("tombox-xshader");
+    let mut files = Vec::new();
+    collect(&xshader.join("src"), &mut files);
+    files.push(xshader.join("Cargo.toml"));
+    for f in ["shader_xlat.rs", "cbv_raw.rs", "mip_bind.rs", "global_bind.rs", "centroid_bind.rs", "xlat_index.rs"] {
+        files.push(manifest.join("src").join(f));
+    }
+    files.sort();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for f in &files {
+        println!("cargo:rerun-if-changed={}", f.display());
+        let Ok(data) = std::fs::read(f) else { continue };
+        let name = f.strip_prefix(&manifest.join("..").join("..")).unwrap_or(f).to_string_lossy().replace('\\', "/");
+        for b in name.bytes().chain(data.into_iter().filter(|&b| b != b'\r')) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    println!("cargo:rerun-if-changed={}", xshader.join("src").display());
+    println!("cargo:rustc-env=TOMBOX_XLAT_SRC_HASH={h:016x}");
 }

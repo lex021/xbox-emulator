@@ -97,6 +97,19 @@ fn budget() -> std::time::Duration {
     std::time::Duration::from_micros(*B.get_or_init(|| std::env::var("TOMBOX_PSO_ASYNC_MS").ok().and_then(|v| v.parse::<f64>().ok()).map(|ms| (ms * 1000.0) as u64).unwrap_or(12_000)))
 }
 
+fn bind_wait() -> bool {
+    static B: OnceLock<bool> = OnceLock::new();
+    *B.get_or_init(|| {
+        let on = std::env::var("TOMBOX_PSO_BIND_WAIT").map(|v| v != "0").unwrap_or(true);
+        record("d3d12_xs", "pso_async", if on {
+            "bind wait on (default): a graphics placeholder's first bind waits for its real PSO like compute does, so no draw is skipped (TOMBOX_PSO_BIND_WAIT=0 restores draw-nothing graphics placeholders)"
+        } else {
+            "bind wait off (TOMBOX_PSO_BIND_WAIT=0): graphics placeholders draw nothing until their real PSO is ready"
+        });
+        on
+    })
+}
+
 type Job = Box<dyn FnOnce() + Send>;
 
 fn pool() -> &'static Mutex<std::sync::mpsc::Sender<Job>> {
@@ -321,7 +334,7 @@ unsafe extern "system" fn watch_rel(this: *mut Watch) -> u32 {
 
 fn placeholder_destroyed(key: usize) {
     crate::dred_marks::forget(key);
-    let Some(slot) = map().lock().unwrap_or_else(|e| e.into_inner()).remove(&key) else { return };
+    let Some(slot) = crate::frame_ev::lock(map()).remove(&key) else { return };
     LIVE.fetch_sub(1, Ordering::Relaxed);
     let mut g = slot.st.lock().unwrap_or_else(|e| e.into_inner());
     if g.finished {
@@ -481,7 +494,7 @@ unsafe fn launch(this: *mut DeviceWrapper, owned: Owned, num_ext: u32, riid: *co
     g.detached = true;
     drop(g);
     crate::dred_marks::note(ph, marks, true);
-    map().lock().unwrap_or_else(|e| e.into_inner()).insert(ph as usize, slot.clone());
+    crate::frame_ev::lock(map()).insert(ph as usize, slot.clone());
     LIVE.fetch_add(1, Ordering::Relaxed);
     if !unsafe { watch(ph) } {
         static WF: AtomicUsize = AtomicUsize::new(0);
@@ -493,6 +506,7 @@ unsafe fn launch(this: *mut DeviceWrapper, owned: Owned, num_ext: u32, riid: *co
     if n <= 40 || n % 100 == 0 {
         record("d3d12_xs", "pso_async", &format!("{kind:?} PSO #{n} not ready after {:.0} ms: placeholder {ph:p} returned, real PSO keeps building in the background (inline {})", budget().as_secs_f64() * 1000.0, INLINE_N.load(Ordering::Relaxed)));
     }
+    crate::frame_ev::mark_async();
     unsafe { *ppv = ph };
     Some(0)
 }
@@ -501,14 +515,15 @@ pub fn swap(p: *mut c_void) -> *mut c_void {
     if p.is_null() || LIVE.load(Ordering::Relaxed) == 0 {
         return p;
     }
-    let slot = map().lock().unwrap_or_else(|e| e.into_inner()).get(&(p as usize)).cloned();
+    let slot = crate::frame_ev::lock(map()).get(&(p as usize)).cloned();
     let Some(slot) = slot else { return p };
     let r = slot.real.load(Ordering::Acquire);
     if r != 0 {
         SWAPPED_BINDS.fetch_add(1, Ordering::Relaxed);
         return r as *mut c_void;
     }
-    if slot.kind == Kind::Compute {
+    if slot.kind == Kind::Compute || bind_wait() {
+        let _ev = crate::frame_ev::begin(crate::frame_ev::PSO_BIND);
         let t0 = std::time::Instant::now();
         let mut g = slot.st.lock().unwrap_or_else(|e| e.into_inner());
         while !g.finished {
@@ -519,7 +534,7 @@ pub fn swap(p: *mut c_void) -> *mut c_void {
         if ms > 5.0 {
             static W: AtomicUsize = AtomicUsize::new(0);
             if W.fetch_add(1, Ordering::Relaxed) < 20 {
-                record("d3d12_xs", "pso_async", &format!("first bind of a compute PSO waited {ms:.0} ms for its background build (dispatches are never skipped)"));
+                record("d3d12_xs", "pso_async", &format!("first bind of a {:?} PSO waited {ms:.0} ms for its background build (draws and dispatches are never skipped)", slot.kind));
             }
         }
         if g.real != 0 {
@@ -535,8 +550,9 @@ pub fn wait_real(p: *mut c_void) -> *mut c_void {
     if p.is_null() || LIVE.load(Ordering::Relaxed) == 0 {
         return p;
     }
-    let slot = map().lock().unwrap_or_else(|e| e.into_inner()).get(&(p as usize)).cloned();
+    let slot = crate::frame_ev::lock(map()).get(&(p as usize)).cloned();
     let Some(slot) = slot else { return p };
+    let _ev = crate::frame_ev::begin(crate::frame_ev::PSO_BIND);
     let t0 = std::time::Instant::now();
     let mut g = slot.st.lock().unwrap_or_else(|e| e.into_inner());
     while !g.finished {
@@ -553,7 +569,7 @@ pub fn wait_real(p: *mut c_void) -> *mut c_void {
 }
 
 pub fn summary() -> String {
-    format!("async {} inline {} live {} pending binds {} swapped binds {} late failures {} compute first-bind wait {:.0} ms", ASYNC_N.load(Ordering::Relaxed), INLINE_N.load(Ordering::Relaxed), LIVE.load(Ordering::Relaxed), PENDING_BINDS.load(Ordering::Relaxed), SWAPPED_BINDS.load(Ordering::Relaxed), LATE_FAIL.load(Ordering::Relaxed), COMPUTE_WAIT_US.load(Ordering::Relaxed) as f64 / 1000.0)
+    format!("async {} inline {} live {} pending binds {} swapped binds {} late failures {} first-bind wait {:.0} ms", ASYNC_N.load(Ordering::Relaxed), INLINE_N.load(Ordering::Relaxed), LIVE.load(Ordering::Relaxed), PENDING_BINDS.load(Ordering::Relaxed), SWAPPED_BINDS.load(Ordering::Relaxed), LATE_FAIL.load(Ordering::Relaxed), COMPUTE_WAIT_US.load(Ordering::Relaxed) as f64 / 1000.0)
 }
 
 unsafe extern "system" fn set_pso(list: *mut c_void, pso: *mut c_void) {

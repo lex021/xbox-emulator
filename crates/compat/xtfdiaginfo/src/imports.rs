@@ -11,6 +11,10 @@ pub type LogVFn = unsafe extern "C" fn(*const u8, *mut u8);
 pub type InstanceFn = unsafe extern "C" fn() -> *mut c_void;
 pub type GetLoggingFn = unsafe extern "C" fn(*mut c_void, *mut u32, *mut WString, *mut u8) -> HRESULT;
 pub type SetLoggingFn = unsafe extern "C" fn(*mut c_void, *const u32, *const u16, *const u8) -> HRESULT;
+pub type LinkCreateFn = unsafe extern "C" fn() -> *mut u8;
+pub type LinkConnectByNameFn = unsafe extern "C" fn(*mut u8, *const u16, u16, u32) -> HRESULT;
+pub type LinkQueryFn = unsafe extern "C" fn(*mut u8, u32, u32, *mut u8) -> HRESULT;
+pub type LinkCloseFn = unsafe extern "C" fn(*mut u8);
 
 #[derive(Clone, Copy)]
 pub struct Imports {
@@ -27,6 +31,10 @@ pub struct Imports {
     pub logging_instance: InstanceFn,
     pub get_logging_properties: GetLoggingFn,
     pub set_logging_properties: SetLoggingFn,
+    pub link_create_handle: LinkCreateFn,
+    pub link_connect_by_name: LinkConnectByNameFn,
+    pub link_query_handle_information: LinkQueryFn,
+    pub link_close_handle: LinkCloseFn,
 }
 
 static IMPORTS: OnceLock<Result<Imports, HRESULT>> = OnceLock::new();
@@ -77,6 +85,10 @@ fn load() -> Result<Imports, HRESULT> {
             logging_instance: proc_addr(b, "?Instance@LoggingManager@xtfbaseservices@@SAAEAV12@XZ")?,
             get_logging_properties: proc_addr(b, "?GetLoggingProperties@LoggingManager@xtfbaseservices@@QEAAJAEAW4eLoggingLevel@log@xtfbase@@AEAV?$basic_string@GU?$char_traits@G@std@@V?$allocator@G@2@@std@@AEA_N@Z")?,
             set_logging_properties: proc_addr(b, "?SetLoggingProperties@LoggingManager@xtfbaseservices@@QEAAJPEAW4eLoggingLevel@log@xtfbase@@PEBGPEA_N@Z")?,
+            link_create_handle: proc_addr(x, "XbtpLinkCreateHandle")?,
+            link_connect_by_name: proc_addr(x, "XbtpLinkConnectByName")?,
+            link_query_handle_information: proc_addr(x, "XbtpLinkQueryHandleInformation")?,
+            link_close_handle: proc_addr(x, "XbtpLinkCloseHandle")?,
         })
     }
 }

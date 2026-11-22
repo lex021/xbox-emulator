@@ -57,6 +57,7 @@ struct Target {
     order: usize,
 }
 static TARGETS: Mutex<Vec<Target>> = Mutex::new(Vec::new());
+static SRV_SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// Last known state per resource (from creation, then the title's transition barriers).
 static STATES: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
 
@@ -220,6 +221,15 @@ fn write_bmp(path: &std::path::Path, w: usize, h: usize, rgb: &[u8]) {
     let _ = std::fs::write(path, f);
 }
 
+struct Released(*mut c_void);
+
+impl Drop for Released {
+    fn drop(&mut self) {
+        let r = self.0;
+        unsafe { vcall!(r, 2, fn() -> u32) };
+    }
+}
+
 fn barrier(res: usize, before: u32, after: u32) -> [u64; 4] {
     [0, res as u64, 0xffff_ffffu64 | ((before as u64) << 32), after as u64]
 }
@@ -274,7 +284,18 @@ pub unsafe fn maybe_capture(queue: *mut c_void, presented: *mut c_void) {
     vcall!(list, 9, fn() -> i32);
     let mut fence_value = 0u64;
 
-    let targets: Vec<(usize, [u8; 0x38], usize)> = TARGETS.lock().unwrap().iter().map(|t| (t.res, t.desc, t.order)).collect();
+    let mut targets: Vec<(usize, [u8; 0x38], usize)> = TARGETS.lock().unwrap().iter().map(|t| (t.res, t.desc, t.order)).collect();
+    for (i, r) in SRV_SEEN.lock().unwrap().iter().enumerate() {
+        if targets.iter().any(|t| t.0 == *r) {
+            continue;
+        }
+        let mut d = [0u8; 0x38];
+        let p = *r as *mut c_void;
+        vcall!(p, 10, fn(*mut u8) -> *mut u8, d.as_mut_ptr());
+        if u32::from_le_bytes(d[0..4].try_into().unwrap()) == 3 {
+            targets.push((*r, d, 900 + i));
+        }
+    }
     let states = STATES.lock().unwrap().clone().unwrap_or_default();
     let _ = writeln!(report, "{} render-target/depth textures known", targets.len());
     let presented_order = targets.iter().find(|t| t.0 == presented as usize).map(|t| format!("#{:03}", t.2)).unwrap_or_else(|| format!("{presented:p}"));
@@ -291,13 +312,55 @@ pub unsafe fn maybe_capture(queue: *mut c_void, presented: *mut c_void) {
             let _ = writeln!(report, "{head}: format not decoded - skipped");
             continue;
         };
-        if samples != 1 || w == 0 || h == 0 {
-            let _ = writeln!(report, "{head}: multisampled/empty - skipped");
+        if w == 0 || h == 0 || (samples != 1 && flags & 0x2 != 0) {
+            let _ = writeln!(report, "{head}: multisampled depth/empty - skipped");
             continue;
         }
-        let r = res as *mut c_void;
+        let msaa = res as *mut c_void;
         let mut pc_desc = [0u8; 0x38];
-        vcall!(r, 10, fn(*mut u8) -> *mut u8, pc_desc.as_mut_ptr());
+        vcall!(msaa, 10, fn(*mut u8) -> *mut u8, pc_desc.as_mut_ptr());
+        let (res, state, resolved) = if samples != 1 {
+            const RESOLVE_DEST: u32 = 0x1000;
+            const RESOLVE_SOURCE: u32 = 0x2000;
+            pc_desc[0x08..0x10].fill(0);
+            pc_desc[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            pc_desc[0x28..0x2c].copy_from_slice(&0u32.to_le_bytes());
+            let dheap: [u32; 5] = [1, 0, 0, 1, 1];
+            let mut tmp: *mut c_void = core::ptr::null_mut();
+            let hr = vcall!(device, 27, fn(*const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32,
+                dheap.as_ptr(), 0, pc_desc.as_ptr(), RESOLVE_DEST, core::ptr::null(), &IID_RESOURCE, &mut tmp);
+            if hr < 0 || tmp.is_null() {
+                let _ = writeln!(report, "{head}: multisampled ({samples}x), resolve texture failed hr={hr:#010x} - skipped");
+                continue;
+            }
+            vcall!(alloc, 8, fn() -> i32);
+            vcall!(list, 10, fn(*mut c_void, *mut c_void) -> i32, alloc, core::ptr::null_mut());
+            if state != RESOLVE_SOURCE {
+                let b = [barrier(res, state, RESOLVE_SOURCE)];
+                vcall!(list, 26, fn(u32, *const [u64; 4]) -> (), 1, b.as_ptr());
+            }
+            let pc_fmt = match u32::from_le_bytes(pc_desc[0x20..0x24].try_into().unwrap()) { 1 | 5 | 9 | 15 | 19 | 22 | 23 | 27 | 39 | 44 | 46 | 48 | 53 | 59 | 72 | 75 | 78 | 87 | 90 | 92 | 94 | 97 => fmt, f => f };
+            vcall!(list, 19, fn(*mut c_void, u32, *mut c_void, u32, u32) -> (), tmp, 0, msaa, 0, pc_fmt);
+            if state != RESOLVE_SOURCE {
+                let b = [barrier(res, RESOLVE_SOURCE, state)];
+                vcall!(list, 26, fn(u32, *const [u64; 4]) -> (), 1, b.as_ptr());
+            }
+            vcall!(list, 9, fn() -> i32);
+            let lists = [list];
+            vcall!(queue, 10, fn(u32, *const *mut c_void) -> (), 1, lists.as_ptr());
+            fence_value += 1;
+            vcall!(queue, 14, fn(*mut c_void, u64) -> i32, fence, fence_value);
+            let mut spins = 0;
+            while vcall!(fence, 8, fn() -> u64) < fence_value && spins < 5000 {
+                Sleep(1);
+                spins += 1;
+            }
+            (tmp as usize, RESOLVE_DEST, Some(Released(tmp)))
+        } else {
+            (res, state, None)
+        };
+        let _keep = resolved;
+        let head = if samples != 1 { format!("{head} msaa{samples}x->resolved") } else { head };
         let mut fp = [0u8; 32];
         let (mut rows, mut row_size, mut total) = (0u32, 0u64, 0u64);
         vcall!(device, 38, fn(*const u8, u32, u32, u64, *mut [u8; 32], *mut u32, *mut u64, *mut u64) -> (),
@@ -584,6 +647,17 @@ pub fn trace_draw(list: usize, compute: bool, text: &str) {
         let rts: Vec<String> = rtv.iter().map(|r| if *r == 0 { "-".into() } else { name(*r) }).collect();
         let ds = if dsv == 0 { "-".to_string() } else { name(dsv) };
         let b = unsafe { crate::bindtrace::dump(list, compute, &name) };
+        {
+            let mut seen = SRV_SEEN.lock().unwrap();
+            for part in b.split("SRV res 0x").skip(1) {
+                let hex: String = part.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+                if let Ok(r) = usize::from_str_radix(&hex, 16) {
+                    if r != 0 && !seen.contains(&r) && seen.len() < 16 {
+                        seen.push(r);
+                    }
+                }
+            }
+        }
         record("d3d12_xs", "drawtrace", &format!("{l} rt=[{}] ds={ds}\n{b}", rts.join(" | ")));
     }
 }

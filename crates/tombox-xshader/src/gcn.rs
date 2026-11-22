@@ -158,6 +158,8 @@ enum Vop2Map {
     Vop3(u32),
     Vop3Swap(u32),
     Vop3Carry(u32),
+    Legacy(bool),
+    PkU8,
 }
 
 fn vop2_map(op: u32) -> Result<Vop2Map, String> {
@@ -182,9 +184,9 @@ fn vop2_map(op: u32) -> Result<Vop2Map, String> {
         0x2e => Vop3(0x369),
         0x30 => Vop3(0x36a),
         0x31 => Vop3(0x36b),
-        0x0d => return Err("v_min_legacy_f32 (gfx7 VOP2 0x0d) has no RDNA2 equivalent yet".into()),
-        0x0e => return Err("v_max_legacy_f32 (gfx7 VOP2 0x0e) has no RDNA2 equivalent yet".into()),
-        0x2c => return Err("v_cvt_pkaccum_u8_f32 (gfx7 VOP2 0x2c) has no RDNA2 equivalent yet".into()),
+        0x0d => Legacy(false),
+        0x0e => Legacy(true),
+        0x2c => PkU8,
         _ => return Err(format!("gfx7 VOP2 opcode {op:#x} is not defined")),
     })
 }
@@ -269,6 +271,28 @@ fn mtbuf_format(dfmt: u32, nfmt: u32) -> Option<u32> {
         .map(|i| i as u32)
 }
 
+fn legacy_minmax(max: bool, vdst: u32, src0: u32, src1: u32, lit: Option<u32>) -> Result<Vec<u32>, String> {
+    let which = if max { "v_max_legacy_f32" } else { "v_min_legacy_f32" };
+    if vdst > 255 {
+        return Err(format!("{which} destination {vdst} is not a VGPR"));
+    }
+    if matches!(src0, 104 | 105) || matches!(src1, 104 | 105) {
+        return Err(format!("{which} source aliases s104:s105, which hold the compare"));
+    }
+    let mut out = Vec::new();
+    let with_lit = |out: &mut Vec<u32>, words: [u32; 2], srcs: &[u32]| -> Result<(), String> {
+        out.extend_from_slice(&words);
+        if srcs.iter().any(|&s| s == 255) {
+            out.push(lit.ok_or_else(|| format!("{which} literal source is missing"))?);
+        }
+        Ok(())
+    };
+    let cmp = if max { 6 } else { 1 };
+    with_lit(&mut out, vop3(cmp, 104, 0, 0, [src0, src1, 128], 0, 0), &[src0, src1])?;
+    with_lit(&mut out, vop3(0x101, vdst, 0, 0, [src1, src0, 104], 0, 0), &[src0, src1])?;
+    Ok(out)
+}
+
 fn is_branch(w: u32) -> bool {
     classify(w) == Enc::Sopp && matches!((w >> 16) & 0x7f, 0x02 | 0x04..=0x09)
 }
@@ -344,6 +368,12 @@ fn convert(ins: &Insn) -> Result<Vec<u32>, String> {
                     v.extend(lit);
                     v
                 }
+                Vop2Map::Legacy(max) => legacy_minmax(max, vdst, src0, vsrc1, lit).map_err(&err)?,
+                Vop2Map::PkU8 => {
+                    let mut v = vop3(0x15e, vdst, 0, 0, [src0, vsrc1, 256 + vdst], 0, 0).to_vec();
+                    v.extend(lit);
+                    v
+                }
             }
         }
         Enc::Vop1 => {
@@ -384,6 +414,24 @@ fn convert(ins: &Insn) -> Result<Vec<u32>, String> {
                             vop3(n, vdst, a, clamp, [s[1], s[0], s[2]], omod, ng).to_vec()
                         }
                         Vop2Map::Vop3Carry(n) => vop3b(n, vdst, sdst, 0, s, omod, neg).to_vec(),
+                        Vop2Map::Legacy(max) => {
+                            if abs | clamp | omod | neg != 0 {
+                                return Err(err(format!(
+                                    "{} modifiers are not supported",
+                                    if max { "v_max_legacy_f32" } else { "v_min_legacy_f32" }
+                                )));
+                            }
+                            if s[0] == 255 || s[1] == 255 {
+                                return Err(err("v_min_legacy_f32 / v_max_legacy_f32 VOP3 literal source is not supported".into()));
+                            }
+                            legacy_minmax(max, vdst, s[0], s[1], None).map_err(&err)?
+                        }
+                        Vop2Map::PkU8 => {
+                            if clamp | omod != 0 || abs & 6 != 0 || neg & 6 != 0 {
+                                return Err(err("v_cvt_pkaccum_u8_f32 modifiers other than abs/neg on the float are not supported".into()));
+                            }
+                            vop3(0x15e, vdst, abs, 0, [s[0], s[1], 256 + vdst], 0, neg).to_vec()
+                        }
                     },
                 },
                 0x16d | 0x16e | 0x176 | 0x177 => vop3b(op, vdst, sdst, 0, s, omod, neg).to_vec(),
@@ -567,6 +615,7 @@ pub fn lower(code: &[u8], data: &[u8]) -> Result<Lowered, String> {
     let mut new_at: BTreeMap<usize, usize> = BTreeMap::new();
     let mut pcs = Vec::new();
     let mut expanded: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut legacy: Vec<std::ops::Range<usize>> = Vec::new();
     let mut pos = 0usize;
     for (k, ins) in insns.iter().enumerate() {
         match sop1_op(ins) {
@@ -584,6 +633,24 @@ pub fn lower(code: &[u8], data: &[u8]) -> Result<Lowered, String> {
         let v = convert(ins)?;
         if ins.enc == Enc::Mubuf && (ins.words[0] >> 15) & 1 != 0 {
             expanded.push(pos..pos + v.len());
+        }
+        let is_legacy = match ins.enc {
+            Enc::Vop2 => matches!((ins.words[0] >> 25) & 0x3f, 0x0d | 0x0e),
+            Enc::Vop3 => matches!((ins.words[0] >> 17) & 0x1ff, 0x10d | 0x10e),
+            _ => false,
+        };
+        if is_legacy {
+            legacy.push(pos..pos + v.len());
+            let max = match ins.enc {
+                Enc::Vop2 => (ins.words[0] >> 25) & 0x3f == 0x0e,
+                Enc::Vop3 => (ins.words[0] >> 17) & 0x1ff == 0x10e,
+                _ => false,
+            };
+            notes.push(format!(
+                "{} at {:#x}: compare/select, so a NaN in source 1 stays NaN",
+                if max { "v_max_legacy_f32" } else { "v_min_legacy_f32" },
+                ins.offset
+            ));
         }
         pos += v.len();
         out.push(v);
@@ -637,6 +704,21 @@ pub fn lower(code: &[u8], data: &[u8]) -> Result<Lowered, String> {
             }
         }
         notes.push(format!("{} MUBUF addr64 access(es) lowered to GLOBAL through v{ADDR64_LO}:v{ADDR64_HI}", expanded.len()));
+    }
+    if !legacy.is_empty() {
+        use crate::rdna2::Opnd;
+        for i in crate::rdna2::disassemble(&isa[..code_len]) {
+            if legacy.iter().any(|r| r.contains(&(i.offset / 4))) {
+                continue;
+            }
+            let clash = i.src.iter().chain(i.dst.iter()).any(|o| matches!(o, Opnd::Sgpr(104 | 105)));
+            if clash {
+                return Err(format!(
+                    "gfx7 legacy min/max writes its compare into s104:s105 but {} at lowered {:#x} uses them",
+                    i.mnemonic, i.offset
+                ));
+            }
+        }
     }
     isa.extend_from_slice(&tail);
     Ok(Lowered { isa, code_len, notes })
@@ -701,6 +783,7 @@ pub fn extract_durango(
         isa: lowered.isa[..lowered.code_len].to_vec(),
         isa_offset_in_fssm: d.code_start,
         isa_preamble: thread_group(&d, stage),
+        psv_numthreads: if stage == crate::Stage::Compute { body(b"PSV0").and_then(crate::meta::parse_psv0_cs_threads) } else { None },
         isa_data: lowered.isa,
         has_input_sig: container.chunk(b"ISG1").is_some() || container.chunk(b"ISGN").is_some(),
         has_output_sig: container.chunk(b"OSG1").is_some() || container.chunk(b"OSGN").is_some(),
@@ -874,6 +957,117 @@ mod tests {
         assert_eq!(words(&l.isa), [0xbe802100, 0xbe840303, 0xbe850380, 0xbf810000]);
         let d = crate::rdna2::disassemble(&l.isa);
         assert_eq!(d[0].mnemonic, "s_swappc_b64");
+    }
+
+    fn legacy_word(op: u32, vdst: u32, vsrc1: u32, src0: u32) -> u32 {
+        (op << 25) | (vdst << 17) | (vsrc1 << 9) | src0
+    }
+
+    fn pk_word(op: u32, vdst: u32, vsrc1: u32, src0: u32) -> u32 {
+        (op << 25) | (vdst << 17) | (vsrc1 << 9) | src0
+    }
+
+    fn translate_lowered(isa: &[u8]) -> Result<String, String> {
+        let ex = crate::ShaderExtract {
+            stage: crate::Stage::Compute,
+            shader_model: (6, 0),
+            bitcode_stripped: true,
+            fssm: Vec::new(),
+            entry: Some("main".into()),
+            isa: isa.to_vec(),
+            isa_offset_in_fssm: 0,
+            isa_preamble: [0, 1, 1, 1],
+            psv_numthreads: None,
+            isa_data: isa.to_vec(),
+            has_input_sig: false,
+            has_output_sig: false,
+            has_psv0: false,
+            has_root_sig: false,
+            input_sig: Vec::new(),
+            output_sig: Vec::new(),
+            resources: Vec::new(),
+            gs_info: None,
+            root_sig: None,
+        };
+        crate::hlsl::translate(&ex).map(|t| t.hlsl)
+    }
+
+    #[test]
+    fn legacy_min_returns_source1_when_source1_is_nan() {
+        let op = legacy_word(0x0d, 1, 2, 256);
+        let l = to_rdna2(&bytes(&[op, 0xbf810000])).unwrap();
+        let d = crate::rdna2::disassemble(&l.isa[..l.code_len]);
+        let names: Vec<_> = d.iter().map(|i| i.mnemonic.as_str()).collect();
+        assert_eq!(names, ["v_cmp_lt_f32", "v_cndmask_b32", "s_endpgm"]);
+        use crate::rdna2::Opnd;
+        assert_eq!(d[0].dst, vec![Opnd::Sgpr(104)]);
+        assert_eq!(d[1].src, vec![Opnd::Vgpr(2), Opnd::Vgpr(0), Opnd::Sgpr(104)]);
+        let h = translate_lowered(&l.isa[..l.code_len]).unwrap();
+        assert!(h.contains("asfloat(v0) < asfloat(v2)"), "{h}");
+        assert!(h.contains("? v0 : v2"), "{h}");
+        assert!(!h.contains("min(asfloat(v0)"), "{h}");
+        let skipped = to_rdna2(&bytes(&[0xbf820001, op, 0xbf810000])).unwrap();
+        let w = words(&skipped.isa);
+        assert_eq!(w[0] & 0xffff, (w.len() - 2) as u32);
+        assert_eq!(w[w.len() - 1], 0xbf810000);
+        let vop3 = [0xd21a_0001, 256 | (258 << 9)];
+        let l = to_rdna2(&bytes(&[vop3[0], vop3[1], 0xbf810000])).unwrap();
+        let names: Vec<_> = crate::rdna2::disassemble(&l.isa[..l.code_len]).into_iter().map(|i| i.mnemonic).collect();
+        assert_eq!(names, ["v_cmp_lt_f32", "v_cndmask_b32", "s_endpgm"]);
+        let e = to_rdna2(&bytes(&[vop3[0] | 0x100, vop3[1], 0xbf810000])).unwrap_err();
+        assert!(e.contains("modifiers"), "{e}");
+    }
+
+    #[test]
+    fn legacy_max_tie_of_signed_zero_keeps_source0() {
+        let op = legacy_word(0x0e, 1, 2, 256);
+        let l = to_rdna2(&bytes(&[op, 0xbf810000])).unwrap();
+        let d = crate::rdna2::disassemble(&l.isa[..l.code_len]);
+        let names: Vec<_> = d.iter().map(|i| i.mnemonic.as_str()).collect();
+        assert_eq!(names, ["v_cmp_ge_f32", "v_cndmask_b32", "s_endpgm"]);
+        use crate::rdna2::Opnd;
+        assert_eq!(d[0].dst, vec![Opnd::Sgpr(104)]);
+        assert_eq!(d[1].src, vec![Opnd::Vgpr(2), Opnd::Vgpr(0), Opnd::Sgpr(104)]);
+        let h = translate_lowered(&l.isa[..l.code_len]).unwrap();
+        assert!(h.contains("asfloat(v0) >= asfloat(v2)"), "{h}");
+        assert!(h.contains("? v0 : v2"), "{h}");
+        assert!(!h.contains("max(asfloat(v0)"), "{h}");
+        assert!(!h.contains("v254"), "{h}");
+        let lit = legacy_word(0x0d, 1, 2, 255);
+        let l = to_rdna2(&bytes(&[lit, 0x7fc0_0000, 0xbf810000])).unwrap();
+        let h = translate_lowered(&l.isa[..l.code_len]).unwrap();
+        assert!(h.contains("asfloat(0x7fc00000u) < asfloat(v2)"), "{h}");
+        assert!(h.contains("? 0x7fc00000u : v2"), "{h}");
+    }
+
+    #[test]
+    fn legacy_minmax_refuses_to_clobber_a_live_scratch_register() {
+        let op = legacy_word(0x0d, 1, 2, 256);
+        let e = to_rdna2(&bytes(&[0xbee80380, op, 0xbf810000])).unwrap_err();
+        assert!(e.contains("s104"), "{e}");
+    }
+
+    #[test]
+    fn pkaccum_u8_updates_the_byte_selected_by_its_integer_source() {
+        let op = pk_word(0x2c, 1, 2, 256);
+        let l = to_rdna2(&bytes(&[op, 0xbf810000])).unwrap();
+        let d = crate::rdna2::disassemble(&l.isa[..l.code_len]);
+        assert_eq!(d[0].mnemonic, "v_cvt_pk_u8_f32");
+        use crate::rdna2::Opnd;
+        assert_eq!(d[0].src, vec![Opnd::Vgpr(0), Opnd::Vgpr(2), Opnd::Vgpr(1)]);
+        assert_eq!(d[0].dst, vec![Opnd::Vgpr(1)]);
+        let h = translate_lowered(&l.isa[..l.code_len]).unwrap();
+        assert!(h.contains("((v2) & 3u) * 8u"), "{h}");
+        assert!(h.contains("((v1) & ~(0xffu <<"), "{h}");
+        assert!(h.contains("clamp(tb_rne("), "{h}");
+        assert!(h.contains("tb_nan("), "{h}");
+        let vop3 = [0xd000_0001 | (0x12c << 17), 256 | (258 << 9)];
+        let e = to_rdna2(&bytes(&[vop3[0] | (1 << 11), vop3[1], 0xbf810000])).unwrap_err();
+        assert!(e.contains("modifiers"), "{e}");
+        let l = to_rdna2(&bytes(&[vop3[0], vop3[1], 0xbf810000])).unwrap();
+        let d = crate::rdna2::disassemble(&l.isa[..l.code_len]);
+        assert_eq!(d[0].mnemonic, "v_cvt_pk_u8_f32");
+        assert_eq!(d[0].src, vec![Opnd::Vgpr(0), Opnd::Vgpr(2), Opnd::Vgpr(1)]);
     }
 
     #[test]

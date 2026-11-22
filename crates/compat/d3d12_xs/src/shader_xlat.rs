@@ -189,6 +189,9 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Input
             dump_failure(hash, blob, None, &e);
             format!("bind: {e}")
         })?;
+        if let Some((slot, lim)) = crate::cbv_raw::clamp_knob() {
+            t.hlsl = crate::cbv_raw::clamp_reads(&t.hlsl, slot, lim);
+        }
     }
     let needs = crate::mip_bind::Needs::of(&t);
     crate::mip_bind::note(hash, &needs);
@@ -205,6 +208,28 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Input
     if let Ok(h) = std::fs::read_to_string(std::env::temp_dir().join("tombox_shader_override").join(format!("{hash:016x}.hlsl"))) {
         record("d3d12_xs", "shader_xlat", &format!("OVERRIDE: hash={hash:016x} uses hand-edited HLSL ({} bytes)", h.len()));
         t.hlsl = h;
+    }
+    if stub_hashes().contains(&hash) {
+        if let Some(k) = t.hlsl.find(" o = (SOut)0;") {
+            let e = k + t.hlsl[k..].find('\n').map_or(0, |x| x + 1);
+            t.hlsl.insert_str(e, "    return o;\n");
+            record("d3d12_xs", "shader_xlat", &format!("STUB: hash={hash:016x} returns its zeroed outputs (TOMBOX_XS_STUB)"));
+        }
+    }
+    if let Some(&(_, lo, hi)) = drop_reads().iter().find(|(h, _, _)| *h == hash) {
+        let (out, n) = drop_read_lines(&t.hlsl, lo, hi);
+        t.hlsl = out;
+        record("d3d12_xs", "shader_xlat", &format!("DROP: hash={hash:016x} dropped {n} memory reads in ISA {lo:#06x}..={hi:#06x} (TOMBOX_XS_DROP)"));
+    }
+    if let Some(&(_, off)) = stub_at().iter().find(|(h, _)| *h == hash) {
+        let tag = format!("// {off:#06x} ");
+        if let Some(k) = t.hlsl.find(&tag) {
+            let ls = t.hlsl[..k].rfind('\n').map_or(0, |x| x + 1);
+            t.hlsl.insert_str(ls, "    return o;\n");
+            record("d3d12_xs", "shader_xlat", &format!("STUB_AT: hash={hash:016x} returns before ISA {off:#06x} (TOMBOX_XS_STUB_AT)"));
+        } else {
+            record("d3d12_xs", "shader_xlat", &format!("STUB_AT: hash={hash:016x} has no ISA line {off:#06x}"));
+        }
     }
     t.hlsl = tombox_xshader::runtime_hlsl::finalize(&t.hlsl, rtfmt, loop_grad());
     // Compiler: DXC (SM6 DXIL) when dxcompiler.dll + dxil.dll are available, otherwise FXC
@@ -226,7 +251,10 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Input
             return Err("edited translation needs DXC".to_string());
         }
         let h = edit(&t.hlsl)?;
-        return tombox_xshader::dxc::compile(&h, &profile);
+        if !edited_pack() {
+            return tombox_xshader::dxc::compile(&h, &profile);
+        }
+        return tombox_xshader::shader_cache::compile_cached_with(&h, &profile, fma_mode(), &["edited-plain-compile"], || tombox_xshader::dxc::compile(&h, &profile)).map(|c| c.code);
     }
     if use_dxc {
         let xlat_ms = t_start.elapsed().as_secs_f64() * 1000.0;
@@ -463,8 +491,37 @@ fn write_atomic(p: &std::path::Path, data: &[u8]) {
 
 static PREWARMED: AtomicUsize = AtomicUsize::new(0);
 
+fn edited_pack() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        let on = std::env::var("TOMBOX_EDITED_PACK").map(|v| v != "0").unwrap_or(true);
+        record("d3d12_xs", "shader_xlat", if on { "edited variants (vs_snorm, ps depth/stencil, dbcount strip) are compiled through the shader pack keyed by their final HLSL (TOMBOX_EDITED_PACK=0 compiles them every time)" } else { "TOMBOX_EDITED_PACK=0: edited variants are compiled every time" });
+        on
+    })
+}
+
+fn index_ctx() -> &'static str {
+    static C: OnceLock<String> = OnceLock::new();
+    C.get_or_init(|| {
+        let f = fma_mode();
+        format!("dxc={} cbv_raw={} loop_grad={} fma={}{}{}{}", tombox_xshader::dxc::available(), crate::cbv_raw::enabled(), loop_grad(), f.preserve as u8, f.any as u8, f.hybrid as u8, f.f2h as u8)
+    })
+}
+
 fn produce(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, _key: u64) -> Result<Vec<u8>, String> {
-    let r = std::panic::catch_unwind(|| translate_uncached(blob, hash, rtfmt, link)).unwrap_or_else(|_| Err("translator panicked".to_string()));
+    let ik = crate::xlat_index::key(blob, hash, rtfmt, link, index_ctx());
+    let hit = ik.and_then(crate::xlat_index::get);
+    let r = match hit {
+        Some(v) => Ok(v),
+        None => {
+            let t0 = std::time::Instant::now();
+            let r = std::panic::catch_unwind(|| translate_uncached(blob, hash, rtfmt, link)).unwrap_or_else(|_| Err("translator panicked".to_string()));
+            if let (Some(k), Ok(v)) = (ik, &r) {
+                crate::xlat_index::put(k, v, t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            r
+        }
+    };
     if let Ok(v) = &r {
         crate::dbcount::note_translated(v, blob, hash, rtfmt);
         let sp = src_path(hash, rtfmt);
@@ -524,6 +581,28 @@ fn finish_with(res: Result<Vec<u8>, String>, hash: u64, len: usize, origin_blob:
 extern "system" {
     fn GetCurrentThread() -> *mut c_void;
     fn SetThreadPriority(h: *mut c_void, p: i32) -> i32;
+    fn GetThreadPriority(h: *mut c_void) -> i32;
+    fn GetCurrentThreadId() -> u32;
+    fn OpenThread(access: u32, inherit: i32, id: u32) -> *mut c_void;
+}
+
+const PREWARM_PRIORITY: i32 = -1;
+const THREAD_SET_QUERY: u32 = 0x0020 | 0x0040;
+static BOOSTS: AtomicUsize = AtomicUsize::new(0);
+
+fn prewarm_busy() -> &'static Mutex<HashMap<u64, usize>> {
+    static M: OnceLock<Mutex<HashMap<u64, usize>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn boost_prewarm(key: u64) {
+    let Some(h) = prewarm_busy().lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied() else { return };
+    let want = unsafe { GetThreadPriority(GetCurrentThread()) }.clamp(0, 2);
+    unsafe { SetThreadPriority(h as *mut c_void, want) };
+    let n = BOOSTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n % 50 == 0 {
+        record("d3d12_xs", "shader_xlat", &format!("a waiting thread boosted the prewarm worker translating key {key:016x} to priority {want} (#{n})"));
+    }
 }
 
 pub fn start_prewarm() {
@@ -568,7 +647,8 @@ pub fn start_prewarm() {
         for _ in 0..workers {
             let q = queue.clone();
             let _ = std::thread::Builder::new().name("tombox-shader-prewarm".into()).spawn(move || {
-                unsafe { SetThreadPriority(GetCurrentThread(), -2) };
+                unsafe { SetThreadPriority(GetCurrentThread(), PREWARM_PRIORITY) };
+                let me = unsafe { OpenThread(THREAD_SET_QUERY, 0, GetCurrentThreadId()) } as usize;
                 let t0 = std::time::Instant::now();
                 let mut done = 0usize;
                 loop {
@@ -584,7 +664,15 @@ pub fn start_prewarm() {
                     let mut ran = false;
                     c.get_or_init(|| {
                         ran = true;
-                        finish(produce(&blob, h, &rt, &InputInterp::default(), key), h, blob.len(), &blob)
+                        if me != 0 {
+                            prewarm_busy().lock().unwrap_or_else(|e| e.into_inner()).insert(key, me);
+                        }
+                        let r = finish(produce(&blob, h, &rt, &InputInterp::default(), key), h, blob.len(), &blob);
+                        if me != 0 {
+                            prewarm_busy().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+                            unsafe { SetThreadPriority(GetCurrentThread(), PREWARM_PRIORITY) };
+                        }
+                        r
                     });
                     if ran {
                         done += 1;
@@ -665,6 +753,7 @@ pub unsafe fn translate_for_targets(ptr: *const u8, len: usize, rtfmt: [u8; 8], 
         }
     }
     let t0 = std::time::Instant::now();
+    boost_prewarm(key);
     let entry = c.get_or_init(|| crate::perf::timed(crate::perf::SHADER, || finish(produce(blob, hash, &rtfmt, link, key), hash, len, blob))).clone();
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     if ms > 1.0 {
@@ -822,3 +911,71 @@ mod tests {
     }
 }
 
+fn stub_hashes() -> &'static Vec<u64> {
+    static S: OnceLock<Vec<u64>> = OnceLock::new();
+    S.get_or_init(|| std::env::var("TOMBOX_XS_STUB").map(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect()).unwrap_or_default())
+}
+
+fn stub_at() -> &'static Vec<(u64, u32)> {
+    static S: OnceLock<Vec<(u64, u32)>> = OnceLock::new();
+    S.get_or_init(|| {
+        std::env::var("TOMBOX_XS_STUB_AT")
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|e| {
+                        let (h, o) = e.trim().split_once(':')?;
+                        Some((u64::from_str_radix(h, 16).ok()?, u32::from_str_radix(o.trim_start_matches("0x"), 16).ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+fn drop_reads() -> &'static Vec<(u64, u32, u32)> {
+    static S: OnceLock<Vec<(u64, u32, u32)>> = OnceLock::new();
+    S.get_or_init(|| {
+        std::env::var("TOMBOX_XS_DROP")
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|e| {
+                        let (h, r) = e.trim().split_once(':')?;
+                        let (a, b) = r.split_once('-')?;
+                        let p = |s: &str| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+                        Some((u64::from_str_radix(h, 16).ok()?, p(a)?, p(b)?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+pub fn drop_read_lines(hlsl: &str, lo: u32, hi: u32) -> (String, usize) {
+    let mut out = String::with_capacity(hlsl.len());
+    let mut dropping = false;
+    let mut n = 0;
+    for l in hlsl.split_inclusive('\n') {
+        let s = l.trim_start();
+        if let Some(rest) = s.strip_prefix("// 0x") {
+            let mut it = rest.split_whitespace();
+            let off = it.next().and_then(|o| u32::from_str_radix(o, 16).ok());
+            let m = it.next().unwrap_or("");
+            dropping = off.is_some_and(|o| o >= lo && o <= hi) && drop_ops().iter().any(|p| m.starts_with(p.as_str()));
+            if dropping {
+                n += 1;
+            }
+            out.push_str(l);
+            continue;
+        }
+        let keep = !dropping || s.starts_with('#') || s.contains("tb_pc") || s.contains("tb_sel") || s.trim_end().chars().all(|c| c == '}' || c == '{' || c == ' ');
+        if keep {
+            out.push_str(l);
+        }
+    }
+    (out, n)
+}
+
+fn drop_ops() -> &'static Vec<String> {
+    static S: OnceLock<Vec<String>> = OnceLock::new();
+    S.get_or_init(|| std::env::var("TOMBOX_XS_DROP_OPS").unwrap_or_else(|_| "image_,buffer_,tbuffer_".into()).split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+}

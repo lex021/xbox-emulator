@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 xtfcommon = { path = "../xtfcommon" }
+xtfmsg = { path = "../xtfmsg" }
 
 [build-dependencies]
 xtfcommon = { path = "../xtfcommon" }

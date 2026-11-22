@@ -65,6 +65,21 @@ impl Emitter<'_> {
         (p[1].max(1), p[2].max(1), p[3].max(1))
     }
 
+    pub(super) fn one_wave_lds(&self) -> bool {
+        if self.ex.stage != crate::Stage::Compute {
+            return false;
+        }
+        if self.insns.iter().any(|i| i.enc == crate::rdna2::Enc::Sopp && i.op == 0x0a) {
+            return false;
+        }
+        let p = self.ex.isa_preamble;
+        if p[1] == 0 && p[2] == 0 && p[3] == 0 {
+            return false;
+        }
+        let n = (p[1].max(1) as u64).saturating_mul(p[2].max(1) as u64).saturating_mul(p[3].max(1) as u64);
+        n > 0 && n <= 64 && self.insns.iter().any(|i| i.enc == crate::rdna2::Enc::Ds && i.mnemonic != "ds_swizzle_b32")
+    }
+
     pub(super) fn xlane_header(&self) -> Result<Option<String>, String> {
         if !self.is_cs || !self.body.contains("tb_xl[") {
             return Ok(None);

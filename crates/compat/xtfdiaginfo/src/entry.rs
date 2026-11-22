@@ -39,7 +39,7 @@ pub const CONSOLE_REGISTRATION_ORDER: [u32; 14] = [
     OP_DEBUG_ACTION,
 ];
 
-pub const IMPLEMENTED_HANDLERS: [(u32, OperationFn); 13] = [
+pub const CONSOLE_HANDLERS: [(u32, OperationFn); 14] = [
     (OP_SYSTEM_UP_TIME, crate::system::system_up_time_handler),
     (OP_SET_SYSTEM_GO_DARK, crate::system::set_system_go_dark_handler),
     (OP_FETCH_SYSTEM_GO_DARK, crate::system::fetch_system_go_dark_handler),
@@ -52,6 +52,7 @@ pub const IMPLEMENTED_HANDLERS: [(u32, OperationFn); 13] = [
     (OP_REPORT_TITLE_MEMORY, crate::titlememory::title_memory_report_handler),
     (OP_QUERY_PROFILING_DIRECTORY, crate::system::query_profiling_directory_handler),
     (OP_RESUME_DEFERRED_EXECUTION, crate::process::resume_deferred_execution_handler),
+    (OP_CONNECTION_DIAGNOSTIC, crate::conndiag::connection_diagnostic_handler),
     (OP_DEBUG_ACTION, crate::debugaction::debug_action_handler),
 ];
 
@@ -76,4 +77,9 @@ pub unsafe fn extension_entry_point(extension: *const GUID, iid: *const GUID, ou
     }
     *out = md.detach();
     S_OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn XtfOrdinal_4(extension: *const GUID, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    extension_entry_point(extension, iid, out, &CONSOLE_HANDLERS)
 }

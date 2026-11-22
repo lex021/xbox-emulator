@@ -22,8 +22,6 @@
 //!   * the PC texture is assumed to be in its creation state when the upload list runs
 //!     (the title's own barriers are not tracked);
 //!   * memory that is not committed/readable is skipped and retried later;
-//!   * a write racing the read is repaired on a later frame (hash changes again), but a
-//!     decommit racing the read would fault;
 //!   * Texture3D, multi-plane and render-target/depth placed textures are not mirrored.
 
 use core::ffi::c_void;
@@ -34,6 +32,8 @@ use crate::placed::Placed;
 
 extern "system" {
     fn VirtualQuery(addr: *const c_void, mbi: *mut Mbi, len: usize) -> usize;
+    fn GetCurrentProcess() -> *mut c_void;
+    fn ReadProcessMemory(process: *mut c_void, base: *const c_void, buf: *mut c_void, len: usize, read: *mut usize) -> i32;
     fn GetModuleHandleA(n: *const u8) -> *mut c_void;
     fn LoadLibraryA(n: *const u8) -> *mut c_void;
     fn GetProcAddress(h: *mut c_void, n: *const u8) -> *mut c_void;
@@ -163,6 +163,32 @@ fn scan_subs(t: &Tracked, subs: &[usize]) -> Option<Scan> {
 fn sparse_zero_enabled() -> bool {
     static SW: crate::live_sw::Sw = crate::live_sw::Sw::new("TOMBOX_SPARSE_ZERO", "sparse_zero", true);
     SW.on()
+}
+
+fn safe_reads() -> bool {
+    static SW: crate::live_sw::Sw = crate::live_sw::Sw::new("TOMBOX_UPLOAD_SAFE_READ", "upload_safe_read", false);
+    SW.on()
+}
+
+fn read_title_memory(addr: usize, dst: &mut [u8]) -> bool {
+    if dst.is_empty() {
+        return true;
+    }
+    let mut got = 0usize;
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), addr as *const c_void, dst.as_mut_ptr() as *mut c_void, dst.len(), &mut got) };
+    ok != 0 && got == dst.len()
+}
+
+fn snapshot_title_memory(addr: usize, len: usize) -> Option<Vec<u8>> {
+    let mut v = vec![0u8; len];
+    read_title_memory(addr, &mut v).then_some(v)
+}
+
+fn with_title_bytes<R>(addr: usize, len: usize, safe: bool, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    if !safe {
+        return Some(f(unsafe { core::slice::from_raw_parts(addr as *const u8, len) }));
+    }
+    snapshot_title_memory(addr, len).map(|v| f(&v))
 }
 
 fn hash_bytes(b: &[u8]) -> u64 {
@@ -592,11 +618,24 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
             }
             let mut v = vec![0u8; len];
             for (a, b) in &sc.ok {
-                core::ptr::copy_nonoverlapping(*a as *const u8, v.as_mut_ptr().add(a - lo), b - a);
+                if safe_reads() {
+                    read_title_memory(*a, &mut v[a - lo..b - lo]);
+                } else {
+                    core::ptr::copy_nonoverlapping(*a as *const u8, v.as_mut_ptr().add(a - lo), b - a);
+                }
             }
             snap = Some(Arc::new(v));
             t.partial[sub as usize] = mark;
         } else {
+            if safe_reads() {
+                match snapshot_title_memory(lo, len) {
+                    Some(v) => snap = Some(Arc::new(v)),
+                    None => {
+                        unreadable += 1;
+                        continue;
+                    }
+                }
+            }
             t.partial[sub as usize] = 0;
         }
         let mem: &[u8] = match &snap {
@@ -749,7 +788,11 @@ fn barrier(res: usize, before: u32, after: u32) -> [u64; 4] {
 }
 
 fn first_nonzero(ranges: &[(usize, usize)]) -> bool {
-    ranges.iter().any(|&(a, b)| unsafe { core::slice::from_raw_parts(a as *const u8, b - a) }.iter().any(|&x| x != 0))
+    first_nonzero_mode(ranges, safe_reads())
+}
+
+fn first_nonzero_mode(ranges: &[(usize, usize)], safe: bool) -> bool {
+    ranges.iter().any(|&(a, b)| with_title_bytes(a, b - a, safe, |s| s.iter().any(|&x| x != 0)).unwrap_or(true))
 }
 
 fn watch_pending(up: &mut Uploader) -> (u64, u64) {
@@ -782,7 +825,7 @@ fn watch_pending(up: &mut Uploader) -> (u64, u64) {
                 }
             } else if sc.bad.is_none() {
                 scanned += n as u64;
-                let h = hash_bytes(unsafe { core::slice::from_raw_parts(a as *const u8, n) });
+                let Some(h) = with_title_bytes(a, n, safe_reads(), hash_bytes) else { continue };
                 if t.hashes[sub] != Some(h) {
                     t.hashes[sub] = None;
                     changed += 1;
@@ -1118,6 +1161,57 @@ mod zero_watch_tests {
         assert!(first_nonzero(&[(a, a + 4096)]));
         assert!(!first_nonzero(&[(a, a + 2048)]));
         assert!(first_nonzero(&[(a, a + 16), (a + 2990, a + 3001)]));
+    }
+
+    #[test]
+    fn decommitted_memory_fails_the_snapshot_instead_of_faulting() {
+        extern "system" {
+            fn VirtualAlloc(addr: *mut c_void, len: usize, ty: u32, protect: u32) -> *mut c_void;
+            fn VirtualFree(addr: *mut c_void, len: usize, ty: u32) -> i32;
+        }
+        const PAGE: usize = 4096;
+        unsafe {
+            let base = VirtualAlloc(core::ptr::null_mut(), 3 * PAGE, 0x3000, 0x04) as usize;
+            assert_ne!(base, 0);
+            core::ptr::write_bytes(base as *mut u8, 0xab, 3 * PAGE);
+            let all = snapshot_title_memory(base, 3 * PAGE).expect("committed memory reads");
+            assert!(all.iter().all(|&b| b == 0xab));
+            assert!(first_nonzero_mode(&[(base, base + 3 * PAGE)], true));
+            assert_eq!(VirtualFree((base + PAGE) as *mut c_void, PAGE, 0x4000), 1);
+            assert!(snapshot_title_memory(base, 3 * PAGE).is_none());
+            assert!(snapshot_title_memory(base + PAGE, PAGE).is_none());
+            assert!(snapshot_title_memory(base, PAGE).is_some());
+            assert!(snapshot_title_memory(base + 2 * PAGE, PAGE).is_some());
+            assert!(first_nonzero_mode(&[(base + PAGE, base + 2 * PAGE)], true));
+            assert!(with_title_bytes(base, 3 * PAGE, true, hash_bytes).is_none());
+            VirtualFree(base as *mut c_void, 0, 0x8000);
+        }
+    }
+
+    #[test]
+    fn default_reads_are_direct_and_the_safe_path_costs_one_copy() {
+        let mut worst_direct_ns = 0f64;
+        for &len in &[16usize << 10, 256 << 10, 4 << 20] {
+            let buf: Vec<u8> = (0..len).map(|i| (i * 31 + i / 7) as u8).collect();
+            let addr = buf.as_ptr() as usize;
+            let iters = ((64usize << 20) / len).max(4);
+            let time = |safe: bool| {
+                let t = std::time::Instant::now();
+                let mut acc = 0u64;
+                for _ in 0..iters {
+                    acc ^= with_title_bytes(addr, len, safe, hash_bytes).unwrap();
+                }
+                std::hint::black_box(acc);
+                t.elapsed().as_nanos() as f64 / iters as f64
+            };
+            time(false);
+            time(true);
+            let (direct, safe) = (time(false), time(true));
+            eprintln!("hash of {:>5} KiB: direct {direct:>10.0} ns/call, safe snapshot {safe:>10.0} ns/call (+{:.0}%)", len >> 10, (safe / direct - 1.0) * 100.0);
+            assert_eq!(with_title_bytes(addr, len, false, hash_bytes), with_title_bytes(addr, len, true, hash_bytes));
+            worst_direct_ns = worst_direct_ns.max(direct);
+        }
+        assert!(worst_direct_ns > 0.0);
     }
 
     #[test]

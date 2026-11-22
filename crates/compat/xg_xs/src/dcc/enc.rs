@@ -318,6 +318,12 @@ pub(crate) fn color_in(d: &mut Dcc, t: &mut Tmp) -> Result<(), i32> {
             for p in 0..64 {
                 t.ever[p] = p >= 54 || (t.ever[p] && (16..48).contains(&p));
             }
+        } else if crate::dcc::xg_build() == 22621 {
+            t.b[56..64].copy_from_slice(&8u64.to_le_bytes());
+            t.b[52..56].fill(0);
+            for p in 0..64 {
+                t.ever[p] = p >= 52 || (t.ever[p] && (24..52).contains(&p));
+            }
         } else {
             t.ever = [false; 64];
         }

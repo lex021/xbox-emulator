@@ -31,6 +31,8 @@ struct Pending {
     cpu_ms: f64,
     wait_ms: f64,
     valid: bool,
+    ev: crate::frame_ev::Snap,
+    game_dt: Option<f64>,
 }
 
 struct Csv {
@@ -47,6 +49,7 @@ struct Csv {
     rows: u64,
     wait_ticks: i64,
     snap: [(u64, u64); 2],
+    qpc_last: i64,
 }
 unsafe impl Send for Csv {}
 
@@ -62,7 +65,7 @@ unsafe fn open(device: usize, freq: u64) -> Result<Csv, String> {
     let p = path();
     let f = std::fs::File::create(&p).map_err(|e| format!("create {}: {e}", p.display()))?;
     let mut out = std::io::BufWriter::with_capacity(64 * 1024, f);
-    let _ = writeln!(out, "frame,t_ms,present_interval_ms,present_cpu_ms,fence_wait_ms,gpu_frame_ms,gpu_present_list_us");
+    let _ = writeln!(out, "frame,t_ms,present_interval_ms,present_cpu_ms,fence_wait_ms,gpu_frame_ms,gpu_present_list_us{}", crate::frame_ev::header());
     let qd: [u32; 3] = [1, 4, 0];
     let mut qheap = 0usize;
     let mut rb = 0usize;
@@ -90,7 +93,8 @@ unsafe fn open(device: usize, freq: u64) -> Result<Csv, String> {
     }
     record("d3d12_xs", "[frame_csv]", &format!("writing {} (gpu timestamps {})", p.display(), if qheap != 0 { "on" } else { "off" }));
     let now = qpc();
-    Ok(Csv { out, path: p.display().to_string(), qheap, rb, map, freq, pending: [Pending::default(); 2], last_gpu_start: 0, start_qpc: now, last_present: 0, rows: 0, wait_ticks: 0, snap: [(0, 0); 2] })
+    crate::frame_ev::set_active(true);
+    Ok(Csv { out, path: p.display().to_string(), qheap, rb, map, freq, pending: [Pending::default(); 2], last_gpu_start: 0, start_qpc: now, last_present: 0, rows: 0, wait_ticks: 0, snap: [(0, 0); 2], qpc_last: 0 })
 }
 
 pub fn on() -> bool {
@@ -98,6 +102,7 @@ pub fn on() -> bool {
 }
 
 pub fn close() {
+    crate::frame_ev::set_active(false);
     if let Ok(mut g) = CSV.lock() {
         if let Some(c) = g.as_mut() {
             let _ = c.out.flush();
@@ -172,7 +177,7 @@ pub fn present_done(frame: u64, entry: i64) {
         }
     }
     if old.valid {
-        let _ = writeln!(c.out, "{},{:.3},{:.3},{:.3},{:.3},{gpu_frame},{gpu_list}", old.frame, old.t_ms, old.interval_ms, old.cpu_ms, old.wait_ms);
+        let _ = writeln!(c.out, "{},{:.3},{:.3},{:.3},{:.3},{gpu_frame},{gpu_list}{}", old.frame, old.t_ms, old.interval_ms, old.cpu_ms, old.wait_ms, crate::frame_ev::row(&old.ev, old.game_dt));
         c.rows += 1;
         if c.rows % 240 == 0 {
             let _ = c.out.flush();
@@ -183,6 +188,12 @@ pub fn present_done(frame: u64, entry: i64) {
     }
     let interval = if c.last_present != 0 { ms(entry - c.last_present) } else { 0.0 };
     c.last_present = entry;
-    c.pending[slot] = Pending { frame, t_ms: ms(entry - c.start_qpc), interval_ms: interval, cpu_ms: ms(now - entry), wait_ms: ms(c.wait_ticks), valid: true };
+    crate::frame_ev::note_present_thread();
+    let ev = crate::frame_ev::take();
+    let game_dt = crate::frame_ev::game_dt_ms(c.qpc_last, &ev);
+    if ev.qpc_last != 0 {
+        c.qpc_last = ev.qpc_last;
+    }
+    c.pending[slot] = Pending { frame, t_ms: ms(entry - c.start_qpc), interval_ms: interval, cpu_ms: ms(now - entry), wait_ms: ms(c.wait_ticks), valid: true, ev, game_dt };
     c.wait_ticks = 0;
 }

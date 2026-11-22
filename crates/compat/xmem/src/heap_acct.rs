@@ -21,14 +21,30 @@ pub fn block_overhead(size: usize) -> i64 {
     (((size + 15) & !15) - size + 16) as i64
 }
 
+pub fn enabled() -> bool {
+    static ON: AtomicUsize = AtomicUsize::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var("TOMBOX_XMEM_HEAPACCT").map_or(true, |v| v.trim() != "0");
+            ON.store(on as usize, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 pub fn slot(heap: usize) -> Option<&'static Acct> {
-    if heap == 0 {
+    if heap == 0 || !enabled() {
         return None;
     }
     ACCT.iter().find(|a| a.heap.load(Ordering::Acquire) == heap)
 }
 
 pub fn register(heap: usize, allocated: u64, overhead: u64) -> Option<&'static Acct> {
+    if !enabled() {
+        return None;
+    }
     if let Some(a) = slot(heap) {
         return Some(a);
     }

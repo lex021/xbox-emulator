@@ -561,6 +561,7 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut c_void, ty: u32, ti
     let t0 = qpc();
     let r = WaitForMultipleObjects(hs.len() as u32, hs.as_ptr(), (flags & FLAG_WAIT_ALL) as i32, timeout_ms);
     let t1 = qpc();
+    crate::frame_ev::note_frame_wait(t1 - t0);
     if ty == 0 {
         crate::perf::on_origin_wait(t1 - t0, t1);
     }

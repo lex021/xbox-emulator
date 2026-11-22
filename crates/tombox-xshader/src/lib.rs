@@ -172,6 +172,7 @@ pub struct ShaderExtract {
     pub isa_offset_in_fssm: usize,
     /// The 16-byte ISA-section preamble (compute: dwords 1..3 = thread-group size X,Y,Z).
     pub isa_preamble: [u32; 4],
+    pub psv_numthreads: Option<[u32; 3]>,
     /// The program followed by any constant data embedded after it in the code section.
     pub isa_data: Vec<u8>,
     /// Presence of the standard signature/validation/root-sig chunks in the outer DXBC.
@@ -276,6 +277,7 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
     let chunk_body = |cc: &[u8; 4]| container.chunk(cc).map(|c| &dxbc[c.offset..c.offset + c.size]);
     let entry = find_entry_name(&fssm);
 
+    let psv_numthreads = if stage == Stage::Compute { chunk_body(b"PSV0").and_then(meta::parse_psv0_cs_threads) } else { None };
     let mut gs_info = chunk_body(b"PSV0").and_then(meta::parse_psv0_gs);
     dxil_meta::fill_num_threads(&mut gs_info, || dxil_disassembly(dxbc))?;
     Ok(ShaderExtract {
@@ -286,6 +288,7 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
         isa,
         isa_offset_in_fssm: isa_off,
         isa_preamble,
+        psv_numthreads,
         isa_data,
         fssm,
         has_input_sig: container.chunk(b"ISG1").is_some() || container.chunk(b"ISGN").is_some(),
