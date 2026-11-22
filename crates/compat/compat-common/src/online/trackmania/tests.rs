@@ -228,13 +228,48 @@ fn space_parameters_carry_nadeo_masterserver_url() {
     assert_eq!(r.status, 200);
     let b = body(&r);
     let url = b["parameters"]["NadeoServicesParameters"]["fields"]["masterserver_init_url"].as_str().unwrap();
-    assert!(url.starts_with("https://") && url.trim_end_matches('/').ends_with(CORE));
+    let rest = url.strip_prefix("https://").unwrap();
+    let (url_host, url_path) = rest.split_at(rest.find('/').unwrap());
+    assert_eq!(url_host, CORE);
+    assert_eq!(url_path, "/api/routes", "the client requests the init url path verbatim with ?usage=Client appended");
     assert!(b["parameters"]["us-sdkClientUrls"].is_object());
     let other = body(&t.route(&req("GET", "public-ubiservices.ubi.com", &format!("/v1/spaces/{space}/parameters"), &[("parameterGroups", "us-sdkClientUrls")], &[], b"")).unwrap());
     assert!(other["parameters"].get("NadeoServicesParameters").is_none());
-    let host = url.split("://").nth(1).unwrap().split('/').next().unwrap();
-    let routes = t.route(&req("GET", host, "/api/routes", &[("usage", "Client")], &[], b"")).unwrap();
-    assert_ne!(routes.status, 404, "the masterserver host must serve Nadeo core routes");
+    let routes = t.route(&req("GET", url_host, url_path, &[("usage", "Client")], &[], b"")).unwrap();
+    assert_eq!(routes.status, 200, "the masterserver init url must serve the Nadeo core route table");
+    assert_eq!(t.route(&req("GET", url_host, "/", &[("usage", "Client")], &[], b"")).unwrap().status, 404);
+}
+
+#[test]
+fn route_table_entries_carry_host_and_port() {
+    let t = tm();
+    let table = body(&t.route(&req("GET", CORE, "/api/routes", &[("usage", "Client")], &[], b"")).unwrap());
+    let m = table.as_object().unwrap();
+    for (id, r) in m {
+        assert!(id.starts_with("nadeoservices_"), "{id}");
+        assert_eq!(r["host"], CORE, "{id}");
+        assert_eq!(r["port"], 443, "{id}");
+        assert_eq!(r["timeout"], 0, "{id}");
+        assert!(matches!(r["method"].as_str().unwrap(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD"), "{id}");
+        assert!(r["path"].as_str().unwrap().starts_with('/'), "{id}");
+    }
+    for id in ["nadeoservices_token_create_from_ubiservices_v2", "nadeoservices_token_create_from_nadeoservices_v2", "nadeoservices_token_refresh_v2", "nadeoservices_client_config_get", "nadeoservices_client_debug_info_add", "nadeoservices_account_client_url_config_get", "nadeoservices_account_zone_get"] {
+        assert!(m.contains_key(id), "{id}");
+    }
+    let (at, _) = login(&t, "NadeoServices");
+    let tok = &m["nadeoservices_token_create_from_nadeoservices_v2"];
+    let auth = format!("nadeo_v1 t={at}");
+    let r = t.route(&req(tok["method"].as_str().unwrap(), tok["host"].as_str().unwrap(), tok["path"].as_str().unwrap(), &[], &[("Authorization", &auth)], br#"{"audience":"NadeoLiveServices"}"#)).unwrap();
+    assert_eq!(r.status, 200);
+    assert_eq!(claims(body(&r)["accessToken"].as_str().unwrap())["aud"], "NadeoLiveServices");
+}
+
+#[test]
+fn client_debug_info_is_accepted_before_authentication() {
+    let t = tm();
+    let r = t.route(&req("POST", CORE, "/client/debug/", &[], &[("Content-Type", "application/json")], br#"{"type":"connection","message":"test"}"#)).unwrap();
+    assert_eq!(r.status, 200);
+    assert_eq!(t.route(&req("POST", CORE, "/client/logs/", &[], &[], b"{}")).unwrap().status, 401);
 }
 
 #[test]
@@ -255,4 +290,159 @@ fn contact_url_patch_updates_the_open_connection() {
     assert_eq!(gone.status, 404);
     crate::online::xdefiant::store::close_connection(&cid);
     crate::online::xdefiant::store::close_connection(&foreign);
+}
+
+#[test]
+fn connect_to_nadeo_services_sequence() {
+    let t = tm();
+    let sess = body(&t.route(&req("POST", "public-ubiservices.ubi.com", "/v3/profiles/sessions", &[], &[("Ubi-AppId", APP_ID)], b"{}")).unwrap());
+    let ubi = format!("ubi_v1 t={}", sess["ticket"].as_str().unwrap());
+    let table = body(&t.route(&req("GET", CORE, "/api/routes", &[("usage", "Client")], &[], b"")).unwrap());
+    let call = |id: &str, auth: Option<&str>, vars: &[(&str, &str)], b: &[u8]| {
+        let r = &table[id];
+        let mut path = r["path"].as_str().unwrap().to_string();
+        for (k, v) in vars {
+            path = path.replace(&format!("{{{k}}}"), v);
+        }
+        let h: Vec<(&str, &str)> = auth.map(|a| vec![("Authorization", a)]).unwrap_or_default();
+        t.route(&req(r["method"].as_str().unwrap(), r["host"].as_str().unwrap(), &path, &[], &h, b)).unwrap()
+    };
+    let cfg = call("nadeoservices_client_config_get", None, &[], b"");
+    assert_eq!(cfg.status, 200, "the userless client config is fetched before any token exists");
+    assert!(body(&cfg)["settings"].is_object());
+    let tok = call("nadeoservices_token_create_from_ubiservices_v2", Some(&ubi), &[], b"");
+    assert_eq!(tok.status, 200);
+    let at = body(&tok)["accessToken"].as_str().unwrap().to_string();
+    assert_eq!(claims(&at)["aud"], "NadeoServices");
+    let core_auth = format!("nadeo_v1 t={at}");
+    for aud in ["NadeoLiveServices", "NadeoClubServices"] {
+        let r = call("nadeoservices_token_create_from_nadeoservices_v2", Some(&core_auth), &[], json!({"audience": aud}).to_string().as_bytes());
+        assert_eq!(r.status, 200, "{aud}");
+        assert_eq!(claims(body(&r)["accessToken"].as_str().unwrap())["aud"], aud);
+    }
+    let me = t.core.account_id.clone();
+    for id in ["nadeoservices_account_client_config_get", "nadeoservices_account_client_url_config_get", "nadeoservices_account_zone_get", "nadeoservices_account_title_list_get"] {
+        let r = call(id, Some(&core_auth), &[("accountId", &me)], b"");
+        assert_eq!(r.status, 200, "{id}");
+    }
+    assert_eq!(call("nadeoservices_account_zone_get", None, &[("accountId", &me)], b"").status, 401);
+}
+
+fn gbx_scalar_text(v: &Value) -> bool {
+    v.is_string() || v.is_number()
+}
+
+fn gbx_client_config_ok(v: &Value) -> Result<(), String> {
+    if let Some(st) = v.get("settings") {
+        let m = st.as_object().ok_or("settings is not an object")?;
+        for (k, val) in m {
+            if k.is_empty() || !gbx_scalar_text(val) {
+                return Err(format!("setting {k:?} = {val} is not a string or number"));
+            }
+        }
+    }
+    if let Some(keys) = v.get("keys") {
+        for e in keys.as_array().ok_or("keys is not an array")? {
+            let id = e["id"].as_u64().unwrap_or(0);
+            let timeout = e["timeout"].as_u64().unwrap_or(0);
+            let key = e["key"].as_str().unwrap_or("");
+            if id == 0 || timeout == 0 || key.is_empty() {
+                return Err(format!("key entry {e} needs id>0, timeout>0 and a non-empty key"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn gbx_core_token_ok(at: &str) -> Result<(), String> {
+    if at.split('.').count() != 3 {
+        return Err("not a three-part JWT".into());
+    }
+    let c = claims(at);
+    for k in ["jti", "iss", "aud", "usg", "sid", "sub"] {
+        if !gbx_scalar_text(&c[k]) {
+            return Err(format!("claim {k} missing or not text"));
+        }
+    }
+    if c["iss"] != "NadeoServices" || c["aud"] != "NadeoServices" || c["usg"] != "Client" {
+        return Err(format!("iss/aud/usg must be NadeoServices/NadeoServices/Client: {c}"));
+    }
+    for k in ["iat", "rat", "exp"] {
+        if !c[k].is_u64() {
+            return Err(format!("claim {k} must be an unsigned number"));
+        }
+    }
+    if let Some(l) = c.get("limit_type") {
+        if !gbx_scalar_text(l) {
+            return Err("limit_type must be text".into());
+        }
+    }
+    if let Some(p) = c.get("pce") {
+        if !p.is_boolean() {
+            return Err("pce must be a boolean".into());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn gbx_field_rules_accept_and_reject() {
+    assert!(gbx_client_config_ok(&json!({"settings": {"A": "1", "B": 2}})).is_ok());
+    assert!(gbx_client_config_ok(&json!({"settings": {"A": true}})).is_err());
+    assert!(gbx_client_config_ok(&json!({"keys": [{"id": 1, "timeout": 60, "key": "k"}]})).is_ok());
+    assert!(gbx_client_config_ok(&json!({"keys": [{"id": 0, "timeout": 60, "key": "k"}]})).is_err());
+}
+
+#[test]
+fn connect_responses_satisfy_the_client_parsers() {
+    let t = tm();
+    let me = t.core.account_id.clone();
+    let cfg = t.route(&req("GET", CORE, "/client/config", &[], &[], b"")).unwrap();
+    assert_eq!(cfg.status, 200);
+    gbx_client_config_ok(&body(&cfg)).unwrap();
+    let (at, rt) = login(&t, "NadeoServices");
+    gbx_core_token_ok(&at).unwrap();
+    gbx_core_token_ok(&rt).unwrap();
+    let auth = format!("nadeo_v1 t={at}");
+    for path in [format!("/accounts/{me}/client/config"), "/titles/TMxSM_Xbox/client/config".to_string()] {
+        let r = t.route(&req("GET", CORE, &path, &[], &[("Authorization", &auth)], b"")).unwrap();
+        assert_eq!(r.status, 200, "{path}");
+        gbx_client_config_ok(&body(&r)).unwrap();
+    }
+    let table = body(&t.route(&req("GET", CORE, "/api/routes", &[("usage", "Client")], &[], b"")).unwrap());
+    for (id, r) in table.as_object().unwrap() {
+        for k in ["method", "host", "path"] {
+            assert!(r[k].is_string() && !r[k].as_str().unwrap().is_empty(), "{id}.{k}");
+        }
+        assert!(r["port"].is_u64() && r["timeout"].is_u64(), "{id}");
+    }
+}
+
+fn gbx_iso_ok(t: &str) -> bool {
+    let b = t.as_bytes();
+    b.len() >= 19 && b[4] == b'-' && b[7] == b'-' && b[10] == b'T' && b[13] == b':' && b[16] == b':' && (t.ends_with('Z') || t[19..].trim_start_matches(|c: char| c == '.' || c.is_ascii_digit()).starts_with(['+', '-']))
+}
+
+fn gbx_waiting_queue_ok(v: &Value) -> Result<u64, String> {
+    for k in ["rank", "refreshTime", "waitingTime"] {
+        if !v[k].is_u64() {
+            return Err(format!("{k} must be an unsigned number: {v}"));
+        }
+    }
+    match v["timestamp"].as_str() {
+        Some(t) if gbx_iso_ok(t) => Ok(v["rank"].as_u64().unwrap()),
+        _ => Err(format!("timestamp must be an ISO 8601 string: {v}")),
+    }
+}
+
+#[test]
+fn waiting_queue_is_clear_before_authentication() {
+    let t = tm();
+    let r = t.route(&req("PUT", CORE, "/waitingQueue/u_c1e2b3d5-f362-58b3-a4a2-5aff3ee2ddd5", &[], &[], b"")).unwrap();
+    assert_eq!(r.status, 200);
+    let b = body(&r);
+    assert_eq!(gbx_waiting_queue_ok(&b).unwrap(), 0, "rank 0 lets ConnectToNadeoServices continue");
+    assert!(b["refreshTime"].as_u64().unwrap() > 0);
+    assert!(gbx_iso_ok("2026-11-22T05:44:00+00:00") && gbx_iso_ok("2026-11-22T05:44:00.123Z") && !gbx_iso_ok("yesterday"));
+    assert_eq!(t.route(&req("PUT", CORE, "/waitingQueue/x", &[], &[], b"")).unwrap().status, 400);
 }

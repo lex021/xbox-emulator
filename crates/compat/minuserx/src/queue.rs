@@ -310,7 +310,7 @@ pub unsafe fn peek(out: *mut Msg, hwnd: *mut c_void, lo: u32, hi: u32, flags: u3
             }
             continue;
         }
-        if crate::test_run() && !taken_over() && matches!(m.message, 0x0100 | 0x0104 | 0x0201 | 0x0204 | 0x0207 | 0x020B) {
+        if crate::test_run() && !crate::headless() && !taken_over() && matches!(m.message, 0x0100 | 0x0104 | 0x0201 | 0x0204 | 0x0207 | 0x020B) {
             take_over(m.message);
         }
         if host_kbm_message(m.message) && host_kbm_hidden() {
@@ -331,7 +331,7 @@ pub fn host_kbm_message(msg: u32) -> bool {
 
 pub fn host_kbm_hidden() -> bool {
     static H: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *H.get_or_init(|| matches!(std::env::var("TOMBOX_HOST_KBM").ok().as_deref().map(str::trim), Some("0") | Some("off") | Some("false"))) && !taken_over()
+    (*H.get_or_init(|| matches!(std::env::var("TOMBOX_HOST_KBM").ok().as_deref().map(str::trim), Some("0") | Some("off") | Some("false"))) || crate::headless()) && !taken_over()
 }
 
 pub unsafe fn get(out: *mut Msg, hwnd: *mut c_void, lo: u32, hi: u32) -> Result<bool, u32> {

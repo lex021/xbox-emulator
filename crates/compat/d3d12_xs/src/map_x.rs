@@ -452,6 +452,7 @@ unsafe extern "system" fn map_hook(res: *mut c_void, sub: u32, range: *const (u6
             return 0;
         }
     }
+    crate::dred::on_failure(hr, "Map");
     if n < 32 {
         record("d3d12_xs", "map_x", &format!("Map FAILED res={res:p} sub={sub} range={rr:x?} out={out:p} hr={hr:#010x} | {}", unsafe { describe(res) }));
     }

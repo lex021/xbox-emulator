@@ -15,6 +15,34 @@ pub fn row_pitch(width: u32) -> u32 {
     (width * 4).div_ceil(256) * 256
 }
 
+pub fn bytes_per_pixel(format: u32) -> u32 {
+    match format {
+        9 | 10 => 8,
+        _ => 4,
+    }
+}
+
+pub fn pitch_for(width: u32, format: u32) -> u32 {
+    (width * bytes_per_pixel(format)).div_ceil(256) * 256
+}
+
+pub fn half_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+    let e = ((h >> 10) & 0x1f) as i32;
+    let m = (h & 0x3ff) as f32;
+    match e {
+        0 => sign * m * (2.0f32).powi(-24),
+        31 => if m == 0.0 { sign * f32::INFINITY } else { f32::NAN },
+        _ => sign * (1.0 + m / 1024.0) * (2.0f32).powi(e - 15),
+    }
+}
+
+pub fn linear_to_srgb8(v: f32) -> u8 {
+    let c = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
+    let s = if c <= 0.003_130_8 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+    (s * 255.0 + 0.5) as u8
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct Stats {
     pub nonzero: u64,
@@ -23,13 +51,18 @@ pub struct Stats {
 }
 
 pub fn stats(data: &[u8], pitch: usize, width: usize, height: usize) -> Stats {
+    stats_fmt(data, pitch, width, height, 28)
+}
+
+pub fn stats_fmt(data: &[u8], pitch: usize, width: usize, height: usize, format: u32) -> Stats {
+    let bpp = bytes_per_pixel(format) as usize;
     let mut nonzero = 0u64;
     let mut distinct_rows = 0u64;
     let mut prev: Option<&[u8]> = None;
     for y in 0..height {
-        let row = &data[y * pitch..y * pitch + width * 4];
-        for px in row.chunks_exact(4) {
-            if px[0] | px[1] | px[2] != 0 {
+        let row = &data[y * pitch..y * pitch + width * bpp];
+        for px in row.chunks_exact(bpp) {
+            if px[..bpp - bpp / 4].iter().any(|&b| b != 0) {
                 nonzero += 1;
             }
         }
@@ -43,6 +76,10 @@ pub fn stats(data: &[u8], pitch: usize, width: usize, height: usize) -> Stats {
 
 pub fn to_bgr(px: &[u8], format: u32) -> [u8; 3] {
     match format {
+        9 | 10 => {
+            let c = |i: usize| linear_to_srgb8(half_to_f32(u16::from_le_bytes([px[i * 2], px[i * 2 + 1]])));
+            [c(2), c(1), c(0)]
+        }
         87 | 88 | 90 | 91 => [px[0], px[1], px[2]],
         23 | 24 | 25 => {
             let v = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
@@ -54,6 +91,7 @@ pub fn to_bgr(px: &[u8], format: u32) -> [u8; 3] {
 }
 
 pub fn bmp(data: &[u8], pitch: usize, width: usize, height: usize, format: u32) -> Vec<u8> {
+    let bpp = bytes_per_pixel(format) as usize;
     let row = (width * 3).div_ceil(4) * 4;
     let size = 54 + row * height;
     let mut out = Vec::with_capacity(size);
@@ -68,9 +106,9 @@ pub fn bmp(data: &[u8], pitch: usize, width: usize, height: usize, format: u32) 
     out.extend_from_slice(&24u16.to_le_bytes());
     out.extend_from_slice(&[0u8; 24]);
     for y in (0..height).rev() {
-        let src = &data[y * pitch..y * pitch + width * 4];
+        let src = &data[y * pitch..y * pitch + width * bpp];
         let start = out.len();
-        for px in src.chunks_exact(4) {
+        for px in src.chunks_exact(bpp) {
             out.extend_from_slice(&to_bgr(px, format));
         }
         out.resize(start + row, 0);
@@ -86,7 +124,7 @@ pub fn footprint_location(buf: *mut c_void, format: u32, width: u32, height: u32
     l[0x1c..0x20].copy_from_slice(&width.to_le_bytes());
     l[0x20..0x24].copy_from_slice(&height.to_le_bytes());
     l[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
-    l[0x28..0x2c].copy_from_slice(&row_pitch(width).to_le_bytes());
+    l[0x28..0x2c].copy_from_slice(&pitch_for(width, format).to_le_bytes());
     l
 }
 
@@ -97,8 +135,8 @@ pub fn subresource_location(tex: *mut c_void) -> [u8; 0x30] {
 }
 
 pub fn finish(tag: &str, frame: u64, data: &[u8], width: u32, height: u32, format: u32, extra: &str) {
-    let pitch = row_pitch(width) as usize;
-    let s = stats(data, pitch, width as usize, height as usize);
+    let pitch = pitch_for(width, format) as usize;
+    let s = stats_fmt(data, pitch, width as usize, height as usize, format);
     let mut saved = String::new();
     if let Some(d) = dir() {
         let _ = std::fs::create_dir_all(&d);
@@ -153,5 +191,41 @@ mod tests {
         assert_eq!(u32::from_le_bytes(l[8..12].try_into().unwrap()), 1);
         assert_eq!(u32::from_le_bytes(l[0x28..0x2c].try_into().unwrap()), 7680);
         assert!(!wanted(11));
+        let f = footprint_location(0x1000 as *mut c_void, 10, 1920, 1080);
+        assert_eq!(u32::from_le_bytes(f[0x28..0x2c].try_into().unwrap()), 15360);
+    }
+
+    #[test]
+    fn fp16_pitch_and_conversion() {
+        assert_eq!(bytes_per_pixel(10), 8);
+        assert_eq!(bytes_per_pixel(9), 8);
+        assert_eq!(bytes_per_pixel(87), 4);
+        assert_eq!(bytes_per_pixel(24), 4);
+        assert_eq!(pitch_for(1920, 10), 15360);
+        assert_eq!(pitch_for(1920, 28), row_pitch(1920));
+        assert_eq!(pitch_for(33, 10), 512);
+        assert_eq!(half_to_f32(0x3c00), 1.0);
+        assert_eq!(half_to_f32(0x3800), 0.5);
+        assert_eq!(half_to_f32(0xbc00), -1.0);
+        assert_eq!(half_to_f32(0), 0.0);
+        assert!(half_to_f32(0x7e00).is_nan());
+        assert_eq!(linear_to_srgb8(1.0), 255);
+        assert_eq!(linear_to_srgb8(4.0), 255);
+        assert_eq!(linear_to_srgb8(-1.0), 0);
+        assert_eq!(linear_to_srgb8(0.5), 188);
+        let px: Vec<u8> = [0x3c00u16, 0x3800, 0, 0x3c00].iter().flat_map(|h| h.to_le_bytes()).collect();
+        assert_eq!(to_bgr(&px, 10), [0, 188, 255]);
+        let pitch = 256;
+        let mut d = vec![0u8; pitch * 2];
+        d[..8].copy_from_slice(&px);
+        let b = bmp(&d, pitch, 2, 2, 10);
+        assert_eq!(b.len(), 54 + 8 * 2);
+        assert_eq!(&b[62..65], &[0, 188, 255], "top row is last in the bottom-up file");
+        let s = stats_fmt(&d, pitch, 2, 2, 10);
+        assert_eq!(s.nonzero, 1);
+        assert_eq!(s.total, 4);
+        let mut alpha_only = vec![0u8; pitch];
+        alpha_only[6..8].copy_from_slice(&0x3c00u16.to_le_bytes());
+        assert_eq!(stats_fmt(&alpha_only, pitch, 1, 1, 10).nonzero, 0);
     }
 }

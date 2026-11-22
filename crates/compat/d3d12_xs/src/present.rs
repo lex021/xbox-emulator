@@ -192,12 +192,19 @@ fn create_window(client_w: i32, client_h: i32) -> usize {
         const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
         let mut r = [0i32, 0, client_w, client_h];
         AdjustWindowRect(&mut r, WS_OVERLAPPEDWINDOW, 0);
+        let headless = compat_common::headless::enabled();
+        let ex = if headless { compat_common::headless::top_level_styles(WS_OVERLAPPEDWINDOW, 0).ex } else { 0 };
         let hwnd = CreateWindowExW(
-            0, class.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW, 80, 80, r[2] - r[0], r[3] - r[1],
+            ex, class.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW, 80, 80, r[2] - r[0], r[3] - r[1],
             core::ptr::null_mut(), core::ptr::null_mut(), inst, core::ptr::null_mut(),
         );
         if !hwnd.is_null() {
-            ShowWindow(hwnd, 5); // SW_SHOW
+            if headless {
+                compat_common::headless::cloak(hwnd);
+                ShowWindow(hwnd, compat_common::headless::SW_SHOWNA);
+            } else {
+                ShowWindow(hwnd, 5);
+            }
         }
         let _ = tx.send(hwnd as usize);
         let mut msg = [0u8; 48];
@@ -304,6 +311,11 @@ unsafe fn init(queue: *mut c_void, src: *mut c_void) -> Result<State, String> {
         }
         record("d3d12_xs", "PresentX", "title window not found (or TOMBOX_OWN_WINDOW=1): presenting into a TomBox host window");
     }
+    if compat_common::headless::enabled() {
+        let hr = compat_common::headless::cloak(hwnd as *mut c_void);
+        record("d3d12_xs", "PresentX", &format!("TOMBOX_HEADLESS: present window {hwnd:#x} cloaked (hr={hr:#010x}, cloaked={})", compat_common::headless::is_cloaked(hwnd as *mut c_void)));
+    }
+    crate::capture::start();
 
     let dxgi = LoadLibraryA(b"dxgi.dll\0".as_ptr());
     let create = GetProcAddress(dxgi, b"CreateDXGIFactory2\0".as_ptr());
@@ -378,7 +390,7 @@ unsafe fn snap_buffers(queue: *mut c_void, st: &State) -> Option<(*mut c_void, *
     if vcall!(queue, 7, fn(*const Guid, *mut *mut c_void) -> i32, &IID_DEVICE, &mut device) < 0 || device.is_null() {
         return None;
     }
-    let size = crate::present_snap::row_pitch(st.width as u32) as u64 * st.height as u64;
+    let size = crate::present_snap::pitch_for(st.width as u32, st.format) as u64 * st.height as u64;
     let heap: [u32; 5] = [3, 0, 0, 1, 1];
     let mut bd = [0u8; 0x38];
     bd[0..4].copy_from_slice(&1u32.to_le_bytes());
@@ -406,6 +418,61 @@ unsafe fn snap_buffers(queue: *mut c_void, st: &State) -> Option<(*mut c_void, *
     Some((out[0], out[1]))
 }
 
+struct CapPending(crate::capture::Req, usize, u64);
+unsafe impl Send for CapPending {}
+static CAP_PENDING: Mutex<Option<CapPending>> = Mutex::new(None);
+
+unsafe fn readback_buffer(device: *mut c_void, size: u64) -> Result<*mut c_void, i32> {
+    let heap: [u32; 5] = [3, 0, 0, 1, 1];
+    let mut bd = [0u8; 0x38];
+    bd[0..4].copy_from_slice(&1u32.to_le_bytes());
+    bd[0x10..0x18].copy_from_slice(&size.to_le_bytes());
+    bd[0x18..0x1c].copy_from_slice(&1u32.to_le_bytes());
+    bd[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes());
+    bd[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes());
+    bd[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+    bd[0x2c..0x30].copy_from_slice(&1u32.to_le_bytes());
+    let mut out: *mut c_void = core::ptr::null_mut();
+    let hr = vcall!(device, 27, fn(*const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32,
+        heap.as_ptr(), 0, bd.as_ptr(), 0x400, core::ptr::null(), &IID_RESOURCE, &mut out);
+    if hr < 0 || out.is_null() { Err(hr) } else { Ok(out) }
+}
+
+unsafe fn queue_capture(st: &State, src: *mut c_void) {
+    if CAP_PENDING.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+        return;
+    }
+    let Some(req) = crate::capture::take() else { return };
+    let size = crate::present_snap::pitch_for(st.width as u32, st.format) as u64 * st.height as u64;
+    let rb = match readback_buffer(st.device, size) {
+        Ok(rb) => rb,
+        Err(hr) => {
+            crate::capture::fail(&req, &format!("readback buffer {size:#x} hr={hr:#010x}"));
+            return;
+        }
+    };
+    let d = crate::present_snap::footprint_location(rb, st.format, st.width as u32, st.height);
+    let s = crate::present_snap::subresource_location(src);
+    vcall!(st.list, 16, fn(*const u8, u32, u32, u32, *const u8, *const c_void) -> (), d.as_ptr(), 0, 0, 0, s.as_ptr(), core::ptr::null());
+    *CAP_PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(CapPending(req, rb as usize, st.frames + 1));
+}
+
+unsafe fn complete_capture(st: &State) {
+    let Some(CapPending(req, rb, frame)) = CAP_PENDING.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let rb = rb as *mut c_void;
+    let len = crate::present_snap::pitch_for(st.width as u32, st.format) as usize * st.height as usize;
+    let mut p: *mut u8 = core::ptr::null_mut();
+    let hr = vcall!(rb, 8, fn(u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut p);
+    if hr >= 0 && !p.is_null() {
+        let data = core::slice::from_raw_parts(p, len).to_vec();
+        vcall!(rb, 9, fn(u32, *const c_void) -> (), 0, core::ptr::null());
+        crate::capture::finish(req, data, st.width as u32, st.height, st.format, frame);
+    } else {
+        crate::capture::fail(&req, &format!("readback Map hr={hr:#010x}"));
+    }
+    vcall!(rb, 2, fn() -> u32);
+}
+
 unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) -> Result<(), String> {
     const COMMON: u32 = 0; // == PRESENT
     const COPY_DEST: u32 = 0x400;
@@ -419,6 +486,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
         return Err("timed out waiting for previous present copy".into());
     }
     crate::present_probe::collect();
+    complete_capture(st);
     crate::overlay::tick(st.hwnd);
     let idx = vcall!(st.swapchain, 36, fn() -> u32);
     let mut dst: *mut c_void = core::ptr::null_mut();
@@ -432,6 +500,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
     let pre = [barrier(src, COMMON, COPY_SOURCE), barrier(dst, COMMON, COPY_DEST)];
     vcall!(st.list, 26, fn(u32, *const [u64; 4]) -> (), 2, pre.as_ptr());
     vcall!(st.list, 17, fn(*mut c_void, *mut c_void) -> (), dst, src); // CopyResource
+    queue_capture(st, src);
     let dst_state = if crate::overlay::draw(st.device, queue, st.list, dst, st.sc_format, st.width, st.height) { RENDER_TARGET } else { COPY_DEST };
     let snap_frame = st.frames + 1;
     let snaps = if crate::present_snap::wanted(snap_frame) { snap_buffers(queue, st) } else { None };
@@ -463,7 +532,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
             if crate::present_wait::wait_fence(st.fence, st.fence_value, 5000) {
                 let state = crate::gpu_va::state(src as usize);
                 for (tag, rb) in [("title_backbuffer", rb_src), ("presented_swapchain", rb_dst)] {
-                    let len = crate::present_snap::row_pitch(st.width as u32) as usize * st.height as usize;
+                    let len = crate::present_snap::pitch_for(st.width as u32, st.format) as usize * st.height as usize;
                     let mut p: *mut u8 = core::ptr::null_mut();
                     if vcall!(rb, 8, fn(u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut p) >= 0 && !p.is_null() {
                         let data = core::slice::from_raw_parts(p, len);
@@ -482,6 +551,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
         }
         let hr = vcall!(st.swapchain, 8, fn(u32, u32) -> i32, 0, present_flags());
         if hr < 0 {
+            crate::dred::on_failure(hr, "swapchain Present");
             return Err(format!("swapchain Present hr={hr:#010x}"));
         }
         st.frames += 1;
@@ -497,6 +567,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
     vcall!(queue, 14, fn(*mut c_void, u64) -> i32, st.fence, st.fence_value);
     let hr = crate::perf::timed(crate::perf::PFLIP, || vcall!(st.swapchain, 8, fn(u32, u32) -> i32, 0, present_flags()));
     if hr < 0 {
+        crate::dred::on_failure(hr, "swapchain Present");
         return Err(format!("swapchain Present hr={hr:#010x}"));
     }
     st.frames += 1;
@@ -549,6 +620,7 @@ unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes
     crate::gpuprof::on_present();
     crate::hot_reload::on_present();
     crate::present_probe::on_present(src, plane_count, planes);
+    crate::upload::register_direct_queue(queue);
     crate::slowcall::time("PresentX upload pump", || crate::perf::timed(crate::perf::UPLOAD, || crate::upload::pump(queue)));
     crate::slowcall::time("PresentX replay/rtcap", || crate::perf::timed(crate::perf::RTCAP, || {
         crate::replay::on_present(queue);

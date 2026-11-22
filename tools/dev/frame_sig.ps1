@@ -73,7 +73,7 @@ function Test-PadScreen($t, [string]$Name, [uint32[]]$Pids, [string]$Png) {
   if (-not $t.PSObject.Properties['PadScreens']) { return $null }
   $s = $t.PadScreens | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
   if (-not $s -or -not (Test-Path -LiteralPath $s.Ref)) { return $null }
-  try { $c = [TbFrame]::Capture($Pids, $Png) } catch { return $null }
+  try { $c = [TbFrame2]::Grab($Pids, $Png) } catch { return $null }
   if (-not $c -or -not $c.Drawn) { return $null }
   $hi = if ($s.Contains('Hi')) { $s.Hi } else { 215 }
   $v = [TbSig]::Score($Png, $s.Ref, $s.X, $s.Y, $s.W, $s.H, $s.CapW, $s.CapH, $hi, 60)

@@ -320,6 +320,7 @@ unsafe extern "system" fn watch_rel(this: *mut Watch) -> u32 {
 }
 
 fn placeholder_destroyed(key: usize) {
+    crate::dred_marks::forget(key);
     let Some(slot) = map().lock().unwrap_or_else(|e| e.into_inner()).remove(&key) else { return };
     LIVE.fetch_sub(1, Ordering::Relaxed);
     let mut g = slot.st.lock().unwrap_or_else(|e| e.into_inner());
@@ -390,6 +391,13 @@ unsafe fn snapshot_compute(pdesc: *const u8, num_ext: u32, pext: *const u8) -> O
 }
 
 unsafe fn launch(this: *mut DeviceWrapper, owned: Owned, num_ext: u32, riid: *const Guid, ppv: *mut *mut c_void, sync: CreateFn, kind: Kind, placeholder: &mut dyn FnMut() -> Result<*mut c_void, i32>) -> Option<i32> {
+    let marks = if !crate::dred_marks::enabled() {
+        crate::dred_marks::Hashes::default()
+    } else if kind == Kind::Graphics {
+        unsafe { crate::dred_marks::gfx_hashes(owned.desc.as_ptr()) }
+    } else {
+        unsafe { crate::dred_marks::compute_hashes(owned.desc.as_ptr()) }
+    };
     let slot = Arc::new(Slot { st: Mutex::new(Done { started: Some(std::time::Instant::now()), ..Default::default() }), cv: Condvar::new(), real: AtomicUsize::new(0), kind });
     let riid_v: Guid = unsafe { core::ptr::read(riid) };
     let (dev, ws) = (this as usize, slot.clone());
@@ -472,6 +480,7 @@ unsafe fn launch(this: *mut DeviceWrapper, owned: Owned, num_ext: u32, riid: *co
     }
     g.detached = true;
     drop(g);
+    crate::dred_marks::note(ph, marks, true);
     map().lock().unwrap_or_else(|e| e.into_inner()).insert(ph as usize, slot.clone());
     LIVE.fetch_add(1, Ordering::Relaxed);
     if !unsafe { watch(ph) } {

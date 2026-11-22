@@ -512,8 +512,13 @@ pub fn show(spec: Dialog, hwnd_out: Option<Arc<AtomicUsize>>) -> Outcome {
         if let Some(o) = &hwnd_out {
             o.store(h as usize, Ordering::Release);
         }
-        ShowWindow(h, 5);
-        SetForegroundWindow(h);
+        if crate::headless::enabled() {
+            crate::headless::cloak(h as *mut c_void);
+            ShowWindow(h, crate::headless::SW_SHOWNA);
+        } else {
+            ShowWindow(h, 5);
+            SetForegroundWindow(h);
+        }
         let focus = STATE.with(|st| st.borrow().as_ref().map(|s| if !s.edit.is_null() { s.edit } else if !s.list.is_null() { s.list } else { s.buttons.get(s.spec.default).copied().unwrap_or(core::ptr::null_mut()) }));
         if let Some(f) = focus {
             if !f.is_null() {

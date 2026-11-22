@@ -28,15 +28,15 @@ pub(super) fn cond(cc: &str, x: &str, y: &str, nan: &str) -> Result<String, Stri
         "tru" => return Ok("true".into()),
         "o" => return Ok(format!("(!{nan})")),
         "u" => return Ok(format!("({nan})")),
-        "lt" | "nlt" => format!("({x} < {y})"),
-        "eq" | "neq" => format!("({x} == {y})"),
-        "le" | "nle" => format!("({x} <= {y})"),
-        "gt" | "ngt" => format!("({x} > {y})"),
-        "ge" | "nge" => format!("({x} >= {y})"),
-        "lg" | "nlg" => format!("(({x} < {y}) || ({x} > {y}))"),
+        "lt" | "nge" => format!("({x} < {y})"),
+        "eq" | "nlg" => format!("({x} == {y})"),
+        "le" | "ngt" => format!("({x} <= {y})"),
+        "gt" | "nle" => format!("({x} > {y})"),
+        "ge" | "nlt" => format!("({x} >= {y})"),
+        "lg" | "neq" => format!("(({x} < {y}) || ({x} > {y}))"),
         other => return Err(format!("compare cond {other} unsupported")),
     };
-    Ok(if cc.starts_with('n') { format!("({nan} || (!{rel}))") } else { format!("({rel} && (!{nan}))") })
+    Ok(if cc.starts_with('n') { format!("({nan} || {rel})") } else { format!("({rel} && (!{nan}))") })
 }
 
 pub(super) fn either(ty: &str, a: &Opnd, b: &Opnd) -> Result<String, String> {

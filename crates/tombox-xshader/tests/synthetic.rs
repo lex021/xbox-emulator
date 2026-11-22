@@ -510,6 +510,7 @@ fn atomic_mubuf_addressing() {
         space: 0,
         lower: 0,
         upper: 0,
+        kind: 0,
     });
     let t4 = translate(&ex4).expect("translate atomic on structured UAV with offen");
     assert!(t4.hlsl.contains("InterlockedAdd(ubuf0[(((v0) + 0x8u) >> 2) / 4u].w[(((v0) + 0x8u) >> 2) % 4u], v1, t0);"), "{}", t4.hlsl);
@@ -531,6 +532,7 @@ fn atomic_mubuf_addressing() {
         space: 0,
         lower: 0,
         upper: 0,
+        kind: 0,
     });
     let t5 = translate(&ex5).expect("translate atomic on structured UAV with idxen");
     assert!(t5.hlsl.contains("InterlockedAdd(ubuf0[v0 + 0u].w[2], v1, t0);"), "{}", t5.hlsl);
@@ -598,6 +600,29 @@ fn vertex_misc_vector_export_feeds_the_render_target_array_index() {
     assert!(line.contains("uint4(") && line.trim_end().ends_with(".z);"), "{line}");
 }
 
+const EXP_POS0_V0_V3: [u32; 2] = [0xf800_08cf, 0x0300_0300];
+
+#[test]
+fn vertex_shader_receives_vertex_and_instance_index_in_v0_and_v3() {
+    let words = [EXP_POS0_V0_V3[0], EXP_POS0_V0_V3[1], S_ENDPGM];
+    let position = || vec![sig("SV_Position", 1, 3, 0, 0xf)];
+    let ex = shader(Stage::Vertex, &words, vec![sig("SV_VertexID", 6, 1, 0, 1), sig("SV_InstanceID", 8, 1, 1, 1)], position(), None);
+    let t = translate(&ex).expect("translate (vertex and instance index)");
+    assert!(t.hlsl.contains("    v0 = (uint)(i.i0);"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("    v3 = (uint)(i.i1);"), "{}", t.hlsl);
+    let ex = shader(Stage::Vertex, &words, vec![sig("SV_VertexID", 6, 1, 0, 1)], position(), None);
+    let t = translate(&ex).expect("translate (vertex index only)");
+    assert!(t.hlsl.contains("    v0 = (uint)(i.i0);"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("v3 = (uint)(i."), "{}", t.hlsl);
+    let mut attribute = sig("ATTRIBUTE", 0, 3, 0, 0xf);
+    attribute.rw_mask = 0xf;
+    let exp_pos0_v4_v5_v6_v7 = [0xf800_08cf, 0x0706_0504, S_ENDPGM];
+    let ex = shader(Stage::Vertex, &exp_pos0_v4_v5_v6_v7, vec![attribute, sig("SV_VertexID", 6, 1, 1, 1), sig("SV_InstanceID", 8, 1, 2, 1)], position(), None);
+    let t = translate(&ex).expect("translate (index declared, not read)");
+    assert!(!t.hlsl.contains("v0 = (uint)(i.") && !t.hlsl.contains("v3 = (uint)(i."), "{}", t.hlsl);
+    assert!(t.hlsl.contains("    v4 = asuint(i.i0.x);"), "{}", t.hlsl);
+}
+
 #[test]
 fn pixel_attribute_past_the_interpolants_reads_the_layer_sysval() {
     let words = [0xc802_0002, 0xf800_1c03, 0x0000_0000, S_ENDPGM];
@@ -644,4 +669,40 @@ fn durango_vertex_shader_sgpr_layout_investigation() {
     let ex = shader(Stage::Vertex, &words, vec![], vec![sig("SV_Position", 1, 3, 0, 0xf)], root);
     let res = translate(&ex);
     println!("Translation result: {:?}", res.as_ref().map(|t| &t.hlsl).map_err(|e| e));
+}
+
+#[test]
+fn image_ops_with_status_or_r128_bits_are_refused() {
+    let root = || Some(RootSig { version: 2, flags: 1, params: vec![table(0, 64, 5), table(2, 16, 5)], num_static_samplers: 0, static_samplers: Vec::new() });
+    let program = |load: u32| vec![0xf40c_0004, 0xfa00_0000, 0x7e00_0280, 0x7e02_0280, load, 0x0000_0000, 0x3604_0081, S_NOP, S_NOP, PACK_V0_V2_V2, PACK_V1_V2_V2, EXP_MRT0_COMPR[0], EXP_MRT0_COMPR[1], S_ENDPGM];
+    let out = || vec![sig("SV_Target", 64, 3, 0, 0xf)];
+    translate(&shader(Stage::Pixel, &program(0xf000_1108), vec![], out(), root())).expect("plain image_load");
+    for (bit, name) in [(15, "R128"), (16, "TFE"), (17, "LWE")] {
+        let e = translate(&shader(Stage::Pixel, &program(0xf000_1108 | 1 << bit), vec![], out(), root())).err().unwrap_or_else(|| panic!("{name} translated"));
+        assert!(e.contains(name), "{name}: {e}");
+    }
+}
+
+#[test]
+fn durango_vertex_fetch_call_synthesizes_attributes_from_input_signature() {
+    let words = [0xbe80_2100, 0xf800_00cf, 0x0706_0504, S_ENDPGM];
+    let pos_in = sig("POSITION", 0, 3, 0, 0xf);
+    let color_in = sig("COLOR", 0, 3, 1, 0xf);
+    let pos_out = sig("SV_Position", 1, 3, 0, 0xf);
+    let mut ex = shader(Stage::Vertex, &words, vec![pos_in, color_in], vec![pos_out], None);
+
+    let mut durango_blob = vec![0u8; 72];
+    durango_blob[0..8].copy_from_slice(&72u64.to_le_bytes());
+    durango_blob[0x18..0x1c].copy_from_slice(&5u32.to_le_bytes());
+    durango_blob[0x28..0x30].copy_from_slice(&64u64.to_le_bytes());
+    ex.fssm = durango_blob;
+
+    let t = translate(&ex).expect("Durango vertex shader with s_swappc translates");
+    assert!(t.hlsl.contains("struct SIn {"), "Missing SIn:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("float4 i0 : POSITION0;"), "Missing POSITION0:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("float4 i1 : COLOR0;"), "Missing COLOR0:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("v4 = asuint(i.i0.x);"), "Missing v4 init:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("v7 = asuint(i.i0.w);"), "Missing v7 init:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("v8 = asuint(i.i1.x);"), "Missing v8 init:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("v11 = asuint(i.i1.w);"), "Missing v11 init:\n{}", t.hlsl);
 }

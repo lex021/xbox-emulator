@@ -8,6 +8,7 @@ use std::sync::{Mutex, OnceLock};
 const ROUTES: &str = include_str!("../../../backend_data/trackmania/core_routes.json");
 const ACCESS_SECS: u64 = 3600;
 const REFRESH_SECS: u64 = 86400;
+const WAITING_REFRESH_SECS: u64 = 30;
 const AUDIENCES: &[&str] = &["NadeoServices", "NadeoLiveServices", "NadeoClubServices"];
 
 pub fn routes() -> &'static Vec<(String, String, Vec<String>)> {
@@ -22,8 +23,20 @@ pub fn routes() -> &'static Vec<(String, String, Vec<String>)> {
     })
 }
 
-pub fn route_table() -> Value {
-    serde_json::from_str(ROUTES).unwrap_or(Value::Null)
+pub const CORE_PORT: u16 = 443;
+
+pub fn route_table(host: &str) -> Value {
+    let mut v: Value = serde_json::from_str(ROUTES).unwrap_or(Value::Null);
+    if let Some(m) = v.as_object_mut() {
+        for r in m.values_mut() {
+            if let Some(o) = r.as_object_mut() {
+                o.insert("host".into(), json!(host));
+                o.insert("port".into(), json!(CORE_PORT));
+                o.insert("timeout".into(), json!(0));
+            }
+        }
+    }
+    v
 }
 
 pub fn match_route(method: &str, seg: &[&str]) -> Option<(&'static str, HashMap<String, String>)> {
@@ -426,7 +439,7 @@ impl Core {
         let arg = |k: &str| p.get(k).cloned().unwrap_or_default();
         let now = now_ts();
         let short = id.trim_start_matches("nadeoservices_");
-        if short != "api_routes_get" && short != "storage_object_url_redirect" && short != "storage_object_content_url_redirect" && self.bearer(req).filter(|c| !c.refresh).is_none() {
+        if short != "api_routes_get" && short != "client_debug_info_add" && short != "client_config_get" && short != "waiting_queue_client_add" && short != "storage_object_url_redirect" && short != "storage_object_content_url_redirect" && self.bearer(req).filter(|c| !c.refresh).is_none() {
             return nadeo_error(401, "C-AA-00-01", "A valid nadeo_v1 access token is required.", Value::Null);
         }
         if let Some(a) = p.get("accountId") {
@@ -436,7 +449,7 @@ impl Core {
         }
         match short {
             "api_routes_get" => match req.query("usage") {
-                Some(u) if u.eq_ignore_ascii_case("Client") || u.eq_ignore_ascii_case("Server") => Response::json(&route_table()),
+                Some(u) if u.eq_ignore_ascii_case("Client") || u.eq_ignore_ascii_case("Server") => Response::json(&route_table(host)),
                 _ => invalid("usage", "The usage must be Client or Server."),
             },
             "storage_object_url_redirect" | "storage_object_content_url_redirect" => {
@@ -447,7 +460,7 @@ impl Core {
                     None => not_found("Storage object"),
                 }
             }
-            "client_config_get" => Response::json(&json!({"timestamp": now, "settings": {"ClientLogsEnabled": true, "ClientDebugInfoEnabled": true}})),
+            "client_config_get" => Response::json(&json!({"timestamp": now, "settings": {}})),
             "title_client_config_get" => Response::json(&json!({"titleId": arg("titleId"), "timestamp": now, "settings": {}})),
             "account_client_config_get" => Response::json(&json!({"accountId": arg("accountId"), "timestamp": now, "settings": {}})),
             "account_client_plugins_get" => Response::json(&json!({"accountId": arg("accountId"), "plugins": []})),
@@ -458,6 +471,10 @@ impl Core {
             })),
             "client_file_list_get" => Response::json(&json!([])),
             "client_log_add" | "client_debug_info_add" => {
+                if short == "client_debug_info_add" {
+                    let text: String = String::from_utf8_lossy(&req.body).chars().take(2000).collect();
+                    crate::record_raw("online", "trackmania", &format!("client debug info: {text}"));
+                }
                 let mut st = self.st();
                 st.logs.push(json!({"kind": short, "received": now, "body": if body.is_null() { json!(String::from_utf8_lossy(&req.body)) } else { body.clone() }}));
                 if st.logs.len() > 2000 {
@@ -1062,9 +1079,11 @@ impl Core {
             }
             "waiting_queue_client_add" => {
                 let wid = arg("waitingClientId");
+                if wid.len() < 3 || !(wid.starts_with("u_") || wid.starts_with("r_")) {
+                    return invalid("waitingClientId", "Invalid waiting client id.");
+                }
                 let mut st = self.st();
-                let position = st.waiting.len();
-                let v = json!({"waitingClientId": wid, "position": 0, "queued": position, "canEnter": true, "timestamp": now});
+                let v = json!({"rank": 0, "refreshTime": WAITING_REFRESH_SECS, "waitingTime": 0, "timestamp": now});
                 st.waiting.insert(wid, v.clone());
                 Response::json(&v)
             }

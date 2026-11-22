@@ -12,6 +12,7 @@
 //! base interface — those will be addressed as the RHI exercises them.
 
 mod device_wrap;
+mod res3d;
 mod dxgi_device;
 mod xone_dxgi;
 mod xone_queue;
@@ -44,6 +45,7 @@ mod overlay_sensors;
 #[cfg(test)]
 mod overlay_hw;
 mod present_snap;
+mod capture;
 mod present_probe;
 mod frame;
 mod frame_fast;
@@ -114,6 +116,7 @@ mod pso_ext;
 mod global_bind;
 mod kmd10;
 mod dred;
+mod dred_marks;
 mod title_shadow;
 pub mod perfctr;
 #[cfg(test)]

@@ -28,25 +28,46 @@ pub struct SigElement {
     pub rw_mask: u8,
 }
 
-/// Parse an ISG1/OSG1 chunk body (32-byte elements).
-pub fn parse_signature(body: &[u8]) -> Result<Vec<SigElement>, String> {
+pub fn parse_signature(tag: &[u8; 4], body: &[u8]) -> Result<Vec<SigElement>, String> {
     let count = u32_at(body, 0)? as usize;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
     if count > 64 {
         return Err(format!("implausible signature element count {count}"));
     }
+    let is_24 = matches!(tag, b"ISGN" | b"OSGN" | b"PCSG");
+    let stride = if is_24 { 24 } else { 32 };
+    if 8 + count * stride > body.len() {
+        return Err(format!("signature body truncated for {count} elements"));
+    }
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        let e = 8 + i * 32;
-        let name_off = u32_at(body, e + 4)? as usize;
-        out.push(SigElement {
-            name: cstr_at(body, name_off),
-            index: u32_at(body, e + 8)?,
-            sysval: u32_at(body, e + 12)?,
-            comp_type: u32_at(body, e + 16)?,
-            register: u32_at(body, e + 20)?,
-            mask: *body.get(e + 24).ok_or("sig mask oob")?,
-            rw_mask: *body.get(e + 25).ok_or("sig rwmask oob")?,
-        });
+        if is_24 {
+            let e = 8 + i * 24;
+            let name_off = u32_at(body, e)? as usize;
+            out.push(SigElement {
+                name: cstr_at(body, name_off),
+                index: u32_at(body, e + 4)?,
+                sysval: u32_at(body, e + 8)?,
+                comp_type: u32_at(body, e + 12)?,
+                register: u32_at(body, e + 16)?,
+                mask: *body.get(e + 20).ok_or("sig mask oob")?,
+                rw_mask: *body.get(e + 21).ok_or("sig rwmask oob")?,
+            });
+        } else {
+            let e = 8 + i * 32;
+            let name_off = u32_at(body, e + 4)? as usize;
+            out.push(SigElement {
+                name: cstr_at(body, name_off),
+                index: u32_at(body, e + 8)?,
+                sysval: u32_at(body, e + 12)?,
+                comp_type: u32_at(body, e + 16)?,
+                register: u32_at(body, e + 20)?,
+                mask: *body.get(e + 24).ok_or("sig mask oob")?,
+                rw_mask: *body.get(e + 25).ok_or("sig rwmask oob")?,
+            });
+        }
     }
     Ok(out)
 }
@@ -59,6 +80,7 @@ pub struct PsvResource {
     pub space: u32,
     pub lower: u32,
     pub upper: u32,
+    pub kind: u32,
 }
 
 /// Parse the PSV0 chunk far enough to recover the resource-binding list.
@@ -162,6 +184,7 @@ pub fn parse_psv0(body: &[u8]) -> Result<Vec<PsvResource>, String> {
             space: u32_at(body, e + 4)?,
             lower: u32_at(body, e + 8)?,
             upper: u32_at(body, e + 12)?,
+            kind: if bind_size >= 24 { u32_at(body, e + 16)? } else { 0 },
         });
     }
     Ok(out)
@@ -295,4 +318,57 @@ pub fn parse_rts0(body: &[u8]) -> Result<RootSig, String> {
         }
     }
     Ok(RootSig { version, flags, params, num_static_samplers, static_samplers })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_both_24byte_isgn_and_32byte_isg1_signatures() {
+        let mut isgn = Vec::new();
+        isgn.extend_from_slice(&1u32.to_le_bytes());
+        isgn.extend_from_slice(&8u32.to_le_bytes());
+        let name_offset_24 = 8 + 24;
+        isgn.extend_from_slice(&(name_offset_24 as u32).to_le_bytes());
+        isgn.extend_from_slice(&0u32.to_le_bytes());
+        isgn.extend_from_slice(&0u32.to_le_bytes());
+        isgn.extend_from_slice(&3u32.to_le_bytes());
+        isgn.extend_from_slice(&0u32.to_le_bytes());
+        isgn.push(0x0f);
+        isgn.push(0x0f);
+        isgn.extend_from_slice(&[0, 0]);
+        isgn.extend_from_slice(b"POSITION\0");
+
+        let sig_24 = parse_signature(b"ISGN", &isgn).expect("parse ISGN");
+        assert_eq!(sig_24.len(), 1);
+        assert_eq!(sig_24[0].name, "POSITION");
+        assert_eq!(sig_24[0].comp_type, 3);
+        assert_eq!(sig_24[0].register, 0);
+        assert_eq!(sig_24[0].mask, 0x0f);
+        assert_eq!(sig_24[0].rw_mask, 0x0f);
+
+        let mut isg1 = Vec::new();
+        isg1.extend_from_slice(&1u32.to_le_bytes());
+        isg1.extend_from_slice(&8u32.to_le_bytes());
+        let name_offset_32 = 8 + 32;
+        isg1.extend_from_slice(&0u32.to_le_bytes());
+        isg1.extend_from_slice(&(name_offset_32 as u32).to_le_bytes());
+        isg1.extend_from_slice(&0u32.to_le_bytes());
+        isg1.extend_from_slice(&0u32.to_le_bytes());
+        isg1.extend_from_slice(&3u32.to_le_bytes());
+        isg1.extend_from_slice(&0u32.to_le_bytes());
+        isg1.push(0x0f);
+        isg1.push(0x0f);
+        isg1.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        isg1.extend_from_slice(b"POSITION\0");
+
+        let sig_32 = parse_signature(b"ISG1", &isg1).expect("parse ISG1");
+        assert_eq!(sig_32.len(), 1);
+        assert_eq!(sig_32[0].name, "POSITION");
+        assert_eq!(sig_32[0].comp_type, 3);
+        assert_eq!(sig_32[0].register, 0);
+        assert_eq!(sig_32[0].mask, 0x0f);
+        assert_eq!(sig_32[0].rw_mask, 0x0f);
+    }
 }

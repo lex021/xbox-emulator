@@ -55,7 +55,12 @@ pub const COMPRESSION_ZLIB: u8 = 1;
 pub const OPT_EXT10_VALID: u64 = 1 << 21;
 pub const OPT_SOURCE_MEMORY: u64 = 1 << 22;
 pub const OPT_EXT28_VALID: u64 = 1 << 23;
-pub const OPT_KNOWN_MASK: u64 = 0xff | OPT_SOURCE_MEMORY;
+pub const OPT_ZLIB: u64 = 1;
+pub const OPT_BCPACK_SHIFT: u32 = 1;
+pub const OPT_BCPACK_MASK: u64 = 0xf;
+pub const OPT_SWIZZLE_SHIFT: u32 = 5;
+pub const OPT_SWIZZLE_MASK: u64 = 0xffff;
+pub const OPT_KNOWN_MASK: u64 = OPT_ZLIB | (OPT_BCPACK_MASK << OPT_BCPACK_SHIFT) | OPT_SOURCE_MEMORY;
 
 pub const QUEUE_SOURCE_FILE: u32 = 0;
 pub const QUEUE_SOURCE_MEMORY: u32 = 1;

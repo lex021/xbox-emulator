@@ -717,7 +717,7 @@ pub fn end_frame(captured_into: Option<&std::path::Path>) {
         if t.trace_hashes != tl {
             t.trace_hashes = tl;
             t.trace_pso.clear();
-            t.trace_budget = 14;
+            t.trace_budget = 48;
         }
     });
     if let Some(dir) = captured_into {

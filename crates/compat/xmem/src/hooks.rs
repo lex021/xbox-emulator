@@ -69,6 +69,11 @@ unsafe fn report_free(heap: usize, flags: u32, ptr: usize) {
 
 unsafe extern "system" fn alloc_w<const I: usize>(heap: usize, flags: u32, size: usize) -> usize {
     let r = core::mem::transmute::<usize, AllocFn>(ALLOC_ORIG[I].load(Ordering::Acquire))(heap, flags, size);
+    if r != 0 {
+        if let Some(a) = crate::heap_acct::slot(heap) {
+            a.add(size);
+        }
+    }
     let h = TRACKING_HOOKS[0].load(Ordering::Acquire);
     if h != 0 {
         guarded(|| core::mem::transmute::<usize, AllocHook>(h)(heap, flags, size, r));
@@ -80,7 +85,15 @@ unsafe extern "system" fn realloc_w<const I: usize>(heap: usize, flags: u32, old
     if REALLOC_REPORTS_FREE.load(Ordering::Acquire) != 0 {
         report_free(heap, flags, old);
     }
+    let acct = crate::heap_acct::slot(heap);
+    let old_size = if acct.is_some() { crate::heap_acct::block_size(heap, flags, old) } else { None };
     let r = core::mem::transmute::<usize, ReallocFn>(REALLOC_ORIG[I].load(Ordering::Acquire))(heap, flags, old, size);
+    if let (Some(a), true) = (acct, r != 0) {
+        if let Some(o) = old_size {
+            a.sub(o);
+        }
+        a.add(size);
+    }
     let h = TRACKING_HOOKS[1].load(Ordering::Acquire);
     if h != 0 {
         guarded(|| core::mem::transmute::<usize, ReallocHook>(h)(heap, flags, size, old, r));
@@ -89,7 +102,12 @@ unsafe extern "system" fn realloc_w<const I: usize>(heap: usize, flags: u32, old
 }
 
 unsafe extern "system" fn free_w<const I: usize>(heap: usize, flags: u32, ptr: usize) -> usize {
+    let acct = crate::heap_acct::slot(heap);
+    let old_size = if acct.is_some() { crate::heap_acct::block_size(heap, flags, ptr) } else { None };
     let r = core::mem::transmute::<usize, FreeFn>(FREE_ORIG[I].load(Ordering::Acquire))(heap, flags, ptr);
+    if let (Some(a), Some(o), true) = (acct, old_size, r != 0) {
+        a.sub(o);
+    }
     report_free(heap, flags, ptr);
     r
 }
@@ -176,6 +194,11 @@ pub fn heap_rule(_dll: &[u8], name: Option<&[u8]>, value: usize) -> Option<usize
     let k = name.and_then(heap_kind_by_name).or_else(|| heap_known().iter().find(|(f, _)| *f == value).map(|(_, k)| *k))?;
     let i = claim(origs(k), value)?;
     Some(wrappers(k)[i])
+}
+
+pub fn install_heap_accounting() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| iat::patch_all(&heap_rule))
 }
 
 pub fn install_heap_hooks() {

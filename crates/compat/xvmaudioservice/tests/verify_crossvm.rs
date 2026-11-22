@@ -14,6 +14,17 @@ const PKEY_AUDIO_ENGINE_DEVICE_FORMAT: ([u8; 16], u32) = ([77, 6, 159, 241, 44, 
 extern "system" {
     fn WaitForSingleObject(h: isize, ms: u32) -> u32;
     fn ResetEvent(h: isize) -> i32;
+    fn QueryPerformanceCounter(v: *mut i64) -> i32;
+    fn QueryPerformanceFrequency(v: *mut i64) -> i32;
+}
+
+fn qpc_100ns() -> i64 {
+    let (mut c, mut f) = (0i64, 0i64);
+    unsafe {
+        QueryPerformanceCounter(&mut c);
+        QueryPerformanceFrequency(&mut f);
+    }
+    (c as i128 * 10_000_000 / f as i128) as i64
 }
 
 unsafe fn vslot<T: Copy>(obj: *mut c_void, slot: usize) -> T {
@@ -90,6 +101,21 @@ fn crossvm_audio_devices_sessions_and_volumes_follow_the_guest_layouts() {
 }
 
 #[test]
+fn crossvm_audio_guest_get_position_reads_wasapi_clock_records() {
+    run_step("position");
+}
+
+#[test]
+fn crossvm_audio_shared_stream_and_clock_adjustment_follow_the_guest_layouts() {
+    run_step("shared");
+}
+
+#[test]
+fn crossvm_audio_endpoint_and_spatial_queries_match_the_pc() {
+    run_step("endpoint");
+}
+
+#[test]
 fn inner() {
     let Ok(step) = std::env::var(STEP) else { return };
     let dir = std::env::temp_dir().join(format!("xvmaudio_crossvm_{}", std::process::id()));
@@ -107,6 +133,9 @@ fn inner() {
     let mix = e[0x10..0x10 + mix_len].to_vec();
     match step.as_str() {
         "render" => render(&mix),
+        "position" => position(&mix),
+        "shared" => shared(&mix),
+        "endpoint" => endpoint(&mix),
         _ => objects(&mix),
     }
     println!("STEP OK");
@@ -507,9 +536,346 @@ fn objects(mix: &[u8]) {
     e[0x16..0x16 + mix.len()].copy_from_slice(mix);
     assert_eq!(send(&mut e), 0, "the mix format is supported in shared mode");
 
-    let mut e = envelope(0x47, dev);
+    let mut e = envelope(0x64, dev);
     assert_eq!(send(&mut e), 0x8000_4001u32 as i32, "an id with no decoded layout reports E_NOTIMPL");
     for o in [ps, vol, sess, ep, dev, enumerator] {
+        let mut e = envelope(crossvm::RELEASE_OBJECT, o);
+        assert_eq!(send(&mut e), 0);
+    }
+}
+
+fn init_stream(mix: &[u8], flags: u32) -> (u32, i32, Vec<u8>) {
+    let (hr, e) = create(2, 1, 0, 0x2f, &[]);
+    assert_eq!(hr, 0);
+    let object = u32_at(&e, 0x1c);
+    let mut e = envelope(crossvm::INITIALIZE, object);
+    let a = 0x10;
+    e[a + crossvm::INIT_FLAGS..a + crossvm::INIT_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
+    e[a + 8..a + 16].copy_from_slice(&1_000_000i64.to_le_bytes());
+    e[a + 0x18..a + 0x18 + mix.len()].copy_from_slice(mix);
+    let hr = send(&mut e);
+    (object, hr, e[a..].to_vec())
+}
+
+fn guest_position(cb: *const u8, align: u64) -> Option<(u64, i64)> {
+    let r32 = |o: usize| unsafe { (cb.add(o) as *const u32).read_volatile() };
+    let r64 = |o: usize| unsafe { (cb.add(o) as *const u64).read_volatile() };
+    let flags = r32(crossvm::CB_FLAGS);
+    if flags & 4 == 0 {
+        return Some((r64(0x98) / align, -1));
+    }
+    if flags & 2 == 0 {
+        return None;
+    }
+    let mut got = None;
+    for _ in 0..3 {
+        let idx = r32(0xa0) as usize;
+        let rec = 0x20 + idx * 0x28;
+        let v = (r64(rec), r64(rec + 0x18) as i64, unsafe { (cb.add(rec + 0x20) as *const f32).read_volatile() }, r32(rec + 0x24));
+        if r32(0xa0) as usize == idx {
+            got = Some(v);
+            break;
+        }
+    }
+    let (pos, qpc, rate, valid) = got.expect("the guest retries the seqlock 3 times (12cdb -> 3b6b0)");
+    assert_eq!(valid, 1);
+    let (base, pad, anchor) = (r64(0x70), r64(0x80), r64(0x98) / align);
+    let now = qpc_100ns();
+    assert!(now >= qpc, "record QPC {qpc} is not in the future of {now}");
+    if pos < base + pad {
+        return Some((anchor, now - qpc));
+    }
+    let elapsed = ((now - qpc) as f64 * rate as f64 / 1e7 + 0.5) as u64;
+    let read = r64(crossvm::CB_READ) / align;
+    Some(((pos - base - pad + elapsed + anchor).min(read), now - qpc))
+}
+
+fn position(mix: &[u8]) {
+    let align = u16::from_le_bytes([mix[0xc], mix[0xd]]) as u64;
+    let rate = u32_at(mix, 4);
+    let (object, hr, _) = init_stream(mix, 0);
+    assert_eq!(hr, 0);
+    let (base, _, _, _, _) = crossvm::stream_info(object).unwrap();
+    let cb = base as *mut u8;
+    let r32 = |o: usize| unsafe { (cb.add(o) as *const u32).read_volatile() };
+    assert_eq!(r32(crossvm::CB_FLAGS), crossvm::FLAG_POSITION_IS_READ, "before the first clock record the guest reads READ");
+    let c = crossvm::CB_CONFIG;
+    let (start, end) = (r32(c + crossvm::CFG_DATA_START) as usize, r32(c + crossvm::CFG_DATA_END) as usize);
+    let bytes = ((end - start) / 2 / align as usize) * align as usize;
+    let mut e = envelope(crossvm::START, object);
+    assert_eq!(send(&mut e), 0);
+    let t = std::time::Instant::now();
+    let mut written = 0usize;
+    let mut samples = Vec::new();
+    while t.elapsed().as_millis() < 1500 {
+        let read = unsafe { (cb.add(crossvm::CB_READ) as *const i64).read_volatile() } as usize;
+        if written - read < bytes / 2 {
+            let n = bytes / 2;
+            for i in 0..n {
+                unsafe { *cb.add(start + (written + i) % (end - start)) = 0 };
+            }
+            written += n;
+            unsafe { (*(cb.add(crossvm::CB_WRITE) as *const std::sync::atomic::AtomicI64)).fetch_add(n as i64, std::sync::atomic::Ordering::SeqCst) };
+        }
+        if let Some(p) = guest_position(cb, align) {
+            samples.push(p);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let (records, rec_rate, _) = crossvm::stream_records(object).unwrap();
+    println!("{records} WASAPI clock records, {} guest GetPosition samples, last {:?}, rate {rec_rate}", samples.len(), samples.last());
+    assert!(records > 10, "the host publishes IAudioClock records while running");
+    assert_eq!(rec_rate, rate as f32, "the record rate equals the stream rate, so the guest takes the non-adjusted path");
+    assert!(samples.len() > 50, "flags bits 1 and 2 are set once the first record lands");
+    let slack = rate as u64 / 1000;
+    let back = samples.windows(2).map(|w| w[0].0.saturating_sub(w[1].0)).max().unwrap_or(0);
+    println!("largest step back between guest GetPosition samples: {back} frames (1 ms = {slack})");
+    assert!(back <= slack, "guest position is monotonic within 1 ms of clock jitter");
+    assert!(samples.iter().all(|s| s.1 < 2_000_000), "every record QPC is within 200 ms of the guest QPC");
+    let played = samples.last().unwrap().0;
+    let wall = (t.elapsed().as_secs_f64() * rate as f64) as u64;
+    println!("guest position {played} frames after {wall} wall-clock frames");
+    assert!(played > wall / 4 && played <= wall + rate as u64 / 10, "the interpolated position follows the PC device clock");
+    let mut e = envelope(crossvm::STOP, object);
+    assert_eq!(send(&mut e), 0);
+    let t = std::time::Instant::now();
+    while r32(crossvm::CB_FLAGS) & 4 != 0 && t.elapsed().as_secs() < 2 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let read_frames = unsafe { (cb.add(crossvm::CB_READ) as *const u64).read_volatile() } / align;
+    let s1 = guest_position(cb, align).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let s2 = guest_position(cb, align).unwrap();
+    println!("stopped: guest GetPosition {} then {} frames (READ {read_frames})", s1.0, s2.0);
+    assert_eq!(s1.1, -1, "after Stop flags bit 2 is clear and the guest returns cb+0x98");
+    assert_eq!(s1.0, s2.0, "the stopped position is frozen");
+    assert!(s1.0 <= read_frames && s1.0 + slack >= played, "the frozen value is the PC clock at Stop, not READ");
+    let mut e = envelope(crossvm::START, object);
+    assert_eq!(send(&mut e), 0);
+    let mut resumed = Vec::new();
+    let t = std::time::Instant::now();
+    while t.elapsed().as_millis() < 400 {
+        if let Some(p) = guest_position(cb, align) {
+            resumed.push(p.0);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let mut e = envelope(crossvm::STOP, object);
+    assert_eq!(send(&mut e), 0);
+    let back = resumed.iter().fold((s1.0, 0u64), |(prev, worst), &p| (p, worst.max(prev.saturating_sub(p)))).1;
+    println!("after restart: {} samples from {:?} to {:?}, largest step back {back}", resumed.len(), resumed.first(), resumed.last());
+    assert!(back <= slack, "restart continues from the frozen position (cb+0x98 anchor) without going back");
+    let mut e = envelope(crossvm::RESET, object);
+    assert_eq!(send(&mut e), 0);
+    let t = std::time::Instant::now();
+    while crossvm::stream_records(object).unwrap().2 == 0 && t.elapsed().as_secs() < 2 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(guest_position(cb, align).unwrap(), (0, -1), "after Reset the guest reads position 0 from cb+0x98");
+    unsafe { (*(cb.add(crossvm::CB_READ) as *const std::sync::atomic::AtomicI64)).store(0, std::sync::atomic::Ordering::SeqCst) };
+    unsafe { (*(cb.add(crossvm::CB_WRITE) as *const std::sync::atomic::AtomicI64)).store(0, std::sync::atomic::Ordering::SeqCst) };
+    let t = std::time::Instant::now();
+    while crossvm::stream_records(object).unwrap().2 < 2 && t.elapsed().as_secs() < 2 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(crossvm::stream_records(object).unwrap().2, 2, "a 19041 guest Reset (local 20b70 zeroes READ) also resets the PC client");
+    let mut e = envelope(crossvm::START, object);
+    assert_eq!(send(&mut e), 0);
+    let t = std::time::Instant::now();
+    let mut fed = 0i64;
+    while t.elapsed().as_millis() < 300 {
+        let read = unsafe { (cb.add(crossvm::CB_READ) as *const i64).read_volatile() };
+        if fed - read < (bytes / 2) as i64 {
+            unsafe { (*(cb.add(crossvm::CB_WRITE) as *const std::sync::atomic::AtomicI64)).fetch_add((bytes / 2) as i64, std::sync::atomic::Ordering::SeqCst) };
+            fed += (bytes / 2) as i64;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let before = crossvm::stream_records(object).unwrap().2;
+    let mut e = envelope(crossvm::STOP, object);
+    assert_eq!(send(&mut e), 0);
+    unsafe { (*(cb.add(crossvm::CB_READ) as *const std::sync::atomic::AtomicI64)).store(0, std::sync::atomic::Ordering::SeqCst) };
+    unsafe { (*(cb.add(crossvm::CB_WRITE) as *const std::sync::atomic::AtomicI64)).store((bytes / 2) as i64, std::sync::atomic::Ordering::SeqCst) };
+    let mut e = envelope(crossvm::START, object);
+    assert_eq!(send(&mut e), 0);
+    let t = std::time::Instant::now();
+    while crossvm::stream_records(object).unwrap().2 == before && t.elapsed().as_secs() < 2 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(crossvm::stream_records(object).unwrap().2, before + 1, "Stop, guest Reset, Start back to back still resets the PC client");
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let quick = guest_position(cb, align).map(|p| p.0).unwrap_or(0);
+    let mut e = envelope(crossvm::STOP, object);
+    assert_eq!(send(&mut e), 0);
+    println!("back-to-back Stop/Reset/Start: guest GetPosition {quick} frames 30 ms after Start (before reset {})", s2.0);
+    assert!(quick < rate as u64 / 10, "after a back-to-back guest Reset the position restarts near 0");
+    let mut e = envelope(crossvm::RELEASE_OBJECT, object);
+    assert_eq!(send(&mut e), 0);
+}
+
+fn shared(mix: &[u8]) {
+    let rate = u32_at(mix, 4);
+    let mut e = envelope(crossvm::GET_SHARED_MODE_ENGINE_PERIOD, 0);
+    e[0x10..0x10 + mix.len()].copy_from_slice(mix);
+    assert_eq!(send(&mut e), 0);
+    let (def, fund, min, max) = (u32_at(&e, 0x58), u32_at(&e, 0x5c), u32_at(&e, 0x60), u32_at(&e, 0x64));
+    println!("engine periods default {def} fundamental {fund} min {min} max {max} frames");
+    assert!(fund > 0 && min <= def && def <= max);
+    let (hr, e) = create(2, 1, 0, 0x2f, &[]);
+    assert_eq!(hr, 0);
+    let object = u32_at(&e, 0x1c);
+    let mut e = envelope(crossvm::CLOCK_SET_SAMPLE_RATE, object);
+    e[0x10..0x14].copy_from_slice(&(rate as f32).to_le_bytes());
+    assert_eq!(send(&mut e), 0x8889_0001u32 as i32, "SetSampleRate before the stream exists is AUDCLNT_E_NOT_INITIALIZED");
+    let mut e = envelope(crossvm::INITIALIZE_SHARED_AUDIO_STREAM, object);
+    let a = 0x10;
+    e[a..a + mix.len()].copy_from_slice(mix);
+    e[a + crossvm::SHARED_INIT_PERIOD..a + crossvm::SHARED_INIT_PERIOD + 4].copy_from_slice(&def.to_le_bytes());
+    let hr = send(&mut e);
+    println!("InitializeSharedAudioStream({def} frames) -> {hr:#010x}");
+    assert_eq!(hr, 0);
+    let r = e[a..].to_vec();
+    let l = &crossvm::SHARED_INIT_LAYOUT;
+    assert_eq!(&r[..mix.len()], mix, "the reply keeps the format at A+0 (parser checks cbSize at env+0x20)");
+    assert_eq!(u32_at(&r, crossvm::SHARED_INIT_PERIOD), def);
+    assert_eq!(&r[l.clsid..l.clsid + 4], &0xCD773740u32.to_le_bytes(), "render endpoint CLSID at +0x60");
+    assert_eq!(u32_at(&r, l.event1), crossvm::KIND_NONE);
+    assert_eq!(u32_at(&r, l.event2), crossvm::KIND_NONE);
+    assert_eq!(u32_at(&r, l.event3), crossvm::KIND_CROSS_VM_EVENT);
+    assert_eq!(u32_at(&r, l.event3 + 0x24), crossvm::EVENT_KIND_GAMECORE);
+    assert_eq!(u32_at(&r, 0x3f0), 0, "+0x3f0 (the Initialize +0x400 flag) is 0");
+    assert_eq!(u32_at(&r, l.memory), crossvm::KIND_CROSS_VM_MEMORY);
+    for o in [0x70usize, 0x74, 0x78, 0x7c, 0x80, 0x518, 0x51c, 0x520] {
+        assert_eq!(u32_at(&r, o), 0, "reply field {o:#x} is 0");
+    }
+    let (_, pool, frames, _, _) = crossvm::stream_info(object).unwrap();
+    assert_eq!(u32_at(&r, l.memory + 0x24), pool as u32);
+    assert!(frames >= def * 2, "the ring holds two engine periods ({frames} frames)");
+    let mut e = envelope(crossvm::INITIALIZE_SHARED_AUDIO_STREAM, object);
+    e[a..a + mix.len()].copy_from_slice(mix);
+    e[a + crossvm::SHARED_INIT_PERIOD..a + crossvm::SHARED_INIT_PERIOD + 4].copy_from_slice(&def.to_le_bytes());
+    assert_eq!(send(&mut e), 0x8889_0002u32 as i32, "a second initialisation is AUDCLNT_E_ALREADY_INITIALIZED");
+    let s0 = crossvm::stream_signals(object).unwrap();
+    let mut e = envelope(crossvm::START, object);
+    assert_eq!(send(&mut e), 0);
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let mut e = envelope(crossvm::STOP, object);
+    assert_eq!(send(&mut e), 0);
+    assert!(crossvm::stream_signals(object).unwrap() - s0 >= 2, "the shared-stream path signals the period event");
+    let mut e = envelope(crossvm::CLOCK_SET_SAMPLE_RATE, object);
+    e[0x10..0x14].copy_from_slice(&(rate as f32 + 10.0).to_le_bytes());
+    let hr = send(&mut e);
+    println!("SetSampleRate on a stream without RATEADJUST -> {hr:#010x}");
+    assert!(hr < 0, "WASAPI refuses IAudioClockAdjustment without AUDCLNT_STREAMFLAGS_RATEADJUST");
+    let mut e = envelope(crossvm::RELEASE_OBJECT, object);
+    assert_eq!(send(&mut e), 0);
+
+    let (adj, hr, _) = init_stream(mix, console_sandbox::wasapi::STREAMFLAGS_RATEADJUST);
+    println!("Initialize with RATEADJUST -> {hr:#010x}");
+    assert_eq!(hr, 0);
+    let target = rate as f32 + 10.0;
+    let mut e = envelope(crossvm::CLOCK_SET_SAMPLE_RATE, adj);
+    e[0x10..0x14].copy_from_slice(&target.to_le_bytes());
+    let hr = send(&mut e);
+    println!("IAudioClockAdjustment::SetSampleRate({target}) -> {hr:#010x}");
+    assert_eq!(hr, 0);
+    assert_eq!(crossvm::stream_records(adj).unwrap().1, target, "the PC IAudioClockAdjustment took the rate");
+    let mut e = envelope(crossvm::RELEASE_OBJECT, adj);
+    assert_eq!(send(&mut e), 0);
+}
+
+fn endpoint(_mix: &[u8]) {
+    use console_sandbox::wasapi;
+    let (hr, e) = create(1, 1, 0, 0, &[]);
+    assert_eq!(hr, 0);
+    let enumerator = u32_at(&e, 0x1c);
+    let mut e = envelope(crossvm::ENUMERATOR_SUBSCRIBE, enumerator);
+    assert_eq!(send(&mut e), 0);
+    assert!(crossvm::notifications_registered(enumerator), "0x23 (sent from the enumerator init and re-sent on reconnect) subscribes");
+    let mut e = envelope(crossvm::ENUMERATOR_UNSUBSCRIBE, enumerator);
+    assert_eq!(send(&mut e), 0);
+    assert!(!crossvm::notifications_registered(enumerator), "0x24 (sent from the enumerator destructor) unsubscribes");
+
+    let (hr, e) = create(5, 0, enumerator, crossvm::METHOD_DEFAULT_ENDPOINT, &[0u8; 8]);
+    assert_eq!(hr, 0);
+    let dev = u32_at(&e, 0x1c);
+    let id = crossvm::object_device(dev).unwrap();
+    let mut e = envelope(crossvm::ENDPOINT_HOST_STREAM_MODES, dev);
+    e[0x10..0x18].fill(0xcc);
+    assert_eq!(send(&mut e), 0);
+    assert_eq!((u32_at(&e, 0x10), u32_at(&e, 0x14)), (0, 0), "0x29 R+0/R+4: the host forces no console stream-flag bits 25/26");
+    let mut e = envelope(crossvm::ENDPOINT_OFFLOAD_SERVICE, dev);
+    e[0x10..0x14].fill(0xcc);
+    assert_eq!(send(&mut e), 0);
+    let off = wasapi::endpoint_offload(Some(&id)).unwrap();
+    println!("0x2a offload {} (PC IAudioClient2::IsOffloadCapable over all categories {off})", u32_at(&e, 0x10));
+    assert_eq!(u32_at(&e, 0x10), off);
+
+    let (hr, e) = create(4, 0, dev, 0, &[]);
+    assert_eq!(hr, 0);
+    let sc = u32_at(&e, 0x1c);
+    let pc = match wasapi::spatial(Some(&id)) {
+        Ok(p) => p,
+        Err(hr) => {
+            let mut e = envelope(crossvm::SPATIAL_STATIC_POSITION, sc);
+            assert_eq!(send(&mut e), hr, "no PC ISpatialAudioClient: the PC error is returned");
+            println!("PC ISpatialAudioClient unavailable {hr:#010x}");
+            return;
+        }
+    };
+    let mut e = envelope(crossvm::SPATIAL_STATIC_POSITION, sc);
+    e[0x10..0x14].copy_from_slice(&2u32.to_le_bytes());
+    let hr = send(&mut e);
+    match pc.static_position(2) {
+        Ok(p) => {
+            assert_eq!(hr, 0);
+            let got = [f32_at(&e, 0x14), f32_at(&e, 0x18), f32_at(&e, 0x1c)];
+            println!("GetStaticObjectPosition(FrontLeft) {got:?}");
+            assert_eq!(got, p, "x/y/z at R+4/R+8/R+0xc");
+        }
+        Err(pe) => assert_eq!(hr, pe),
+    }
+    let mut e = envelope(crossvm::FORMAT_ENUM_COUNT, sc);
+    let hr = send(&mut e);
+    match pc.format_count() {
+        Ok(n) => {
+            assert_eq!(hr, 0);
+            assert_eq!(u32_at(&e, 0x10), n);
+            println!("object format count {n}");
+        }
+        Err(pe) => assert_eq!(hr, pe),
+    }
+    let mut e = envelope(crossvm::FORMAT_ENUM_GET, sc);
+    let hr = send(&mut e);
+    let fmt = match pc.format_at(0) {
+        Ok(f) => {
+            assert_eq!(hr, 0);
+            let plain = crossvm::plain_format(&f);
+            assert_eq!(&e[0x14..0x26], &plain[..], "WAVEFORMATEX (0x12 bytes) at R+4");
+            assert_eq!(u16::from_le_bytes([e[0x24], e[0x25]]), 0, "cbSize 0: the guest copies only 0x12 bytes");
+            println!("object format tag {:#x} {} Hz {} ch", u16::from_le_bytes([plain[0], plain[1]]), u32::from_le_bytes(plain[4..8].try_into().unwrap()), plain[2]);
+            Some(f)
+        }
+        Err(pe) => {
+            assert_eq!(hr, pe);
+            None
+        }
+    };
+    if let Some(f) = fmt {
+        let mut e = envelope(crossvm::SPATIAL_MAX_FRAMES_FOR_CATEGORY, sc);
+        e[0x10..0x10 + f.len()].copy_from_slice(&f);
+        e[0x10 + crossvm::SPATIAL_CATEGORY_AT..0x14 + crossvm::SPATIAL_CATEGORY_AT].copy_from_slice(&6u32.to_le_bytes());
+        let hr = send(&mut e);
+        match pc.max_frames_for_category(6, false, &f) {
+            Ok(n) => {
+                assert_eq!(hr, 0);
+                assert_eq!(u32_at(&e, 0x10 + crossvm::SPATIAL_FRAMES_AT), n, "frames at R+0x4c");
+                println!("GetMaxFrameCountForCategory(GameEffects) {n}");
+            }
+            Err(pe) => assert_eq!(hr, pe),
+        }
+    }
+    for o in [sc, dev, enumerator] {
         let mut e = envelope(crossvm::RELEASE_OBJECT, o);
         assert_eq!(send(&mut e), 0);
     }

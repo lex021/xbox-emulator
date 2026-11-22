@@ -5,7 +5,7 @@ use super::xfer::host_wide;
 
 pub const DELTA_RECEIVE_TIMEOUT: u32 = 120000;
 pub const DELTA_ENTRY_SIZE: usize = 32;
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+pub const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 const INVALID_HANDLE: isize = -1;
 
 #[repr(C)]
@@ -177,7 +177,43 @@ impl DeltaEntry {
     }
 }
 
-pub fn lookup(table: &[DeltaEntry], hash: &[u8; 16]) -> Option<usize> {
+pub const DELTA_TABLE_GROWTH: usize = 50000;
+
+fn units_eq_at(buf: &[u8], at: usize, key: &[u16]) -> bool {
+    let mut o = at;
+    for &k in key.iter().chain(core::iter::once(&0u16)) {
+        if o + 2 > buf.len() {
+            return false;
+        }
+        if u16::from_le_bytes([buf[o], buf[o + 1]]) != k {
+            return false;
+        }
+        o += 2;
+    }
+    true
+}
+
+pub fn resolve_collision(collisions: &[u8], key: &[u16]) -> Option<usize> {
+    let size = collisions.len();
+    let mut at = 0usize;
+    while at < size {
+        if units_eq_at(collisions, at, key) {
+            let o = at + key.len() * 2 + 2;
+            if o + 4 > size {
+                return None;
+            }
+            return Some(u32::from_le_bytes(collisions[o..o + 4].try_into().unwrap()) as usize);
+        }
+        let mut c = at;
+        while c < size && c + 1 < size && u16::from_le_bytes([collisions[c], collisions[c + 1]]) != 0 {
+            c += 2;
+        }
+        at = c + 6;
+    }
+    None
+}
+
+pub fn find(table: &[DeltaEntry], collisions: &[u8], hash: &[u8; 16], key: &[u16]) -> Option<usize> {
     let mut n = 0usize;
     let mut steps = 0usize;
     loop {
@@ -191,15 +227,84 @@ pub fn lookup(table: &[DeltaEntry], hash: &[u8; 16]) -> Option<usize> {
             core::cmp::Ordering::Greater => n = e.greater as usize,
             core::cmp::Ordering::Equal => {
                 let g = e.greater as usize;
-                if g == 0 || table.get(g).map_or(true, |x| x.hash != *hash) {
-                    return Some(n);
+                if g != 0 && table.get(g).is_some_and(|x| x.hash == *hash) {
+                    return resolve_collision(collisions, key);
                 }
-                return None;
+                return Some(n);
             }
         }
         if n == 0 {
             return None;
         }
+    }
+}
+
+#[derive(Default)]
+pub struct DeltaTable {
+    pub entries: Vec<DeltaEntry>,
+    pub collisions: Vec<u8>,
+    pub collision_count: u32,
+}
+
+impl DeltaTable {
+    pub fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+
+    pub fn add(&mut self, relative: &[u16]) -> usize {
+        if self.entries.len() == self.entries.capacity() {
+            self.entries.reserve_exact(DELTA_TABLE_GROWTH);
+        }
+        let key = normalize_key(relative);
+        let bytes: Vec<u8> = key.iter().flat_map(|u| u.to_le_bytes()).collect();
+        self.add_hashed(md5(&bytes), &key)
+    }
+
+    pub fn add_hashed(&mut self, hash: [u8; 16], key: &[u16]) -> usize {
+        let idx = self.entries.len();
+        self.entries.push(DeltaEntry { hash, time: 0, less: 0, greater: 0 });
+        self.update_binary_tree(idx, key);
+        idx
+    }
+
+    fn update_binary_tree(&mut self, idx: usize, key: &[u16]) {
+        if idx == 0 {
+            return;
+        }
+        let new_hash = self.entries[idx].hash;
+        let mut node = 0usize;
+        let mut seen_equal = false;
+        loop {
+            let ord = self.entries[node].hash.cmp(&new_hash);
+            seen_equal |= ord == core::cmp::Ordering::Equal;
+            let go_less = ord == core::cmp::Ordering::Less;
+            let next = if go_less { self.entries[node].less } else { self.entries[node].greater } as usize;
+            if next != 0 && !(seen_equal && ord != core::cmp::Ordering::Equal) {
+                node = next;
+                continue;
+            }
+            if next != 0 {
+                self.entries[idx].greater = next as u32;
+            }
+            if go_less {
+                self.entries[node].less = idx as u32;
+            } else {
+                self.entries[node].greater = idx as u32;
+            }
+            break;
+        }
+        if seen_equal {
+            for u in key {
+                self.collisions.extend_from_slice(&u.to_le_bytes());
+            }
+            self.collisions.extend_from_slice(&[0, 0]);
+            self.collisions.extend_from_slice(&(idx as u32).to_le_bytes());
+            self.collision_count += 1;
+        }
+    }
+
+    pub fn table_bytes(&self) -> Vec<u8> {
+        self.entries.iter().flat_map(|e| e.to_bytes()).collect()
     }
 }
 
@@ -242,34 +347,47 @@ fn name_of(d: &FindData) -> String {
     String::from_utf16_lossy(&d.file_name[..n])
 }
 
-fn probe_symlink(child: &str, d: &mut FindData) -> HRESULT {
+pub struct Probed {
+    pub attributes: u32,
+    pub creation: [u32; 2],
+    pub access: [u32; 2],
+    pub write: [u32; 2],
+    pub size_high: u32,
+    pub size_low: u32,
+}
+
+pub fn probe_symlink_target(child: &str) -> Result<Probed, HRESULT> {
     let a = file::get_attributes_raw(child);
     let flags = if a & FILE_ATTRIBUTE_DIRECTORY != 0 { 0x0200_0010 } else { 0x80 };
-    let w = match host_wide(child) {
-        Ok(w) => w,
-        Err(e) => return e,
-    };
+    let w = host_wide(child)?;
     let h = unsafe { CreateFileW(w.as_ptr(), 0, 1, null_mut(), 3, flags, 0) };
     if h == INVALID_HANDLE {
-        return last_hr();
+        return Err(last_hr());
     }
     let mut bh = ByHandleInfo::default();
     let ok = unsafe { GetFileInformationByHandle(h, &mut bh) };
-    let hr = if ok == 0 { last_hr() } else { S_OK };
+    let r = if ok == 0 { Err(last_hr()) } else { Ok(Probed { attributes: bh.attributes, creation: bh.creation, access: bh.access, write: bh.write, size_high: bh.size_high, size_low: bh.size_low }) };
     unsafe { CloseHandle(h) };
-    if ok != 0 {
-        d.attributes = bh.attributes;
-        d.creation = bh.creation;
-        d.access = bh.access;
-        d.write = bh.write;
-        d.size_high = bh.size_high;
-        d.size_low = bh.size_low;
+    r
+}
+
+fn probe_symlink(child: &str, d: &mut FindData) -> HRESULT {
+    match probe_symlink_target(child) {
+        Ok(p) => {
+            d.attributes = p.attributes;
+            d.creation = p.creation;
+            d.access = p.access;
+            d.write = p.write;
+            d.size_high = p.size_high;
+            d.size_low = p.size_low;
+            S_OK
+        }
+        Err(e) => e,
     }
-    hr
 }
 
 fn find_first(pattern: &str, d: &mut FindData) -> Result<Option<isize>, HRESULT> {
-    let w = host_wide(pattern);
+    let w = crate::paths::host_search_path(pattern).map(|h| h.wide).map_err(hr_from_win32);
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -292,7 +410,7 @@ fn find_first(pattern: &str, d: &mut FindData) -> Result<Option<isize>, HRESULT>
     }
 }
 
-pub fn enumerate_delta_root(root: &str, table: &[DeltaEntry], result: &mut DeltaResult, remove_orphans: bool, timer: &mut Timer, stats: &mut ScanStats) -> HRESULT {
+pub fn enumerate_delta_root(root: &str, table: &[DeltaEntry], collisions: &[u8], result: &mut DeltaResult, remove_orphans: bool, timer: &mut Timer, stats: &mut ScanStats) -> HRESULT {
     stats.files_deleted = 0;
     stats.dirs_deleted = 0;
     let full = match full_path_name(root) {
@@ -331,9 +449,11 @@ pub fn enumerate_delta_root(root: &str, table: &[DeltaEntry], result: &mut Delta
                 }
                 timer.mark("HashPrep");
                 let units: Vec<u16> = child.encode_utf16().collect();
-                let h = hash_key(&units[root_len.min(units.len())..]);
+                let key = normalize_key(&units[root_len.min(units.len())..]);
+                let kb: Vec<u8> = key.iter().flat_map(|u| u.to_le_bytes()).collect();
+                let h = md5(&kb);
                 timer.mark("Hash");
-                let found = lookup(table, &h);
+                let found = find(table, collisions, &h, &key);
                 timer.mark("HashFind");
                 match found {
                     Some(i) => {
@@ -492,7 +612,7 @@ pub unsafe fn calculate_incremental_changes(session: Session, request: *mut c_vo
         timer.mark("Network");
         let table: Vec<DeltaEntry> = raw.chunks_exact(DELTA_ENTRY_SIZE).map(DeltaEntry::from_bytes).collect();
         let mut result = DeltaResult::new(req.file_count);
-        let hr = enumerate_delta_root(&root, &table, &mut result, req.remove_orphans, &mut timer, &mut stats);
+        let hr = enumerate_delta_root(&root, &table, &collisions, &mut result, req.remove_orphans, &mut timer, &mut stats);
         if hr < 0 {
             break 'reply hr;
         }

@@ -26,7 +26,7 @@ fn is_core_host(h: &str) -> bool {
 }
 
 pub const NADEO_PARAMETER_GROUP: &str = "NadeoServicesParameters";
-pub const MASTERSERVER_INIT_URL: &str = "https://prod.trackmania.core.nadeo.online/";
+pub const MASTERSERVER_INIT_URL: &str = "https://prod.trackmania.core.nadeo.online/api/routes";
 
 pub fn nadeo_parameter_group() -> Value {
     serde_json::json!({ "fields": { "masterserver_init_url": MASTERSERVER_INIT_URL }, "relatedPopulation": Value::Null })

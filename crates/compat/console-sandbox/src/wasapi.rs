@@ -1,5 +1,5 @@
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::gcdcom::Guid;
@@ -16,6 +16,20 @@ const IID_IAUDIO_SESSION_MANAGER: Guid = Guid { data1: 0xBFA971F1, data2: 0x4D5E
 const IID_IAUDIO_SESSION_CONTROL2: Guid = Guid { data1: 0xBFB7FF88, data2: 0x7239, data3: 0x4FC9, data4: [0x8F, 0xA2, 0x07, 0xC9, 0x50, 0xBE, 0x9C, 0x6D] };
 const IID_ISPATIAL_AUDIO_CLIENT: Guid = Guid { data1: 0xBBF8E066, data2: 0xAAAA, data3: 0x49BE, data4: [0x9A, 0x4D, 0xFD, 0x2A, 0x85, 0x8E, 0xA2, 0x7F] };
 const IID_ISPATIAL_AUDIO_CLIENT2: Guid = Guid { data1: 0xCAABE452, data2: 0xA66A, data3: 0x4BEE, data4: [0xA9, 0x3E, 0xE3, 0x20, 0x46, 0x3F, 0x6A, 0x53] };
+const IID_IAUDIO_CLOCK: Guid = Guid { data1: 0xCD63314F, data2: 0x3FBA, data3: 0x4A1B, data4: [0x81, 0x2C, 0xEF, 0x96, 0x35, 0x87, 0x28, 0xE7] };
+const IID_IAUDIO_CLOCK_ADJUSTMENT: Guid = Guid { data1: 0xF6E4C0A0, data2: 0x46D9, data3: 0x4FB8, data4: [0xBE, 0x21, 0x57, 0xA3, 0xEF, 0x2B, 0x62, 0x6C] };
+pub const STREAMFLAGS_RATEADJUST: u32 = 0x0010_0000;
+pub const AUDIO_CATEGORIES: u32 = 12;
+pub const CB_RECORD_INDEX: usize = 0xa0;
+pub const CB_FLAGS: usize = 0xa4;
+pub const CB_RECORDS: usize = 0x20;
+pub const CB_RECORD: usize = 0x28;
+pub const CB_BASE_POSITION: usize = 0x70;
+pub const CB_BASE_PADDING: usize = 0x80;
+pub const CB_BASE_QPC: usize = 0x88;
+pub const CB_ANCHOR: usize = 0x98;
+pub const FLAG_RECORDS: u32 = 2;
+pub const FLAG_POSITION_IS_READ: u32 = 4;
 const CLSCTX_ALL: u32 = 0x17;
 pub const SHARED: u32 = 0;
 const AUTOCONVERT: u32 = 0x8000_0000 | 0x0800_0000;
@@ -25,6 +39,7 @@ pub const E_NOINTERFACE: i32 = 0x8000_4002u32 as i32;
 pub const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
 pub const E_NOTFOUND: i32 = 0x8007_0490u32 as i32;
 pub const AUDCLNT_E_NOT_STOPPED: i32 = 0x8889_0005u32 as i32;
+pub const AUDCLNT_E_NOT_INITIALIZED: i32 = 0x8889_0001u32 as i32;
 
 #[link(name = "ole32")]
 extern "system" {
@@ -489,6 +504,18 @@ pub fn session_set_ducking(id: Option<&str>, session: &Guid, opt_out: bool) -> i
     }
 }
 
+pub fn endpoint_offload(id: Option<&str>) -> Result<u32, i32> {
+    let mut any = 0u32;
+    for cat in 0..AUDIO_CATEGORIES {
+        match offload_capable(id, cat) {
+            Ok(b) => any |= (b != 0) as u32,
+            Err(E_INVALIDARG) => {}
+            Err(hr) => return Err(hr),
+        }
+    }
+    Ok(any)
+}
+
 pub struct Spatial(Com);
 
 pub fn spatial(id: Option<&str>) -> Result<Spatial, i32> {
@@ -526,17 +553,57 @@ impl Spatial {
     pub fn stream_available(&self, iid: &Guid) -> i32 {
         unsafe { slot::<unsafe extern "system" fn(*mut c_void, *const Guid, *const c_void) -> i32>(self.0 .0, 9)(self.0 .0, iid, core::ptr::null()) }
     }
+    unsafe fn client2(&self) -> Result<Com, i32> {
+        let mut c2 = core::ptr::null_mut();
+        let hr = slot::<unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32>(self.0 .0, 0)(self.0 .0, &IID_ISPATIAL_AUDIO_CLIENT2, &mut c2);
+        if hr < 0 { Err(hr) } else { Ok(Com(c2)) }
+    }
     pub fn offload_capable(&self, category: u32) -> Result<u32, i32> {
         unsafe {
-            let mut c2 = core::ptr::null_mut();
-            let hr = slot::<unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32>(self.0 .0, 0)(self.0 .0, &IID_ISPATIAL_AUDIO_CLIENT2, &mut c2);
-            if hr < 0 {
-                return Err(hr);
-            }
-            let c2 = Com(c2);
+            let c2 = self.client2()?;
             let mut b = 0i32;
             let hr = slot::<unsafe extern "system" fn(*mut c_void, u32, *mut i32) -> i32>(c2.0, 11)(c2.0, category, &mut b);
             if hr < 0 { Err(hr) } else { Ok(b as u32) }
+        }
+    }
+    pub fn max_frames_for_category(&self, category: u32, offload: bool, fmt: &[u8]) -> Result<u32, i32> {
+        unsafe {
+            let c2 = self.client2()?;
+            let mut n = 0u32;
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, u32, i32, *const u8, *mut u32) -> i32>(c2.0, 12)(c2.0, category, offload as i32, fmt.as_ptr(), &mut n);
+            if hr < 0 { Err(hr) } else { Ok(n) }
+        }
+    }
+    pub fn static_position(&self, kind: u32) -> Result<[f32; 3], i32> {
+        unsafe {
+            let mut p = [0f32; 3];
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, u32, *mut f32, *mut f32, *mut f32) -> i32>(self.0 .0, 3)(self.0 .0, kind, &mut p[0], &mut p[1], &mut p[2]);
+            if hr < 0 { Err(hr) } else { Ok(p) }
+        }
+    }
+    unsafe fn formats(&self) -> Result<Com, i32> {
+        let mut e = core::ptr::null_mut();
+        let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32>(self.0 .0, 6)(self.0 .0, &mut e);
+        if hr < 0 { Err(hr) } else { Ok(Com(e)) }
+    }
+    pub fn format_count(&self) -> Result<u32, i32> {
+        unsafe {
+            let e = self.formats()?;
+            let mut n = 0u32;
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, *mut u32) -> i32>(e.0, 3)(e.0, &mut n);
+            if hr < 0 { Err(hr) } else { Ok(n) }
+        }
+    }
+    pub fn format_at(&self, index: u32) -> Result<Vec<u8>, i32> {
+        unsafe {
+            let e = self.formats()?;
+            let mut f: *mut u8 = core::ptr::null_mut();
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, u32, *mut *mut u8) -> i32>(e.0, 4)(e.0, index, &mut f);
+            if hr < 0 || f.is_null() {
+                return Err(hr);
+            }
+            let head = core::slice::from_raw_parts(f, 0x12);
+            Ok(core::slice::from_raw_parts(f, format_len(head)).to_vec())
         }
     }
 }
@@ -558,6 +625,34 @@ impl Ring {
     pub fn bytes(&self) -> u32 {
         self.end - self.start
     }
+    fn word(&self, o: usize) -> &AtomicU32 {
+        unsafe { &*((self.base + o) as *const AtomicU32) }
+    }
+    pub unsafe fn publish_position(&self, frames: u64, qpc: u64, rate: f32, base: u64, anchor: u64) {
+        let p = self.base as *mut u8;
+        let w64 = |o: usize, v: u64| (p.add(o) as *mut u64).write_volatile(v);
+        let cur = self.word(CB_RECORD_INDEX).load(Ordering::Acquire);
+        let next = (cur == 0) as u32;
+        let r = CB_RECORDS + next as usize * CB_RECORD;
+        w64(r, frames);
+        w64(r + 8, frames);
+        w64(r + 0x10, 0);
+        w64(r + 0x18, qpc);
+        (p.add(r + 0x20) as *mut f32).write_volatile(rate);
+        (p.add(r + 0x24) as *mut u32).write_volatile(1);
+        self.word(CB_RECORD_INDEX).swap(next, Ordering::AcqRel);
+        if self.word(CB_FLAGS).load(Ordering::Acquire) & FLAG_RECORDS == 0 {
+            w64(CB_BASE_POSITION, base);
+            w64(CB_BASE_PADDING, 0);
+            w64(CB_BASE_QPC, qpc);
+            (*((self.base + CB_ANCHOR) as *const AtomicU64)).swap(anchor, Ordering::AcqRel);
+            self.word(CB_FLAGS).fetch_or(FLAG_RECORDS | FLAG_POSITION_IS_READ, Ordering::AcqRel);
+        }
+    }
+    pub fn freeze_position(&self, bytes: u64) {
+        unsafe { (*((self.base + CB_ANCHOR) as *const AtomicU64)).swap(bytes, Ordering::AcqRel) };
+        self.word(CB_FLAGS).fetch_and(!(FLAG_RECORDS | FLAG_POSITION_IS_READ), Ordering::AcqRel);
+    }
 }
 
 #[derive(Default)]
@@ -574,6 +669,9 @@ pub struct Shared {
     pub client: AtomicUsize,
     pub latency: AtomicI64,
     pub period: AtomicI64,
+    pub rate: AtomicU32,
+    pub records: AtomicI64,
+    pub rebases: AtomicI64,
 }
 
 pub struct Renderer {
@@ -604,6 +702,8 @@ pub struct Open {
     pub duration: i64,
     pub session: Guid,
     pub properties: Option<[u32; 4]>,
+    pub flags: u32,
+    pub period_frames: Option<u32>,
 }
 
 pub fn open(o: Open, ring: Ring) -> Result<(Renderer, u32), i32> {
@@ -628,6 +728,34 @@ impl Renderer {
     pub fn stream_latency(&self) -> i64 {
         self.shared.latency.load(Ordering::SeqCst)
     }
+    pub fn set_sample_rate(&self, rate: f32) -> i32 {
+        unsafe {
+            let c = self.shared.client.load(Ordering::SeqCst) as *mut c_void;
+            if c.is_null() {
+                return AUDCLNT_E_NOT_INITIALIZED;
+            }
+            let mut adj = core::ptr::null_mut();
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32>(c, 14)(c, &IID_IAUDIO_CLOCK_ADJUSTMENT, &mut adj);
+            if hr < 0 {
+                return hr;
+            }
+            let adj = Com(adj);
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, f32) -> i32>(adj.0, 3)(adj.0, rate);
+            if hr >= 0 {
+                self.shared.rate.store(rate.to_bits(), Ordering::SeqCst);
+            }
+            hr
+        }
+    }
+    pub fn current_rate(&self) -> f32 {
+        f32::from_bits(self.shared.rate.load(Ordering::SeqCst))
+    }
+    pub fn records(&self) -> i64 {
+        self.shared.records.load(Ordering::SeqCst)
+    }
+    pub fn rebases(&self) -> i64 {
+        self.shared.rebases.load(Ordering::SeqCst)
+    }
 }
 
 unsafe fn run(o: Open, ring: Ring, s: Arc<Shared>, tx: std::sync::mpsc::Sender<Result<u32, i32>>) {
@@ -642,7 +770,20 @@ unsafe fn run(o: Open, ring: Ring, s: Arc<Shared>, tx: std::sync::mpsc::Sender<R
         let props = [16u32, p[0], p[1], p[2]];
         slot::<unsafe extern "system" fn(*mut c_void, *const u32) -> i32>(c.0, 16)(c.0, props.as_ptr());
     }
-    let hr = slot::<unsafe extern "system" fn(*mut c_void, u32, u32, i64, i64, *const u8, *const Guid) -> i32>(c.0, 3)(c.0, SHARED, AUTOCONVERT, o.duration, 0, o.format.as_ptr(), &o.session);
+    let flags = o.flags & STREAMFLAGS_RATEADJUST;
+    let hr = match o.period_frames {
+        Some(p) => {
+            let mut c3 = core::ptr::null_mut();
+            let hr = slot::<unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32>(c.0, 0)(c.0, &IID_IAUDIO_CLIENT3, &mut c3);
+            if hr < 0 {
+                let _ = tx.send(Err(hr));
+                return;
+            }
+            let c3 = Com(c3);
+            slot::<unsafe extern "system" fn(*mut c_void, u32, u32, *const u8, *const Guid) -> i32>(c3.0, 20)(c3.0, flags, p, o.format.as_ptr(), &o.session)
+        }
+        None => slot::<unsafe extern "system" fn(*mut c_void, u32, u32, i64, i64, *const u8, *const Guid) -> i32>(c.0, 3)(c.0, SHARED, AUTOCONVERT | flags, o.duration, 0, o.format.as_ptr(), &o.session),
+    };
     if hr < 0 {
         let _ = tx.send(Err(hr));
         return;
@@ -662,6 +803,14 @@ unsafe fn run(o: Open, ring: Ring, s: Arc<Shared>, tx: std::sync::mpsc::Sender<R
         return;
     }
     let rc = Com(rc);
+    let mut clock = core::ptr::null_mut();
+    slot::<unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32>(c.0, 14)(c.0, &IID_IAUDIO_CLOCK, &mut clock);
+    let clock = Com(clock);
+    let mut clock_freq = 0u64;
+    if !clock.0.is_null() {
+        slot::<unsafe extern "system" fn(*mut c_void, *mut u64) -> i32>(clock.0, 3)(clock.0, &mut clock_freq);
+    }
+    s.rate.store((sample_rate(&o.format) as f32).to_bits(), Ordering::SeqCst);
     let mut vol = core::ptr::null_mut();
     slot::<unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32>(c.0, 14)(c.0, &IID_ISIMPLE_AUDIO_VOLUME, &mut vol);
     let vol = Com(vol);
@@ -679,17 +828,46 @@ unsafe fn run(o: Open, ring: Ring, s: Arc<Shared>, tx: std::sync::mpsc::Sender<R
     let period = std::time::Duration::from_nanos(s.period.load(Ordering::SeqCst) as u64 * 100);
     let mut next_signal = std::time::Instant::now();
     let mut playing = false;
+    let mut last_clock = 0u64;
+    let mut base_frames: Option<u64> = None;
+    let mut frozen: Option<u64> = None;
+    let mut last_read = 0i64;
+    let nominal = sample_rate(&o.format) as f32;
     let mut applied_gain: Option<f32> = None;
     let mut applied_channels: Option<Vec<f32>> = None;
     while !s.quit.load(Ordering::SeqCst) {
+        let r = ring.read_pos().load(Ordering::Acquire);
+        let guest_reset = r < last_read;
+        last_read = r;
+        if s.reset.swap(false, Ordering::SeqCst) || guest_reset {
+            if playing {
+                slot::<unsafe extern "system" fn(*mut c_void) -> i32>(c.0, 11)(c.0);
+                playing = false;
+            }
+            slot::<unsafe extern "system" fn(*mut c_void) -> i32>(c.0, 12)(c.0);
+            base_frames = None;
+            frozen = None;
+            ring.freeze_position(0);
+            last_clock = 0;
+            s.rebases.fetch_add(1, Ordering::SeqCst);
+        }
         let want = s.running.load(Ordering::SeqCst);
         if want != playing {
             slot::<unsafe extern "system" fn(*mut c_void) -> i32>(c.0, if want { 10 } else { 11 })(c.0);
             playing = want;
             next_signal = std::time::Instant::now();
-        }
-        if !playing && s.reset.swap(false, Ordering::SeqCst) {
-            slot::<unsafe extern "system" fn(*mut c_void) -> i32>(c.0, 12)(c.0);
+            if !playing {
+                if let Some(b) = base_frames {
+                    let (mut pos, mut qpc) = (0u64, 0u64);
+                    slot::<unsafe extern "system" fn(*mut c_void, *mut u64, *mut u64) -> i32>(clock.0, 4)(clock.0, &mut pos, &mut qpc);
+                    let f = (pos as u128 * rate as u128 / clock_freq.max(1) as u128) as u64;
+                    let read = (ring.read_pos().load(Ordering::Acquire).max(0) as u64) / align as u64;
+                    last_clock = pos;
+                    let held = f.saturating_sub(b).min(read);
+                    frozen = Some(held);
+                    ring.freeze_position(held * align as u64);
+                }
+            }
         }
         let g = *s.gain.lock().unwrap();
         if g != applied_gain && !vol.0.is_null() {
@@ -707,6 +885,17 @@ unsafe fn run(o: Open, ring: Ring, s: Arc<Shared>, tx: std::sync::mpsc::Sender<R
         }
         if playing {
             pump(c.0, rc.0, frames, &ring, align, &s);
+            if clock_freq != 0 {
+                let (mut pos, mut qpc) = (0u64, 0u64);
+                if slot::<unsafe extern "system" fn(*mut c_void, *mut u64, *mut u64) -> i32>(clock.0, 4)(clock.0, &mut pos, &mut qpc) >= 0 && qpc != 0 && pos != last_clock {
+                    last_clock = pos;
+                    let f = (pos as u128 * rate as u128 / clock_freq as u128) as u64;
+                    let b = *base_frames.get_or_insert(f);
+                    let held = frozen.unwrap_or(f.saturating_sub(b));
+                    ring.publish_position(f, qpc, nominal, b + held, held * align as u64);
+                    s.records.fetch_add(1, Ordering::SeqCst);
+                }
+            }
             let now = std::time::Instant::now();
             if now >= next_signal {
                 for &e in s.signal.lock().unwrap().iter() {
@@ -756,6 +945,6 @@ unsafe fn pump(c: *mut c_void, rc: *mut c_void, frames: u32, ring: &Ring, align:
         cap.extend_from_slice(core::slice::from_raw_parts(dst, total));
     }
     slot::<unsafe extern "system" fn(*mut c_void, u32, u32) -> i32>(rc, 4)(rc, n as u32, 0);
-    ring.read_pos().store(r + total as i64, Ordering::Release);
+    let _ = ring.read_pos().compare_exchange(r, r + total as i64, Ordering::AcqRel, Ordering::Acquire);
     s.rendered.fetch_add(total as i64, Ordering::SeqCst);
 }

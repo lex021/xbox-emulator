@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 mod host;
+mod history;
 pub mod mouse;
 
 extern "system" {
@@ -21,6 +22,8 @@ const S_OK: i32 = 0;
 const E_NOTIMPL: i32 = 0x8000_4001u32 as i32;
 const READING_NOT_FOUND: i32 = 0x838A_0003u32 as i32;
 const DEVICE_DISCONNECTED: i32 = 0x838A_0001u32 as i32;
+const REFERENCE_READING_TOO_OLD: i32 = 0x838A_0004u32 as i32;
+const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
 
 pub const BTN_MENU: u32 = 0x1;
 pub const BTN_VIEW: u32 = 0x2;
@@ -181,6 +184,7 @@ pub fn parse_command(line: &str) -> Result<Option<Cmd>, String> {
 
 static STATE: Mutex<PadState> = Mutex::new(PadState { buttons: 0, axes: [0.0; 6] });
 static SEQ: AtomicU64 = AtomicU64::new(1);
+static HIST: Mutex<history::History> = Mutex::new(history::History::new());
 static POLLS: AtomicU64 = AtomicU64::new(0);
 static REAL_THIS: AtomicUsize = AtomicUsize::new(0);
 static ORIG: [AtomicUsize; 24] = [const { AtomicUsize::new(0) }; 24];
@@ -254,9 +258,10 @@ fn update(what: &str, f: impl FnOnce(&mut PadState)) {
     let s = {
         let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
         f(&mut g);
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+        HIST.lock().unwrap_or_else(|e| e.into_inner()).push(history::Entry { seq, ts: now_us(), state: g.to_bytes() });
         *g
     };
-    SEQ.fetch_add(1, Ordering::SeqCst);
     log("state", &format!("{what} -> buttons={:#06x} lt={:.2} rt={:.2} lx={:.2} ly={:.2} rx={:.2} ry={:.2}",
         s.buttons, s.axes[0], s.axes[1], s.axes[2], s.axes[3], s.axes[4], s.axes[5]));
 }
@@ -397,14 +402,61 @@ fn is_reading(p: *mut c_void) -> bool {
 
 fn new_reading() -> *mut c_void {
     POLLS.fetch_add(1, Ordering::SeqCst);
+    let (seq, state) = {
+        let g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let seq = SEQ.load(Ordering::SeqCst);
+        let state = g.to_bytes();
+        let mut h = HIST.lock().unwrap_or_else(|e| e.into_inner());
+        if h.len() == 0 {
+            h.push(history::Entry { seq, ts: now_us(), state });
+        }
+        (seq, state)
+    };
+    reading_from(history::Entry { seq, ts: now_us(), state })
+}
+
+fn reading_from(e: history::Entry) -> *mut c_void {
     let r = Box::new(Reading {
         vtbl: core::ptr::addr_of!(READING_VTBL) as *const usize,
         refs: AtomicU32::new(1),
-        ts: now_us(),
-        seq: SEQ.load(Ordering::SeqCst),
-        state: snapshot().to_bytes(),
+        ts: e.ts,
+        seq: e.seq,
+        state: e.state,
     });
     Box::into_raw(r) as *mut c_void
+}
+
+unsafe fn virtual_neighbour(newer: bool, reference: *mut c_void, kind: u32, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return 0x8000_4003u32 as i32;
+    }
+    *out = core::ptr::null_mut();
+    if reference.is_null() {
+        return E_INVALIDARG;
+    }
+    if !is_reading(reference) {
+        return READING_NOT_FOUND;
+    }
+    if !CONNECTED.load(Ordering::SeqCst) {
+        return DEVICE_DISCONNECTED;
+    }
+    if kind & KIND_GAMEPAD == 0 {
+        return READING_NOT_FOUND;
+    }
+    let seq = (*(reference as *mut Reading)).seq;
+    let now = now_us();
+    let step = {
+        let mut h = HIST.lock().unwrap_or_else(|e| e.into_inner());
+        if newer { h.next(seq, now) } else { h.prev(seq, now) }
+    };
+    match step {
+        history::Step::Found(e) => {
+            *out = reading_from(e);
+            S_OK
+        }
+        history::Step::NotFound => READING_NOT_FOUND,
+        history::Step::TooOld => REFERENCE_READING_TOO_OLD,
+    }
 }
 
 unsafe extern "system" fn rd_qi(this: *mut c_void, _iid: *const u8, out: *mut *mut c_void) -> i32 {
@@ -508,10 +560,7 @@ unsafe extern "system" fn gi_current(this: *mut c_void, kind: u32, device: *mut 
 unsafe extern "system" fn gi_next(this: *mut c_void, reference: *mut c_void, kind: u32, device: *mut c_void, out: *mut *mut c_void) -> i32 {
     host::count(5);
     if device == vdev() || is_reading(reference) {
-        if !out.is_null() {
-            *out = core::ptr::null_mut();
-        }
-        return READING_NOT_FOUND;
+        return virtual_neighbour(true, reference, kind, out);
     }
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, *mut *mut c_void) -> i32 = core::mem::transmute(orig(5));
     host::drop_host_pad(f(this, reference, kind, device, out), out)
@@ -520,10 +569,7 @@ unsafe extern "system" fn gi_next(this: *mut c_void, reference: *mut c_void, kin
 unsafe extern "system" fn gi_prev(this: *mut c_void, reference: *mut c_void, kind: u32, device: *mut c_void, out: *mut *mut c_void) -> i32 {
     host::count(6);
     if device == vdev() || is_reading(reference) {
-        if !out.is_null() {
-            *out = core::ptr::null_mut();
-        }
-        return READING_NOT_FOUND;
+        return virtual_neighbour(false, reference, kind, out);
     }
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, *mut *mut c_void) -> i32 = core::mem::transmute(orig(6));
     host::drop_host_pad(f(this, reference, kind, device, out), out)

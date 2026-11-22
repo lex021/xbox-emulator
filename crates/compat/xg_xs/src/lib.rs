@@ -531,13 +531,43 @@ pub unsafe extern "system" fn XGCreateBVHComputer(out: *mut *mut c_void) -> i32 
 pub unsafe extern "system" fn XGComputeTileShape(dim: u32, format: u32, bytes_per_element: u32, samples: u32, texels: *mut tile::TileShape, elements: *mut tile::TileShape) -> i32 {
     tile::compute(dim, format, bytes_per_element, samples, texels.as_mut(), elements.as_mut())
 }
+#[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "system" fn XGEncodeDCC(count: u32, src: *const u8, dst: *mut u8, meta: *mut u8, sizes: *mut u32, format: u32, swizzle: u32, dim: u32, params: *const u32) -> i32 {
-    dcc::encode_export(count, src, dst, meta, sizes, format, swizzle, dim, params)
+    core::arch::naked_asm!(
+        "push rcx", "push rdx", "push r8", "push r9",
+        "lea rcx, [rsp + 0x20]",
+        "sub rsp, 0x28",
+        "call {set}",
+        "add rsp, 0x28",
+        "pop r9", "pop r8", "pop rdx", "pop rcx",
+        "jmp {imp}",
+        set = sym dcc::set_entry,
+        imp = sym encode_dcc_entry,
+    )
 }
+unsafe extern "system" fn encode_dcc_entry(count: u32, src: *const u8, dst: *mut u8, meta: *mut u8, sizes: *mut u32, format: u32, swizzle: u32, dim: u32, params: *const u32) -> i32 {
+    let e = dcc::take_entry();
+    dcc::with_entry(e, || dcc::encode_export(count, src, dst, meta, sizes, format, swizzle, dim, params))
+}
+#[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "system" fn XGDecodeDCC(count: u32, src: *const u8, meta: *const u8, dst: *mut u8, format: u32, swizzle: u32, dim: u32, params: *const u32) -> i32 {
-    dcc::decode_export(count, src, meta, dst, format, swizzle, dim, params)
+    core::arch::naked_asm!(
+        "push rcx", "push rdx", "push r8", "push r9",
+        "lea rcx, [rsp + 0x20]",
+        "sub rsp, 0x28",
+        "call {set}",
+        "add rsp, 0x28",
+        "pop r9", "pop r8", "pop rdx", "pop rcx",
+        "jmp {imp}",
+        set = sym dcc::set_entry,
+        imp = sym decode_dcc_entry,
+    )
+}
+unsafe extern "system" fn decode_dcc_entry(count: u32, src: *const u8, meta: *const u8, dst: *mut u8, format: u32, swizzle: u32, dim: u32, params: *const u32) -> i32 {
+    let e = dcc::take_entry();
+    dcc::with_entry(e, || dcc::decode_export(count, src, meta, dst, format, swizzle, dim, params))
 }
 #[no_mangle]
 pub unsafe extern "system" fn XGValidateDescriptor(kind: u32, desc: *const u32, flags: u32) -> i32 {

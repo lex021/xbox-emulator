@@ -13,8 +13,8 @@
   },
   "rdna2_instructions": {
    "done": 773,
-   "total": 781,
-   "pct": 98.98
+   "total": 783,
+   "pct": 98.72
   },
   "shaders_translated": {
    "done": 105506,
@@ -47,9 +47,9 @@
  },
  "extra": {
   "console_exports": {
-   "done": 2135,
+   "done": 2141,
    "total": 2155,
-   "pct": 99.07
+   "pct": 99.35
   },
   "shader_compile_lobby_frame": {
    "done": 139,
@@ -97,9 +97,9 @@
    "pct": 97.14
   },
   "console_exports_targeted": {
-   "done": 2135,
+   "done": 2141,
    "total": 2153,
-   "pct": 99.16
+   "pct": 99.44
   },
   "console_exports_not_targeted": {
    "done": null,
@@ -111,50 +111,50 @@
  "all_including_pc": {
   "note": "previous definition, kept for history: every export of every console OS DLL and every title import, PC-provided ones included",
   "console_exports": {
-   "done": 21792,
+   "done": 21798,
    "total": 23743,
-   "pct": 91.78
+   "pct": 91.81
   },
   "xbox_only_exports": {
-   "done": 2064,
+   "done": 2065,
    "total": 2078,
-   "pct": 99.33
+   "pct": 99.37
   },
   "title_import_status": {
    "Fortnite": {
     "pc": 1111,
     "hooked": 39,
-    "forwarded": 27,
-    "implemented": 41,
+    "forwarded": 25,
+    "implemented": 43,
     "title": 356
    },
    "XDefiant": {
-    "implemented": 57,
+    "implemented": 60,
     "title": 323,
     "stub": 2,
     "pc": 1192,
     "hooked": 30,
-    "forwarded": 8
+    "forwarded": 5
    },
    "Terraria": {
     "pc": 2476,
     "title": 877,
-    "forwarded": 17,
-    "implemented": 44,
+    "forwarded": 15,
+    "implemented": 46,
     "hooked": 82
    },
    "Trackmania": {
     "title": 241,
     "pc": 1250,
     "hooked": 40,
-    "implemented": 27,
-    "forwarded": 21
+    "implemented": 30,
+    "forwarded": 18
    },
    "Minecraft": {
     "title": 1363,
     "pc": 2060,
-    "forwarded": 8,
-    "implemented": 25,
+    "forwarded": 6,
+    "implemented": 27,
     "hooked": 27,
     "stub": 1
    }
@@ -187,29 +187,29 @@
  },
  "title_import_status": {
   "Fortnite": {
-   "implemented": 39,
+   "implemented": 41,
    "hooked": 3,
-   "forwarded": 8
+   "forwarded": 6
   },
   "XDefiant": {
-   "implemented": 37,
+   "implemented": 40,
    "stub": 2,
    "hooked": 5,
-   "forwarded": 8
+   "forwarded": 5
   },
   "Terraria": {
-   "implemented": 43,
+   "implemented": 45,
    "hooked": 8,
-   "forwarded": 10
+   "forwarded": 8
   },
   "Trackmania": {
-   "implemented": 26,
-   "forwarded": 18,
+   "implemented": 29,
+   "forwarded": 15,
    "hooked": 4
   },
   "Minecraft": {
-   "forwarded": 8,
-   "implemented": 25,
+   "forwarded": 6,
+   "implemented": 27,
    "hooked": 1,
    "stub": 1
   }

@@ -1,4 +1,5 @@
 use crate::abi::*;
+use crate::bcpack;
 use miniz_oxide::inflate::core::{decompress, inflate_flags, DecompressorOxide};
 use miniz_oxide::inflate::TINFLStatus;
 use std::fs::File;
@@ -48,7 +49,19 @@ impl XRequest {
     }
 
     pub fn compression(&self) -> u8 {
-        (self.options & 0xff) as u8
+        (self.options & (OPT_ZLIB | (OPT_BCPACK_MASK << OPT_BCPACK_SHIFT))) as u8
+    }
+
+    pub fn zlib(&self) -> bool {
+        self.options & OPT_ZLIB != 0
+    }
+
+    pub fn bcpack_mode(&self) -> u8 {
+        ((self.options >> OPT_BCPACK_SHIFT) & OPT_BCPACK_MASK) as u8
+    }
+
+    pub fn swizzle_mode(&self) -> u16 {
+        ((self.options >> OPT_SWIZZLE_SHIFT) & OPT_SWIZZLE_MASK) as u16
     }
 
     pub fn memory_source(&self) -> bool {
@@ -71,7 +84,18 @@ pub fn validate(r: &XRequest, queue_source: u32) -> Result<(), Rejection> {
     if unknown != 0 {
         return reject(
             E_DSTORAGE_RESERVED_FIELDS,
-            format!("options {:#x} carry console-only bits {unknown:#x} (ext10={:#x} ext28={:#x}) whose semantics are not implemented", r.options, r.ext10, r.ext28),
+            format!(
+                "options {:#x} carry console-only bits {unknown:#x} (zlib={} bcpack={} swizzle={:#x} ext10={:#x} ext28={:#x} intermediate={:#x} dst={:#x} src={:#x}) whose semantics are not implemented",
+                r.options,
+                r.zlib() as u8,
+                bcpack::mode_name(r.bcpack_mode()),
+                r.swizzle_mode(),
+                r.ext10,
+                r.ext28,
+                r.field34,
+                r.destination_size,
+                r.source_size
+            ),
         );
     }
     let mem = r.memory_source();
@@ -87,8 +111,26 @@ pub fn validate(r: &XRequest, queue_source: u32) -> Result<(), Rejection> {
     if mem && r.source == 0 {
         return reject(E_DSTORAGE_ACCESS_VIOLATION, "null memory source".into());
     }
-    match r.compression() {
-        COMPRESSION_NONE => {
+    let mode = r.bcpack_mode();
+    if mode > bcpack::MODE_BC7 {
+        return reject(E_DSTORAGE_DECOMPRESSION_ERROR, format!("options {:#x}: BCPack mode {mode} is not a DSTORAGE_BCPACK_MODE value", r.options));
+    }
+    if mode != bcpack::MODE_NONE && !bcpack::decodable(mode) {
+        return reject(
+            E_DSTORAGE_DECOMPRESSION_ERROR,
+            format!(
+                "options {:#x}: BCPack {} has no public block mapping (zlib={} intermediate={:#x} dst={:#x} src={:#x}); request rejected",
+                r.options,
+                bcpack::mode_name(mode),
+                r.zlib() as u8,
+                r.field34,
+                r.destination_size,
+                r.source_size
+            ),
+        );
+    }
+    match (r.zlib(), mode != bcpack::MODE_NONE) {
+        (false, false) => {
             if r.destination_size != r.source_size {
                 return reject(
                     E_DSTORAGE_INVALID_DESTINATION_SIZE,
@@ -96,7 +138,7 @@ pub fn validate(r: &XRequest, queue_source: u32) -> Result<(), Rejection> {
                 );
             }
         }
-        COMPRESSION_ZLIB => {
+        (true, false) => {
             if r.destination_size <= r.source_size {
                 return reject(
                     E_DSTORAGE_INVALID_DESTINATION_SIZE,
@@ -104,17 +146,26 @@ pub fn validate(r: &XRequest, queue_source: u32) -> Result<(), Rejection> {
                 );
             }
         }
-        f => {
-            return reject(
-                E_DSTORAGE_DECOMPRESSION_ERROR,
-                format!("console compression format {f} (BCPack or unknown) has no CPU decoder; request rejected"),
-            );
+        (zlib, true) => {
+            if r.destination_size == 0 || r.destination_size as usize % bcpack::BC1_BLOCK_BYTES != 0 {
+                return reject(
+                    E_DSTORAGE_INVALID_DESTINATION_SIZE,
+                    format!("BCPack {} destination size {:#x} is not a whole number of blocks", bcpack::mode_name(mode), r.destination_size),
+                );
+            }
+            if zlib && r.field34 == 0 {
+                return reject(E_DSTORAGE_INVALID_INTERMEDIATE_SIZE, "zlib + BCPack request without an intermediate size".into());
+            }
+            if !zlib && r.field34 != 0 {
+                return reject(E_DSTORAGE_INVALID_INTERMEDIATE_SIZE, format!("intermediate size {:#x} on a BCPack request without zlib", r.field34));
+            }
+            return Ok(());
         }
     }
     if r.field34 != 0 && r.field34 != r.destination_size {
         return reject(
             E_DSTORAGE_INVALID_INTERMEDIATE_SIZE,
-            format!("field+0x34 = {:#x} (intermediate size) with no supported multi-stage decompression", r.field34),
+            format!("field+0x34 = {:#x} (intermediate size) is only used by zlib + BCPack requests", r.field34),
         );
     }
     Ok(())
@@ -170,6 +221,40 @@ pub enum Source<'a> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Outcome {
     pub written: usize,
+}
+
+fn source_bytes(src: Source<'_>, source_size: u32) -> Result<Vec<u8>, i32> {
+    match src {
+        Source::File(f, off) => {
+            let mut b = vec![0u8; source_size as usize];
+            crate::stats::timed(crate::stats::READ, b.len(), || read_at(f, off, &mut b))?;
+            Ok(b)
+        }
+        Source::Memory(m) => {
+            if m.len() < source_size as usize {
+                return Err(E_DSTORAGE_ACCESS_VIOLATION);
+            }
+            Ok(m[..source_size as usize].to_vec())
+        }
+    }
+}
+
+pub fn execute_with_intermediate(compression: u8, intermediate: u32, src: Source<'_>, source_size: u32, dst: &mut [u8]) -> Result<Outcome, i32> {
+    let mode = ((compression as u64 >> OPT_BCPACK_SHIFT) & OPT_BCPACK_MASK) as u8;
+    if mode == bcpack::MODE_NONE {
+        return execute(compression, src, source_size, dst);
+    }
+    let packed = source_bytes(src, source_size)?;
+    let chunk = if compression as u64 & OPT_ZLIB != 0 {
+        let mut mid = vec![0u8; intermediate as usize];
+        let n = crate::stats::timed(crate::stats::INFLATE, mid.len(), || inflate_into(&packed, &mut mid))?;
+        mid.truncate(n);
+        mid
+    } else {
+        packed
+    };
+    let written = bcpack::decode(mode, &chunk, dst)?;
+    Ok(Outcome { written })
 }
 
 pub fn execute(compression: u8, src: Source<'_>, source_size: u32, dst: &mut [u8]) -> Result<Outcome, i32> {

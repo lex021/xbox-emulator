@@ -57,6 +57,11 @@ pub fn operation_table() -> Vec<(u32, OperationFn)> {
     v
 }
 
+#[no_mangle]
+pub unsafe extern "system" fn XtfCreateFileIOClient(address: *const u16, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    client::create_client(address, riid, ppv)
+}
+
 static BOOT_MOVES: std::sync::Once = std::sync::Once::new();
 
 #[no_mangle]

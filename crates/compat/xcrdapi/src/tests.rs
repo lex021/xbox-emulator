@@ -158,11 +158,18 @@ fn validation_rules() {
     assert_eq!(validate(&zlib_small, QUEUE_SOURCE_FILE).unwrap_err().hr, E_DSTORAGE_INVALID_DESTINATION_SIZE);
     let zlib_ok = XRequest::decode(&build_request(1, 0x1000, 64, 0x2000, 0, 16, 0));
     assert_eq!(validate(&zlib_ok, QUEUE_SOURCE_FILE), Ok(()));
-    for fmt in [2u64, 3, 0x80, 0xff] {
-        let r = XRequest::decode(&build_request(fmt, 0x1000, 64, 0x2000, 0, 16, 0));
-        assert_eq!(validate(&r, QUEUE_SOURCE_FILE).unwrap_err().hr, E_DSTORAGE_DECOMPRESSION_ERROR, "format {fmt}");
+    for mode in 2u64..16 {
+        let r = XRequest::decode(&build_request(mode << 1, 0x1000, 64, 0x2000, 0, 16, 0));
+        assert_eq!(validate(&r, QUEUE_SOURCE_FILE).unwrap_err().hr, E_DSTORAGE_DECOMPRESSION_ERROR, "bcpack mode {mode}");
     }
-    for bit in [8u64, 21, 23, 40, 63] {
+    let bc1 = XRequest::decode(&build_request(2, 0x1000, 64, 0x2000, 0, 16, 0));
+    assert_eq!(validate(&bc1, QUEUE_SOURCE_FILE), Ok(()));
+    assert_eq!((bc1.zlib(), bc1.bcpack_mode()), (false, 1));
+    let bc1_odd = XRequest::decode(&build_request(2, 0x1000, 60, 0x2000, 0, 16, 0));
+    assert_eq!(validate(&bc1_odd, QUEUE_SOURCE_FILE).unwrap_err().hr, E_DSTORAGE_INVALID_DESTINATION_SIZE);
+    let zlib_bc1_no_mid = XRequest::decode(&build_request(3, 0x1000, 64, 0x2000, 0, 16, 0));
+    assert_eq!(validate(&zlib_bc1_no_mid, QUEUE_SOURCE_FILE).unwrap_err().hr, E_DSTORAGE_INVALID_INTERMEDIATE_SIZE);
+    for bit in [5u64, 7, 8, 20, 21, 23, 40, 63] {
         let r = XRequest::decode(&build_request(1 << bit, 0x1000, 16, 0x2000, 0, 16, 0));
         assert_eq!(validate(&r, QUEUE_SOURCE_FILE).unwrap_err().hr, E_DSTORAGE_RESERVED_FIELDS, "bit {bit}");
     }

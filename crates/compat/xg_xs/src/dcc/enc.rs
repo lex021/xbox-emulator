@@ -347,21 +347,19 @@ pub(crate) fn channel_in(d: &mut Dcc, t: &mut Tmp) -> Result<(), i32> {
     Ok(())
 }
 
-pub(crate) fn conv_residue(p: Option<usize>) -> ([u8; 64], [bool; 64]) {
-    if crate::dcc::xg_build() == 19041 {
-        return ([0; 64], [true; 64]);
-    }
+pub(crate) fn conv_seen(p: Option<usize>) -> [u8; 64] {
     let mut b = [0u8; 64];
+    if crate::dcc::xg_build() == 19041 {
+        return b;
+    }
     b[0] = 0x3d;
     b[8..16].fill(0xff);
     b[48] = 0x3d;
     b[56] = 0x32;
-    let mut k = [true; 64];
-    match p {
-        Some(v) => b[16..24].copy_from_slice(&(v as u64).to_le_bytes()),
-        None => k[16..22].fill(false),
+    if let Some(v) = p {
+        b[16..24].copy_from_slice(&(v as u64).to_le_bytes());
     }
-    (b, k)
+    b
 }
 
 pub(crate) fn run_model(d: &mut Dcc, fills: &[[u8; 64]; 3], conv: &[u8; 64]) -> Result<(), i32> {

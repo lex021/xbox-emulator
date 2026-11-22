@@ -325,6 +325,11 @@ pub fn local_span(va: u64, need: u64, reservation: Option<(u64, u64)>) -> (u64, 
     (lo, (lo + need.max(LOCAL_WINDOW)).min(end).max(hi_min))
 }
 
+pub fn oversize_span(va: u64, pc_size: u64, xbox_size: u64) -> Option<(u64, u64)> {
+    let title = round_up(xbox_size, PLACEMENT_ALIGN);
+    (xbox_size != 0 && pc_size > title).then(|| (va, va + title))
+}
+
 fn reservation(va: u64) -> Option<(u64, u64)> {
     let first = query(va)?;
     if first.state == MEM_FREE {
@@ -564,9 +569,18 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
             if mixed_heap && samples <= 1 {
                 unsafe { migrate_shadow(real, sp, va, size) };
             }
-            let key = match sp.find_local(va, size, align, resource_class, msaa) {
-                Some(k) => Some((k, false)),
-                None => {
+            let private = if dim >= 2 { oversize_span(va, size, xbox_size) } else { None };
+            let key = match (private, sp.find_local(va, size, align, resource_class, msaa)) {
+                (Some((lo, hi)), _) => unsafe { create_local_heap(real, size, msaa, if mixed_heap { 0 } else { resource_class }) }.map(|h| {
+                    STATS.heaps.fetch_add(1, Ordering::Relaxed);
+                    static N: AtomicUsize = AtomicUsize::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) < 16 {
+                        record("d3d12_xs", "alias", &format!("va={va:#x} PC texture needs {size:#x} but the title layout is {xbox_size:#x}: own heap, title VA range [{lo:#x}, {hi:#x}) only, so later placements after it never share its PC tail"));
+                    }
+                    (sp.insert(Span { lo, hi, kind: Kind::Local, heap: h as usize, heap_flags: if mixed_heap { 0 } else { resource_class }, shifted_msaa_alignment: None, retired: false, live: HashSet::new() }), true)
+                }),
+                (None, Some(k)) => Some((k, false)),
+                (None, None) => {
                     let (lo, hi) = local_span(va, size.max(xbox_size), reservation(va));
                     // A host offset is relative to the heap, so anchor a new
                     // MSAA span at the required residue of the title address.
@@ -977,6 +991,68 @@ mod tests {
             create_placed_x(dev, va + 0x100_0000, &other, 0x2_0000, 0x4, core::ptr::null(), &mut d).expect("later placement");
             assert_eq!(spans_starting_at(va), 0);
             vcall!(d, 2, fn() -> u32);
+        }
+    }
+
+    #[test]
+    fn placement_uses_the_layout_the_title_was_told() {
+        let mut depth = tex_desc(1920, 1080, 19, 0x2);
+        depth[0x24..0x28].copy_from_slice(&2u32.to_le_bytes());
+        let xg = |_: &[u8]| -> Result<(u64, u64), i32> { Ok((0x13e_c000, 0x2000)) };
+        assert_eq!(crate::device_wrap::title_layout_size_with(&depth, Some(&xg)), 0x13e_c000);
+        assert_eq!(crate::device_wrap::title_layout_size_with(&depth, None), 0x1fe_0000);
+        let pc = 0x1fe_0000u64;
+        let told = crate::device_wrap::title_layout_size_with(&depth, Some(&xg));
+        assert_eq!(oversize_span(0x64f9_0000, pc, told), Some((0x64f9_0000, 0x6638_0000)));
+        assert_eq!(oversize_span(0x64f9_0000, pc, crate::device_wrap::title_layout_size_with(&depth, None)), None);
+    }
+
+    #[test]
+    fn oversize_span_only_when_the_pc_layout_outgrows_the_title_layout() {
+        assert_eq!(oversize_span(0x64f9_0000, 0x1fe_0000, 0x13e_c000), Some((0x64f9_0000, 0x64f9_0000 + 0x13f_0000)));
+        assert_eq!(oversize_span(0x64f9_0000, 0x13f_0000, 0x13e_c000), None);
+        assert_eq!(oversize_span(0x64f9_0000, 0x1fe_0000, 0x1fe_0000), None);
+        assert_eq!(oversize_span(0x64f9_0000, 0x1fe_0000, 0), None);
+    }
+
+    #[test]
+    fn msaa_depth_with_a_larger_pc_layout_never_overlaps_the_next_title_placement() {
+        unsafe {
+            let dev = device();
+            let r = VirtualAlloc(core::ptr::null_mut(), 0x400_0000, 0x2000, 0x01) as u64;
+            assert!(r != 0);
+            let small = tex_desc(256, 256, 28, 0x1);
+            let mut first: *mut c_void = core::ptr::null_mut();
+            let m0 = create_placed_x(dev, r, &small, 0x4_0000, 0x4, core::ptr::null(), &mut first).expect("first placement opens the reservation-wide span");
+            assert_eq!(m0.kind, Kind::Local);
+            let mut depth = tex_desc(1920, 1080, 19, 0x2);
+            depth[0x24..0x28].copy_from_slice(&2u32.to_le_bytes());
+            let pc = allocation_info(dev, &depth);
+            let console = 0x13e_c000u64;
+            assert!(pc.0 > round_up(console, PLACEMENT_ALIGN), "this adapter's R32G8X24 2x layout {:#x} is not larger than the console layout", pc.0);
+            let dva = r + 0x40_0000;
+            let mut clear = [0u8; 0x18];
+            clear[0..4].copy_from_slice(&20u32.to_le_bytes());
+            clear[4..8].copy_from_slice(&1f32.to_le_bytes());
+            let mut d: *mut c_void = core::ptr::null_mut();
+            let md = create_placed_x(dev, dva, &depth, console, 0x10, clear.as_ptr() as *const c_void, &mut d).expect("MSAA depth placed");
+            assert_eq!(md.kind, Kind::Local);
+            assert_eq!(md.offset, 0);
+            assert_ne!(md.heap, m0.heap, "the oversize depth must not sit in the shared reservation heap");
+            let next_va = dva + round_up(console, PLACEMENT_ALIGN);
+            let mut n: *mut c_void = core::ptr::null_mut();
+            let mn = create_placed_x(dev, next_va, &small, 0x4_0000, 0x4, core::ptr::null(), &mut n).expect("next title placement");
+            assert!(mn.heap != md.heap || mn.offset >= md.offset + pc.0, "next placement {:#x}+{:#x} overlaps the depth's PC tail", mn.heap, mn.offset);
+            assert_eq!((mn.heap, mn.offset), (m0.heap, next_va - r));
+            let mut a: *mut c_void = core::ptr::null_mut();
+            let ma = create_placed_x(dev, dva, &small, 0x4_0000, 0x4, core::ptr::null(), &mut a).expect("alias inside the console extent");
+            assert_eq!((ma.heap, ma.offset), (md.heap, 0), "title aliases inside the console extent share the depth's memory");
+            for x in [first, d, n, a] {
+                vcall!(x, 2, fn() -> u32);
+            }
+            flush();
+            VirtualFree(r as *mut c_void, 0, 0x8000);
+            vcall!(dev, 2, fn() -> u32);
         }
     }
 }

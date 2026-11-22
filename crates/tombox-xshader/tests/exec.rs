@@ -898,6 +898,25 @@ fn saveexec(c: &mut Cases, m: &'static str, op: u32, a: u32, f: fn(u32, u32) -> 
 }
 
 #[test]
+fn wqm_of_exec_keeps_only_the_lane_bit_so_mask_loops_end() {
+    let mut c = Cases::new();
+    let mut post = pr();
+    post.raw(&[sop1(4, 30, 126)]).s2v(0, 30).s2v(1, 31);
+    c.add("s_wqm_b64", &pr(), &[sop1(0x0a, 126, 126)], &post, &[1, 0]);
+    let mut pre = pr();
+    pre.raw(&[sop1(4, 126, ic(-1)), sop1(4, 30, 126)]).sv(20, 0);
+    let mut post = pr();
+    post.raw(&[sop1(3, 126, ic(1)), sop1(3, 127, ic(0))]).s2v(0, 20).s2v(1, 30).s2v(2, 31);
+    c.add("s_add_u32", &pre, &[sop2(0, 20, 20, ic(1)), sop2(0x15, 30, 30, 126), sopp(0x05, 0xfffd)], &post, &[1, 0, 0]);
+    let mut pre = pr();
+    pre.raw(&[sop1(0x0a, 126, 126), sop1(4, 30, 126)]).sv(20, 0).sv(106, 1).sv(107, 0);
+    let mut post = pr();
+    post.s2v(0, 20).s2v(1, 30);
+    c.add("s_add_u32", &pre, &[sop2(0, 20, 20, ic(1)), sop1(0x24, 4, 106), sop2(0x15, 30, 30, 126), sop1(4, 126, 4), sopp(0x05, 0xfffb)], &post, &[1, 0]);
+    c.run_both("exec_lane_bit");
+}
+
+#[test]
 fn scalar_saveexec_lane_model() {
     let mut c = Cases::new();
     let ops: [(&'static str, u32, fn(u32, u32) -> u32); 11] = [
@@ -998,7 +1017,7 @@ fn f2h(x: f32) -> u32 {
     if a >= 65520.0 {
         return s | 0x7c00;
     }
-    let mut best = 0u32;
+    let best;
     let mut lo = 0u32;
     let mut hi = 0x7c00u32;
     while lo < hi {

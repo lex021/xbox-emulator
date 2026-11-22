@@ -69,6 +69,7 @@ impl Store {
         let _ = std::fs::create_dir_all(self.console_path("%SystemDrive%\\DPP"));
         let _ = std::fs::create_dir_all(self.console_path(CI_DATA));
         let _ = std::fs::create_dir_all(self.console_path("%SystemDrive%\\Data\\Users\\DefaultAccount\\Documents"));
+        let _ = std::fs::create_dir_all(self.title_cwd());
         if !self.state_path().exists() {
             let _ = self.write_state(&[
                 ("ci_policy_options".to_string(), format!("{RETAIL_CI_POLICY_OPTIONS:#x}")),
@@ -153,6 +154,14 @@ impl Store {
             (drive, p)
         };
         rest.split('\\').filter(|c| !c.is_empty()).fold(base, |acc, c| acc.join(c))
+    }
+
+    pub fn title_cwd(&self) -> PathBuf {
+        self.root.join("TitleCwd")
+    }
+
+    pub fn title_relative_path(&self, p: &str) -> PathBuf {
+        p.split('\\').filter(|c| !c.is_empty()).fold(self.title_cwd(), |acc, c| acc.join(c))
     }
 
     pub fn read_file(&self, p: &str, buf: &mut [u8]) -> HResult {

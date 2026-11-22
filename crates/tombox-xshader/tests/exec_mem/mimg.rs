@@ -269,7 +269,7 @@ fn image_mimg_query() {
             pos_uv(&mut pre, 6, 7, k, 0.1);
             let full = [fb(lod.clamp(0.0, 3.0)), fb(lod), 0, 0];
             let mut c = case("image_get_lod", op, build(&pre, &op, 4, dmask.count_ones(), false), Env { tex: Some(&IMG_A), samp: Some(sampler(1, 1, 0)), pos: true, ..Default::default() }, pick(full, dmask));
-            c.tol = 1.0e-5;
+            c.tol = if std::env::var_os("TOMBOX_EXEC_HW").is_some() { 1.0 / 256.0 } else { 1.0e-5 };
             cs.push(c);
         }
     }

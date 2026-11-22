@@ -292,8 +292,12 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
         has_output_sig: container.chunk(b"OSG1").is_some() || container.chunk(b"OSGN").is_some(),
         has_psv0: container.chunk(b"PSV0").is_some(),
         has_root_sig: container.chunk(b"RTS0").is_some(),
-        input_sig: chunk_body(b"ISG1").and_then(|b| meta::parse_signature(b).ok()).unwrap_or_default(),
-        output_sig: chunk_body(b"OSG1").and_then(|b| meta::parse_signature(b).ok()).unwrap_or_default(),
+        input_sig: chunk_body(b"ISG1").and_then(|b| meta::parse_signature(b"ISG1", b).ok())
+            .or_else(|| chunk_body(b"ISGN").and_then(|b| meta::parse_signature(b"ISGN", b).ok()))
+            .unwrap_or_default(),
+        output_sig: chunk_body(b"OSG1").and_then(|b| meta::parse_signature(b"OSG1", b).ok())
+            .or_else(|| chunk_body(b"OSGN").and_then(|b| meta::parse_signature(b"OSGN", b).ok()))
+            .unwrap_or_default(),
         resources: chunk_body(b"PSV0").and_then(|b| meta::parse_psv0(b).ok()).unwrap_or_default(),
         gs_info,
         root_sig: chunk_body(b"RTS0").and_then(|b| meta::parse_rts0(b).ok()),

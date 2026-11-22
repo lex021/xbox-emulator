@@ -78,6 +78,19 @@ pub const WDAC_EVENT_META: &[u8] = include_bytes!("../data/wdac_event_meta.bin")
 pub const BLOCKLIST_EVENT_DESC: &[u8; 11] = include_bytes!("../data/blocklist_event_desc.bin");
 pub const BLOCKLIST_EVENT_META: &[u8] = include_bytes!("../data/blocklist_event_meta.bin");
 
+pub const WATERMARK_GUID: &[u8; 16] = include_bytes!("../data/watermark_provider_guid.bin");
+pub const WATERMARK_META: &[u8] = include_bytes!("../data/watermark_provider_meta.bin");
+pub const RETAIL_UNLOCKED_EVENT_DESC: &[u8; 11] = include_bytes!("../data/retail_unlocked_event_desc.bin");
+pub const RETAIL_UNLOCKED_EVENT_META: &[u8] = include_bytes!("../data/retail_unlocked_event_meta.bin");
+pub const HSTI_FAILURE_EVENT_DESC: &[u8; 11] = include_bytes!("../data/hsti_failure_event_desc.bin");
+pub const HSTI_FAILURE_EVENT_META: &[u8] = include_bytes!("../data/hsti_failure_event_meta.bin");
+pub const PRODUCTION_EVENT_DESC: &[u8; 11] = include_bytes!("../data/production_event_desc.bin");
+pub const PRODUCTION_EVENT_META: &[u8] = include_bytes!("../data/production_event_meta.bin");
+
+pub fn desc_keyword(desc: &[u8; 11]) -> u64 {
+    u64::from_le_bytes([desc[3], desc[4], desc[5], desc[6], desc[7], desc[8], desc[9], desc[10]])
+}
+
 pub struct Provider {
     pub level_plus1: AtomicU32,
     pub keyword_any: AtomicU64,
@@ -176,6 +189,14 @@ pub fn state() -> &'static Provider {
     static P: OnceLock<Provider> = OnceLock::new();
     static R: OnceLock<i32> = OnceLock::new();
     let p = P.get_or_init(|| Provider::new(STATE_GUID, STATE_META));
+    R.get_or_init(|| p.register());
+    p
+}
+
+pub fn watermark() -> &'static Provider {
+    static P: OnceLock<Provider> = OnceLock::new();
+    static R: OnceLock<i32> = OnceLock::new();
+    let p = P.get_or_init(|| Provider::new(WATERMARK_GUID, WATERMARK_META));
     R.get_or_init(|| p.register());
     p
 }

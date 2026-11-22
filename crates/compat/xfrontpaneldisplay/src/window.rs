@@ -204,6 +204,9 @@ pub fn show() {
                 let title = wide(&format!("Front panel{}", if t.is_empty() { String::new() } else { format!(" - {t}") }));
                 let h = CreateWindowExW(0x0000_0008 | 0x0000_0080, class.as_ptr(), title.as_ptr(), style, 40, 40, r.r - r.l, r.b - r.t, core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut());
                 HWND_CELL.store(h as usize, Ordering::Release);
+                if compat_common::headless::enabled() {
+                    compat_common::headless::cloak(h as *mut c_void);
+                }
                 ShowWindow(h, 4);
                 compat_common::record("XFrontPanelDisplay", "window", &format!("front panel window {h:p} (F1-F5 buttons 1-5, arrows, Enter = select)"));
                 let mut msg: Msg = core::mem::zeroed();

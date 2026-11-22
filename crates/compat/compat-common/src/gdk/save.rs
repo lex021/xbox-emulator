@@ -610,7 +610,6 @@ unsafe extern "system" fn read_blob_data_async(_t: This, c: *const Container, na
         b[e + 16..e + 24].copy_from_slice(&(off as u64).to_le_bytes());
         fixups.push(e + 16);
     }
-    b.extend_from_slice(&(wanted.len() as u32).to_le_bytes());
     xasync::run(block, OP_READ, xasync::Payload { hr: S_OK, bytes: b, fixups })
 }
 
@@ -623,28 +622,19 @@ unsafe extern "system" fn read_blob_data_result(_t: This, block: *mut c_void, si
     if hr < 0 {
         return hr;
     }
-    if need < 4 {
+    if need == 0 {
         *count = 0;
         return xasync::bytes(block, OP_READ, size, out as *mut c_void, core::ptr::null_mut());
     }
-    if out.is_null() || size < need - 4 {
+    if out.is_null() || size < need {
         return E_GS_PROVIDED_BUFFER_TOO_SMALL;
     }
-    let mut tmp = vec![0u8; need];
-    let hr = xasync::bytes(block, OP_READ, need, tmp.as_mut_ptr() as *mut c_void, core::ptr::null_mut());
+    let hr = xasync::bytes(block, OP_READ, need, out as *mut c_void, core::ptr::null_mut());
     if hr < 0 {
         return hr;
     }
-    let n = u32::from_le_bytes(tmp[need - 4..].try_into().unwrap_or([0; 4]));
-    let base = tmp.as_ptr() as u64;
-    for i in 0..n as usize {
-        let at = i * 24 + 16;
-        let abs = u64::from_le_bytes(tmp[at..at + 8].try_into().unwrap_or([0; 8]));
-        let rel = abs - base;
-        tmp[at..at + 8].copy_from_slice(&(out as u64 + rel).to_le_bytes());
-    }
-    core::ptr::copy_nonoverlapping(tmp.as_ptr(), out, need - 4);
-    *count = n;
+    let first = core::ptr::read_unaligned(out.add(16) as *const u64);
+    *count = ((first - out as u64) / 24) as u32;
     S_OK
 }
 

@@ -105,6 +105,7 @@ pub unsafe fn check(tag: &str, queue: *mut c_void, get_desc: usize, title: &[*mu
     if after.is_some_and(|h| h != 0) {
         GONE.store(true, Ordering::Relaxed);
         record("d3d12_xs", "ecl.probe", &format!("device removed {} this submission", if removed_here { "by" } else { "before" }));
+        crate::dred::report_once(tag, after);
     }
 }
 
@@ -177,6 +178,7 @@ unsafe fn probed_call(i: usize, args: [usize; 8]) -> usize {
         if removed_now(was, now) && !GONE.swap(true, Ordering::Relaxed) {
             let d = if di != 0 && args[di] != 0 { Some(unsafe { core::slice::from_raw_parts(args[di] as *const u8, dl) }) } else { None };
             record("d3d12_xs", "ecl.probe", &format!("device removed by {tag} (slot {slot}, GetDeviceRemovedReason={:#010x}, returned {r:#x}): {}", now.unwrap_or(0), describe_args(&args, d)));
+            crate::dred::report_once(tag, now);
             if (18..=21).contains(&slot) {
                 let res_args: &[usize] = if slot == 19 { &args[1..3] } else { &args[1..2] };
                 for &res in res_args {
@@ -251,6 +253,7 @@ pub unsafe fn after_device_call(dev: *mut c_void, tag: &str, detail: impl FnOnce
     let hr = unsafe { reason(dev) };
     if hr != 0 && !GONE.swap(true, Ordering::Relaxed) {
         record("d3d12_xs", "ecl.probe", &format!("device removed by {tag} (GetDeviceRemovedReason={hr:#010x}): {}", detail()));
+        crate::dred::report_once(tag, Some(hr));
     }
 }
 

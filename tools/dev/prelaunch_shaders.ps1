@@ -35,7 +35,7 @@ function Invoke-ShaderPrelaunch {
     if ($kit) { $env:TOMBOX_DXC_DIR = $kit }
   }
   $a = @('--title', $ExeStem, '--name', $Name, '--yes')
-  if ($NoUi -or $env:TOMBOX_PRELAUNCH_UI -eq '0') { $a += '--no-ui' }
+  if ($NoUi -or $env:TOMBOX_PRELAUNCH_UI -eq '0' -or $env:TOMBOX_HEADLESS -eq '1') { $a += '--no-ui' }
   $sum = Join-Path $LogDir 'shader_prelaunch.txt'
   $a += @('--summary', $sum)
   $sw = [Diagnostics.Stopwatch]::StartNew()

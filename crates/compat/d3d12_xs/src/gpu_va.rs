@@ -64,6 +64,17 @@ pub fn lookup(va: u64) -> Option<(Entry, u64)> {
     with(|t| find_in(&t.ranges, va).or_else(|| find_in(&t.cpu, va)))
 }
 
+pub fn near_in(m: &BTreeMap<u64, Entry>, va: u64, n: usize) -> Vec<Entry> {
+    let mut below: Vec<Entry> = m.range(..=va).rev().take(n).map(|(_, e)| *e).collect();
+    below.reverse();
+    below.extend(m.range(va.saturating_add(1)..).take(n).map(|(_, e)| *e));
+    below
+}
+
+pub fn near(va: u64, n: usize) -> Vec<Entry> {
+    with(|t| near_in(&t.ranges, va, n))
+}
+
 pub fn lookup_gpu(va: u64) -> Option<(Entry, u64)> {
     with(|t| find_in(&t.ranges, va))
 }
@@ -158,11 +169,23 @@ unsafe extern "system" fn get_gpu_va_x(this: *mut c_void) -> u64 {
 }
 
 pub fn expose_texture_va() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| match std::env::var("TOMBOX_TEXTURE_VA") {
-        Ok(v) => v == "1",
-        Err(_) => crate::xone_tex::is_xbox_one(),
-    })
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| match std::env::var("TOMBOX_TEXTURE_VA") {
+        Ok(v) => Some(v == "1"),
+        Err(_) => None,
+    });
+    if let Some(v) = env {
+        return v;
+    }
+    static IS_XONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if IS_XONE.load(Ordering::Relaxed) {
+        return true;
+    }
+    if crate::xone_tex::is_xbox_one() {
+        IS_XONE.store(true, Ordering::Relaxed);
+        return true;
+    }
+    false
 }
 
 unsafe fn ensure_patched(res: *mut c_void) {

@@ -11,5 +11,11 @@ name = "wldp"
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
+[dependencies]
+compat-common = { path = "../compat-common" }
+
+[dev-dependencies]
+console-sandbox = { path = "../console-sandbox" }
+
 [build-dependencies]
 xone-exports = { path = "../xone-exports" }

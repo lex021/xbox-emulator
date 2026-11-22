@@ -383,6 +383,8 @@
 "v_bfm_b32",
 "v_bcnt_u32_b32",
 "v_fma_f16",
+"v_pk_lshlrev_b16",
+"v_pk_lshrrev_b16",
 "v_pk_fma_f16",
 "v_pk_add_f16",
 "v_pk_mul_f16",

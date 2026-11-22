@@ -137,6 +137,7 @@ unsafe fn acquire(like: *mut c_void) -> *mut c_void {
             }
             p.busy = true;
             p.fence = 0;
+            crate::dred_marks::begin_recording(p.list);
             return p.list as *mut c_void;
         }
     }
@@ -161,6 +162,7 @@ unsafe fn acquire(like: *mut c_void) -> *mut c_void {
         return core::ptr::null_mut();
     }
     POOL.lock().unwrap_or_else(|e| e.into_inner()).push(Pooled { list: l as usize, alloc: a as usize, ty, busy: true, fence: 0, value: 0 });
+    crate::dred_marks::begin_recording(l as usize);
     l
 }
 

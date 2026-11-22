@@ -93,6 +93,13 @@ pub unsafe extern "system" fn XMemGetWin32HeapStatistics(heap: Handle, out: *mut
         SetLastError(ERROR_INVALID_PARAMETER);
         return 0;
     }
+    if let Some(a) = crate::heap_acct::slot(heap as usize) {
+        let (allocated, overhead) = a.read();
+        (*out).allocated = allocated;
+        (*out).overhead = overhead;
+        return 1;
+    }
+    let patched = crate::hooks::install_heap_accounting();
     let mut s = HeapSummaryInfo { cb: core::mem::size_of::<HeapSummaryInfo>() as u32, ..Default::default() };
     if HeapSummary(heap, 0, &mut s) == 0 {
         return 0;
@@ -101,6 +108,9 @@ pub unsafe extern "system" fn XMemGetWin32HeapStatistics(heap: Handle, out: *mut
     let allocated = (s.allocated as u64).min(committed);
     (*out).allocated = allocated;
     (*out).overhead = committed - allocated;
+    if crate::heap_acct::register(heap as usize, allocated, committed - allocated).is_some() {
+        record(M, "XMemGetWin32HeapStatistics", &format!("heap {heap:p}: one baseline HeapSummary (allocated {allocated:#x}, overhead {:#x}), then running totals from the heap import wrappers ({patched} import slots); no further heap walks", committed - allocated));
+    }
     1
 }
 
@@ -131,6 +141,17 @@ mod tests {
         let mut s = HeapSummaryInfo { cb: core::mem::size_of::<HeapSummaryInfo>() as u32, ..Default::default() };
         assert_ne!(unsafe { HeapSummary(h, 0, &mut s) }, 0);
         assert_eq!(st.allocated + st.overhead, s.committed as u64);
+        let exe = unsafe { GetModuleHandleW(core::ptr::null()) };
+        unsafe { crate::iat::patch_module(exe, &crate::hooks::heap_rule) };
+        let q = unsafe { HeapAlloc(h, 0, 0x2000) };
+        let mut st2 = HeapStatistics { allocated: 0, overhead: 0 };
+        assert_eq!(unsafe { XMemGetWin32HeapStatistics(h, &mut st2) }, 1);
+        assert_eq!(st2.allocated, st.allocated + 0x2000);
+        assert_eq!(unsafe { HeapFree(h, 0, q) }, 1);
+        let mut st3 = HeapStatistics { allocated: 0, overhead: 0 };
+        assert_eq!(unsafe { XMemGetWin32HeapStatistics(h, &mut st3) }, 1);
+        assert_eq!(st3.allocated, st.allocated);
+        assert_eq!(st3.overhead, st.overhead);
         assert!(unsafe { XMemCreateWin32Heap(0x9, core::ptr::null_mut()) }.is_null());
         assert!(unsafe { XMemCreateWin32Heap(0x1, core::ptr::null_mut()) }.is_null());
     }

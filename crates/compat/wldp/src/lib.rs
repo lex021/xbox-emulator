@@ -6,8 +6,10 @@ use std::sync::OnceLock;
 pub type HResult = i32;
 
 pub mod console;
+pub mod production;
 pub mod store;
 pub mod tlg;
+pub mod watermark;
 
 pub const E_INVALIDARG_NT: HResult = 0xD000_000Du32 as i32;
 pub const SYSTEM_CI_POLICY_INFORMATION: u32 = 0xa4;
@@ -159,3 +161,7 @@ pub unsafe extern "system" fn WldpIsVulnerableDriverBlocklistEligibleToDisable(e
 mod tests;
 #[cfg(test)]
 mod tests_console;
+#[cfg(test)]
+mod tests_production;
+#[cfg(test)]
+mod tests_watermark;

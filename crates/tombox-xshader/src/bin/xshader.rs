@@ -1,7 +1,5 @@
 //! CLI: extract native RDNA2 ISA from an Xbox Series shader DXBC blob.
 //!
-//! Usage: xshader <shader.dxbc> [--root-signature <file>] [--hlsl-out <file>]
-//!                [--isa-out <file>] [--fssm-out <file>]
 //!
 //! Prints the DXBC→XDAT→zlib→FSSM→RDNA2 chain it walked and a hex/word dump of the ISA.
 

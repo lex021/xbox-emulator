@@ -826,6 +826,29 @@ impl PumpPhases {
     }
 }
 
+static DIRECT_QUEUES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+pub fn register_direct_queue(queue: *mut c_void) {
+    if !queue.is_null() {
+        let mut g = DIRECT_QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+        let addr = queue as usize;
+        if !g.contains(&addr) {
+            g.push(addr);
+        }
+    }
+}
+
+pub fn is_direct_queue(queue: *mut c_void) -> bool {
+    if queue.is_null() {
+        return false;
+    }
+    DIRECT_QUEUES.lock().unwrap_or_else(|e| e.into_inner()).contains(&(queue as usize))
+}
+
+pub fn direct_queue() -> Option<*mut c_void> {
+    DIRECT_QUEUES.lock().unwrap_or_else(|e| e.into_inner()).first().copied().map(|q| q as *mut c_void)
+}
+
 /// Called once per `PresentX`, on the presenting thread, before the frame is copied out.
 pub unsafe fn pump(queue: *mut c_void) {
     let t0 = std::time::Instant::now();
@@ -1179,5 +1202,20 @@ mod detile_speed_tests {
         let per = t.elapsed().as_secs_f64() * 100.0;
         eprintln!("single-thread detile of 1 MB: {per:.2} ms");
         assert!(per < 20.0, "{per} ms");
+    }
+}
+
+#[cfg(test)]
+mod direct_queue_and_pending_tests {
+    use super::*;
+
+    #[test]
+    fn direct_queue_registration_and_detection() {
+        let fake_q = 0xdead_beefusize as *mut c_void;
+        assert!(!is_direct_queue(fake_q));
+        register_direct_queue(fake_q);
+        assert!(is_direct_queue(fake_q));
+        assert!(!is_direct_queue((fake_q as usize + 8) as *mut c_void));
+        assert!(direct_queue().is_some());
     }
 }

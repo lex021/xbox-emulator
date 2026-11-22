@@ -1,6 +1,7 @@
 mod alloc;
 pub mod epoch;
 mod heap;
+mod heap_acct;
 mod hooks;
 mod iat;
 mod phys;

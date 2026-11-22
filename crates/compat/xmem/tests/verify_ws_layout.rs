@@ -45,7 +45,6 @@ fn allocation_is_queryable_through_the_dll_exports() {
 
         let address = alloc(SIZE, 0);
         assert!(!address.is_null());
-        // The Xbox query record occupies 64 bytes. Keep it aligned for the DLL.
         let mut region = [0u64; 8];
         let result = query(GetCurrentProcess(), address, region.as_mut_ptr());
         let mut working_set = [0xcc; 0x58];

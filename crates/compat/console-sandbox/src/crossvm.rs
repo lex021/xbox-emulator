@@ -21,6 +21,7 @@ pub const IS_OFFLOAD_CAPABLE: u32 = 0x0b;
 pub const SET_CLIENT_PROPERTIES: u32 = 0x0c;
 pub const GET_SHARED_MODE_ENGINE_PERIOD: u32 = 0x0d;
 pub const GET_CURRENT_SHARED_MODE_ENGINE_PERIOD: u32 = 0x0e;
+pub const INITIALIZE_SHARED_AUDIO_STREAM: u32 = 0x0f;
 pub const STREAM_GET_CHANNEL_COUNT: u32 = 0x10;
 pub const STREAM_SET_CHANNEL_VOLUME: u32 = 0x11;
 pub const STREAM_GET_CHANNEL_VOLUME: u32 = 0x12;
@@ -36,18 +37,25 @@ pub const SESSION_SET_DISPLAY_NAME: u32 = 0x1b;
 pub const SESSION_GET_GROUPING: u32 = 0x1c;
 pub const SESSION_SET_GROUPING: u32 = 0x1d;
 pub const SESSION_REGISTER_NOTIFICATION: u32 = 0x1e;
-pub const ENUMERATOR_RESET: u32 = 0x23;
+pub const ENUMERATOR_SUBSCRIBE: u32 = 0x23;
+pub const ENUMERATOR_UNSUBSCRIBE: u32 = 0x24;
 pub const DEVICE_GET_ID: u32 = 0x27;
 pub const DEVICE_GET_STATE: u32 = 0x28;
+pub const ENDPOINT_HOST_STREAM_MODES: u32 = 0x29;
+pub const ENDPOINT_OFFLOAD_SERVICE: u32 = 0x2a;
 pub const PROPERTY_GET_COUNT: u32 = 0x2b;
 pub const PROPERTY_GET_AT: u32 = 0x2c;
 pub const PROPERTY_GET_VALUE: u32 = 0x2d;
 pub const RELEASE_OBJECT: u32 = 0x2e;
+pub const SPATIAL_STATIC_POSITION: u32 = 0x30;
 pub const SPATIAL_NATIVE_MASK: u32 = 0x31;
 pub const SPATIAL_MAX_DYNAMIC: u32 = 0x32;
 pub const SPATIAL_MAX_FRAMES: u32 = 0x33;
 pub const SPATIAL_FORMAT_SUPPORTED: u32 = 0x34;
 pub const SPATIAL_STREAM_AVAILABLE: u32 = 0x35;
+pub const FORMAT_ENUM_COUNT: u32 = 0x3a;
+pub const FORMAT_ENUM_GET: u32 = 0x3b;
+pub const CLOCK_SET_SAMPLE_RATE: u32 = 0x47;
 pub const ENDPOINT_REGISTER: u32 = 0x4f;
 pub const ENDPOINT_UNREGISTER: u32 = 0x50;
 pub const ENDPOINT_CHANNEL_COUNT: u32 = 0x51;
@@ -80,6 +88,7 @@ pub const SESSION_GET_INSTANCE_IDENTIFIER: u32 = 0x7d;
 pub const SESSION_IS_SYSTEM_SOUNDS: u32 = 0x7e;
 pub const SESSION_SET_DUCKING: u32 = 0x7f;
 pub const SPATIAL_OFFLOAD_CAPABLE: u32 = 0x85;
+pub const SPATIAL_MAX_FRAMES_FOR_CATEGORY: u32 = 0x86;
 
 pub const METHOD_DEFAULT_ENDPOINT_19041: u32 = 0x22;
 pub const METHOD_ENDPOINT_19041: u32 = 0x25;
@@ -125,6 +134,8 @@ pub const QUEUE_ENTRY: u32 = 0x40;
 pub const MIN_QUEUE_ENTRIES: u32 = 0x19;
 
 pub const INIT_SHARE_MODE: usize = 0;
+pub const INIT_FLAGS: usize = 4;
+pub const INIT_DURATION: usize = 8;
 pub const INIT_FORMAT: usize = 0x18;
 pub const INIT_SESSION: usize = 0x60;
 pub const INIT_ENDPOINT_CLSID: usize = 0x70;
@@ -132,6 +143,47 @@ pub const INIT_EVENT1: usize = 0x94;
 pub const INIT_EVENT2: usize = 0x1b8;
 pub const INIT_EVENT3: usize = 0x2dc;
 pub const INIT_MEMORY: usize = 0x404;
+pub const SHARED_INIT_STRUCT: usize = 0x524;
+pub const SHARED_INIT_FLAGS: usize = 0x48;
+pub const SHARED_INIT_PERIOD: usize = 0x4c;
+pub const SHARED_INIT_SESSION: usize = 0x50;
+pub const SHARED_INIT_REPLY_SHIFT: usize = 0x10;
+pub const SPATIAL_CATEGORY_AT: usize = 0x48;
+pub const SPATIAL_FRAMES_AT: usize = 0x4c;
+pub const SPATIAL_OFFLOAD_AT: usize = 0x50;
+pub const FORMAT_ENUM_AT: usize = 4;
+pub const PLAIN_FORMAT: usize = 0x12;
+
+pub struct InitLayout {
+    pub size: usize,
+    pub mode: Option<usize>,
+    pub flags: usize,
+    pub duration: Option<usize>,
+    pub period: Option<usize>,
+    pub format: usize,
+    pub session: usize,
+    pub clsid: usize,
+    pub event1: usize,
+    pub event2: usize,
+    pub event3: usize,
+    pub memory: usize,
+}
+
+pub const INIT_LAYOUT: InitLayout = InitLayout { size: INIT_STRUCT, mode: Some(INIT_SHARE_MODE), flags: INIT_FLAGS, duration: Some(INIT_DURATION), period: None, format: INIT_FORMAT, session: INIT_SESSION, clsid: INIT_ENDPOINT_CLSID, event1: INIT_EVENT1, event2: INIT_EVENT2, event3: INIT_EVENT3, memory: INIT_MEMORY };
+pub const SHARED_INIT_LAYOUT: InitLayout = InitLayout {
+    size: SHARED_INIT_STRUCT,
+    mode: None,
+    flags: SHARED_INIT_FLAGS,
+    duration: None,
+    period: Some(SHARED_INIT_PERIOD),
+    format: 0,
+    session: SHARED_INIT_SESSION,
+    clsid: INIT_ENDPOINT_CLSID - SHARED_INIT_REPLY_SHIFT,
+    event1: INIT_EVENT1 - SHARED_INIT_REPLY_SHIFT,
+    event2: INIT_EVENT2 - SHARED_INIT_REPLY_SHIFT,
+    event3: INIT_EVENT3 - SHARED_INIT_REPLY_SHIFT,
+    memory: INIT_MEMORY - SHARED_INIT_REPLY_SHIFT,
+};
 pub const KIND_NONE: u32 = 0;
 pub const KIND_CROSS_VM_EVENT: u32 = 2;
 pub const KIND_CROSS_VM_MEMORY: u32 = 3;
@@ -456,7 +508,8 @@ unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
             }
         }
         IS_FORMAT_SUPPORTED => is_format_supported(object, a),
-        INITIALIZE => initialize(object, a, room),
+        INITIALIZE => initialize(object, a, room, &INIT_LAYOUT),
+        INITIALIZE_SHARED_AUDIO_STREAM => initialize(object, a, room, &SHARED_INIT_LAYOUT),
         START | STOP | RESET => transport(id, object),
         GET_BUFFER_SIZE_LIMITS => {
             let f = format_at(a);
@@ -593,7 +646,28 @@ unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
         }
         SESSION_REGISTER_NOTIFICATION | SESSION_MANAGER_REGISTER | ENDPOINT_REGISTER => register(object, true),
         SESSION_MANAGER_UNREGISTER | ENDPOINT_UNREGISTER => register(object, false),
-        ENUMERATOR_RESET => register(object, false),
+        ENUMERATOR_SUBSCRIBE => register(object, true),
+        ENUMERATOR_UNSUBSCRIBE => register(object, false),
+        ENDPOINT_HOST_STREAM_MODES => {
+            wr(a, 0, 0u32);
+            wr(a, 4, 0u32);
+            S_OK
+        }
+        ENDPOINT_OFFLOAD_SERVICE => match wasapi::endpoint_offload(device_for(object).as_deref()) {
+            Ok(b) => {
+                wr(a, 0, b);
+                S_OK
+            }
+            Err(hr) => hr,
+        },
+        CLOCK_SET_SAMPLE_RATE => {
+            let r: f32 = rd(a, 0);
+            let s = state();
+            match stream_owner(&s, object).and_then(|k| s.objects.get(&k)).and_then(|o| o.stream.as_ref()) {
+                Some(st) => st.renderer.set_sample_rate(r),
+                None => AUDCLNT_E_NOT_INITIALIZED,
+            }
+        }
         DEVICE_GET_ID => match device_for(object).map(Ok).unwrap_or_else(wasapi::device_id) {
             Ok(id) => {
                 let w: Vec<u16> = id.encode_utf16().take(DEVICE_ID_CHARS - 1).chain(Some(0)).collect();
@@ -630,7 +704,7 @@ unsafe fn dispatch(id: u32, object: u32, a: *mut u8, room: usize) -> i32 {
             }
         }
         PROPERTY_GET_VALUE => property_value(object, a),
-        SPATIAL_NATIVE_MASK | SPATIAL_MAX_DYNAMIC | SPATIAL_MAX_FRAMES | SPATIAL_FORMAT_SUPPORTED | SPATIAL_STREAM_AVAILABLE | SPATIAL_OFFLOAD_CAPABLE => spatial(id, object, a),
+        SPATIAL_STATIC_POSITION | SPATIAL_NATIVE_MASK | SPATIAL_MAX_DYNAMIC | SPATIAL_MAX_FRAMES | SPATIAL_FORMAT_SUPPORTED | SPATIAL_STREAM_AVAILABLE | SPATIAL_OFFLOAD_CAPABLE | SPATIAL_MAX_FRAMES_FOR_CATEGORY | FORMAT_ENUM_COUNT | FORMAT_ENUM_GET => spatial(id, object, a),
         ENDPOINT_CHANNEL_COUNT => {
             wr(a, 0, endpoint_channels(&device_for(object)));
             S_OK
@@ -908,11 +982,49 @@ unsafe fn spatial(id: u32, object: u32, a: *mut u8) -> i32 {
         }
         SPATIAL_FORMAT_SUPPORTED => sp.format_supported(&format_at(a)),
         SPATIAL_STREAM_AVAILABLE => sp.stream_available(&guid_from(core::slice::from_raw_parts(a, 16))),
+        SPATIAL_STATIC_POSITION => {
+            let kind: u32 = rd(a, 0);
+            match sp.static_position(kind) {
+                Ok(p) => {
+                    for (i, v) in p.iter().enumerate() {
+                        wr(a, 4 + 4 * i, *v);
+                    }
+                    S_OK
+                }
+                Err(hr) => hr,
+            }
+        }
+        SPATIAL_MAX_FRAMES_FOR_CATEGORY => {
+            let f = format_at(a);
+            let cat: u32 = rd(a, SPATIAL_CATEGORY_AT);
+            let offload: u8 = rd(a, SPATIAL_OFFLOAD_AT);
+            put(sp.max_frames_for_category(cat, offload != 0, &f), SPATIAL_FRAMES_AT)
+        }
+        FORMAT_ENUM_COUNT => put(sp.format_count(), 0),
+        FORMAT_ENUM_GET => match sp.format_at(0) {
+            Ok(f) => {
+                let plain = plain_format(&f);
+                core::ptr::copy_nonoverlapping(plain.as_ptr(), a.add(FORMAT_ENUM_AT), PLAIN_FORMAT);
+                S_OK
+            }
+            Err(hr) => hr,
+        },
         _ => {
             let cat: u32 = rd(a, 0);
             put(sp.offload_capable(cat), 4)
         }
     }
+}
+
+pub fn plain_format(f: &[u8]) -> [u8; PLAIN_FORMAT] {
+    let mut out = [0u8; PLAIN_FORMAT];
+    out.copy_from_slice(&f[..PLAIN_FORMAT]);
+    if u16::from_le_bytes([f[0], f[1]]) == 0xfffe && f.len() >= 0x28 {
+        out[0..2].copy_from_slice(&f[0x18..0x1a]);
+    }
+    out[0x10] = 0;
+    out[0x11] = 0;
+    out
 }
 
 unsafe fn endpoint_volume(id: u32, object: u32, a: *mut u8) -> i32 {
@@ -1072,8 +1184,8 @@ unsafe fn default_table(a: *mut u8) -> i32 {
     S_OK
 }
 
-unsafe fn initialize(object: u32, a: *mut u8, room: usize) -> i32 {
-    if room < INIT_STRUCT {
+unsafe fn initialize(object: u32, a: *mut u8, room: usize, lay: &InitLayout) -> i32 {
+    if room < lay.size {
         return E_INVALIDARG;
     }
     let (existing, props) = {
@@ -1086,26 +1198,32 @@ unsafe fn initialize(object: u32, a: *mut u8, room: usize) -> i32 {
     if existing {
         return AUDCLNT_E_ALREADY_INITIALIZED;
     }
-    let mode: u32 = rd(a, INIT_SHARE_MODE);
+    let mode: u32 = lay.mode.map(|o| rd(a, o)).unwrap_or(wasapi::SHARED);
     if mode > 1 {
         return E_INVALIDARG;
     }
-    let duration: i64 = rd(a, 8);
-    let format = format_at(a.add(INIT_FORMAT));
+    let flags: u32 = rd(a, lay.flags);
+    let duration: i64 = lay.duration.map(|o| rd(a, o)).unwrap_or(0);
+    let period: Option<u32> = lay.period.map(|o| rd(a, o));
+    if period == Some(0) {
+        return E_INVALIDARG;
+    }
+    let format = format_at(a.add(lay.format));
     let flen = format.len();
     let align = wasapi::block_align(&format);
     let rate = wasapi::sample_rate(&format);
     if align == 0 || rate == 0 {
         return E_INVALIDARG;
     }
-    let session = guid_from(core::slice::from_raw_parts(a.add(INIT_SESSION), 16));
+    let session = guid_from(core::slice::from_raw_parts(a.add(lay.session), 16));
     let dev = device_for(object);
     let info = match wasapi::device_info_for(dev.as_deref()) {
         Ok(d) => d,
         Err(hr) => return hr,
     };
-    let period_frames = (info.default_period * rate as i64 / HNS).max(1) as u32;
-    let frames = ((duration.max(info.default_period * 2) * rate as i64 + HNS - 1) / HNS) as u32;
+    let period_frames = period.unwrap_or((info.default_period * rate as i64 / HNS).max(1) as u32);
+    let floor = period.map(|p| p as i64 * 2 * HNS / rate as i64).unwrap_or(0).max(info.default_period * 2);
+    let frames = ((duration.max(floor) * rate as i64 + HNS - 1) / HNS) as u32;
     let l = layout(&format, frames, period_frames);
     let pages = (l.total as usize).div_ceil(crate::logan::PAGE);
     let Some(index) = crate::logan::pool_alloc(pages) else {
@@ -1115,7 +1233,7 @@ unsafe fn initialize(object: u32, a: *mut u8, room: usize) -> i32 {
     let hns = frames as i64 * HNS / rate as i64;
     write_control_block(base, &format, hns, &l);
     let ring = wasapi::Ring { base, start: l.start, end: l.end, align };
-    let open = wasapi::Open { device: dev.clone(), format: format.clone(), duration: hns, session, properties: props };
+    let open = wasapi::Open { device: dev.clone(), format: format.clone(), duration: hns, session, properties: props, flags, period_frames: period };
     let (renderer, device_frames) = match wasapi::open(open, ring) {
         Ok(r) => r,
         Err(hr) => {
@@ -1136,17 +1254,17 @@ unsafe fn initialize(object: u32, a: *mut u8, room: usize) -> i32 {
             return (0x8007_0000 | (e & 0xffff)) as i32;
         }
     };
-    core::ptr::write_bytes(a.add(INIT_ENDPOINT_CLSID), 0, INIT_STRUCT - INIT_ENDPOINT_CLSID);
-    core::ptr::copy_nonoverlapping(format.as_ptr(), a.add(INIT_FORMAT), flen);
-    core::ptr::copy_nonoverlapping(guid_bytes(&CLSID_CLIENT_OUTPUT_ENDPOINT).as_ptr(), a.add(INIT_ENDPOINT_CLSID), 16);
-    wr(a, INIT_EVENT1, KIND_NONE);
-    wr(a, INIT_EVENT2, KIND_NONE);
-    write_event_descriptor(a.add(INIT_EVENT3), EVENT_KIND_GAMECORE, event_id as u16);
-    wr(a, INIT_MEMORY, KIND_CROSS_VM_MEMORY);
-    core::ptr::copy_nonoverlapping(guid_bytes(&CLSID_XVM_BUFFER).as_ptr(), a.add(INIT_MEMORY + 4), 16);
-    core::ptr::copy_nonoverlapping(guid_bytes(&GUID_XVM_BUFFER).as_ptr(), a.add(INIT_MEMORY + 0x14), 16);
-    wr(a, INIT_MEMORY + 0x24, index as u32);
-    compat_common::record_raw("crossvm-audio", "Initialize", &format!("object {object:#x}: {frames} frames ({} bytes) at pool page {index}, WASAPI buffer {device_frames} frames, period event {name}", l.bytes));
+    core::ptr::write_bytes(a.add(lay.clsid), 0, lay.size - lay.clsid);
+    core::ptr::copy_nonoverlapping(format.as_ptr(), a.add(lay.format), flen);
+    core::ptr::copy_nonoverlapping(guid_bytes(&CLSID_CLIENT_OUTPUT_ENDPOINT).as_ptr(), a.add(lay.clsid), 16);
+    wr(a, lay.event1, KIND_NONE);
+    wr(a, lay.event2, KIND_NONE);
+    write_event_descriptor(a.add(lay.event3), EVENT_KIND_GAMECORE, event_id as u16);
+    wr(a, lay.memory, KIND_CROSS_VM_MEMORY);
+    core::ptr::copy_nonoverlapping(guid_bytes(&CLSID_XVM_BUFFER).as_ptr(), a.add(lay.memory + 4), 16);
+    core::ptr::copy_nonoverlapping(guid_bytes(&GUID_XVM_BUFFER).as_ptr(), a.add(lay.memory + 0x14), 16);
+    wr(a, lay.memory + 0x24, index as u32);
+    compat_common::record_raw("crossvm-audio", "Initialize", &format!("object {object:#x}: {frames} frames ({} bytes) at pool page {index}, WASAPI buffer {device_frames} frames, period {period:?}, flags {flags:#x}, period event {name}", l.bytes));
     let mut s = state();
     s.session.get_or_insert(session);
     if let Some(o) = s.objects.get_mut(&object) {
@@ -1168,6 +1286,12 @@ pub fn stream_info(object: u32) -> Option<(usize, u16, u32, String, i64)> {
     let s = state();
     let st = s.objects.get(&object)?.stream.as_ref()?;
     Some((st.base, st.pool_index, st.frames, st.event_name.clone(), st.renderer.shared.rendered.load(Ordering::SeqCst)))
+}
+
+pub fn stream_records(object: u32) -> Option<(i64, f32, i64)> {
+    let s = state();
+    let r = &s.objects.get(&object)?.stream.as_ref()?.renderer;
+    Some((r.records(), r.current_rate(), r.rebases()))
 }
 
 pub fn stream_signals(object: u32) -> Option<i64> {

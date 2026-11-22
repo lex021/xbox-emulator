@@ -28,7 +28,7 @@ Contributions are welcome. The most useful thing you can add right now is covera
 - **No fake success.** Don't return S_OK, or accept and ignore a call, when the console would do something. If something genuinely can't be done on PC, leave the row `missing` and explain why in its note.
 - **No network access at runtime.** The emulator is offline. Online features are emulated in-process as private sessions only.
 - **No decryption, key extraction or DRM circumvention.** The project only runs already-decrypted dumps.
-- **Credit your sources.** If you used open-source code, it must have a compatible licence. Record it in the crate's `THIRD_PARTY` file.
+- **Credit your sources.** If you used open-source code, it must have a compatible licence. Record it in `THIRD_PARTY/CREDITS`.
 
 ## How pull requests are reviewed and merged
 
@@ -45,10 +45,10 @@ Pull requests that add binaries or game data, or that copy code under an incompa
 
 ## Credits for third-party code
 
-When you use code or data tables from another project, add **one line per project** to the crate's `THIRD_PARTY` file (plain text, no extension; or `CREDITS` at the top level for repository-wide tools):
+When you use code or data tables from another project, add **one line per project** to `THIRD_PARTY/CREDITS` at the repository root. There are no per-crate credit files and no credits in code. When you copy code, add its upstream licence text beside that code (as `crates/compat/xcrdapi/src/bcpack` does) or under `THIRD_PARTY/licenses/`:
 
 ```
-<project> <url> <licence> <what was used, and where>
+<project> (<url>, <licence>): <what was used>; <where>
 ```
 
 GPL-3.0, LGPL, MIT, BSD, Apache-2.0 and zlib projects are fine. Keep their copyright notices. GPL-2.0-only code cannot be used.
@@ -66,4 +66,4 @@ Some crates also need third-party SDKs (the DirectX Agility SDK, DXC, libopus). 
 
 ## Licence
 
-Contributions are accepted under the project licence: GPL-3.0-or-later. See [LICENSE](LICENSE). Code from GPL-3.0 projects may be used with its copyright notices kept and recorded in the crate's `THIRD_PARTY` file; GPL-2.0-only code is not compatible and must not be copied.
+Contributions are accepted under the project licence: GPL-3.0-or-later. See [LICENSE](LICENSE). Code from GPL-3.0 projects may be used with its copyright notices kept and recorded in `THIRD_PARTY/CREDITS`; GPL-2.0-only code is not compatible and must not be copied.

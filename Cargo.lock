@@ -91,6 +91,17 @@ name = "compat_smoke"
 version = "0.1.0"
 
 [[package]]
+name = "coniosrv"
+version = "0.1.0"
+dependencies = [
+ "compat-common",
+ "coniosrv",
+ "console-image",
+ "console-sandbox",
+ "xone-exports",
+]
+
+[[package]]
 name = "connectedstorageservice_proxystub"
 version = "0.1.0"
 dependencies = [
@@ -451,6 +462,8 @@ name = "pixrt10"
 version = "0.1.0"
 dependencies = [
  "compat-common",
+ "console-sandbox",
+ "xbtp",
  "xone-exports",
 ]
 
@@ -804,6 +817,8 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 name = "wldp"
 version = "0.1.0"
 dependencies = [
+ "compat-common",
+ "console-sandbox",
  "xone-exports",
 ]
 

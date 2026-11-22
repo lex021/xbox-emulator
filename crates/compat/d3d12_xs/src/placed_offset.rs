@@ -910,20 +910,18 @@ mod tests {
             let mut info = [0u64; 2];
             let md = tex_desc(4);
             vc!(dev, 25, fn(*mut u64, u32, u32, *const u8) -> *mut u64, info.as_mut_ptr(), 0, 1, md.as_ptr());
-            let off_va = r + 0x31_0000;
-            let off_step = crate::alias::create_placed_x(dev, off_va, &md, 0x1_0000, 4, core::ptr::null(), &mut t3)
-                .expect("MSAA placement off the reservation's 4 MB step");
+            let off_step = crate::alias::create_placed_x(dev, r + 0x31_0000, &md, 0x1_0000, 4, core::ptr::null(), &mut t3).expect("MSAA larger than its title layout gets its own heap at any 64 KB step");
+            assert_eq!(off_step.offset, 0);
+            assert_ne!(off_step.heap, m1.heap);
+            assert!(crate::msaa_place::capable(off_step.heap) || info[1] < crate::msaa_place::MSAA_ALIGN);
+            vc!(t3, 2, fn() -> u32);
             let mut t4: *mut c_void = core::ptr::null_mut();
-            let repeated = crate::alias::create_placed_x(dev, off_va, &md, 0x1_0000, 4, core::ptr::null(), &mut t4)
-                .expect("second MSAA placement at the same address");
-            assert_eq!(off_step.kind, crate::alias::Kind::Local);
-            assert_eq!((off_step.heap, off_step.offset), (repeated.heap, repeated.offset));
+            let same = crate::alias::create_placed_x(dev, r + 0x31_0000, &md, info[0], 4, core::ptr::null(), &mut t4);
             if info[1] >= crate::msaa_place::MSAA_ALIGN {
-                assert_ne!(off_step.heap, m1.heap, "the original heap cannot represent both alignments");
-                assert_eq!(off_step.offset % info[1], 0);
+                assert!(same.is_none(), "MSAA that fits its title layout but sits off a 4 MB step of the shared heap falls back to a committed resource");
             } else {
-                assert_eq!(off_step.heap, m1.heap);
-                assert_eq!(off_step.offset, 0x31_0000);
+                assert!(same.is_some(), "this adapter places MSAA at {:#x}, so any 64 KB step works", info[1]);
+                vc!(t4, 2, fn() -> u32);
             }
             let mut t5: *mut c_void = core::ptr::null_mut();
             let single = crate::alias::create_placed_x(dev, at, &tex_desc(1), 0x4_0000, 4, core::ptr::null(), &mut t5)

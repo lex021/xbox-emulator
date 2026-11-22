@@ -83,13 +83,13 @@ IMPORT_EVIDENCE = ["media.json", "gameinput_ext.json", "chatprobe.json"]
 GREEN, AMBER, GREY, BG = "#2ea043", "#d29922", "#6e7681", "#0d1117"
 COL = {"done": GREEN, "partial": AMBER, "none": GREY}
 XCOL = {"implemented": "#2ea043", "forwarded": "#388bfd", "hooked": "#a371f7", "pc": "#2f8f83",
-        "title": "#56b6c2", "pending": "#e3b341", "stub": "#d29922", "unverified": "#3d444d", "missing": "#6e7681"}
-XORDER = ["implemented", "forwarded", "hooked", "pc", "title", "pending", "stub", "unverified", "missing"]
+        "title": "#56b6c2", "pending": "#e3b341", "stub": "#d29922", "unsupported": "#da3633", "unverified": "#3d444d", "missing": "#6e7681"}
+XORDER = ["implemented", "forwarded", "hooked", "pc", "title", "pending", "stub", "unsupported", "unverified", "missing"]
 COVERED = {"implemented", "forwarded", "hooked", "pc", "title"}
 PC_SUPPLEMENT = {"kernel32.dll", "advapi32.dll", "ntdll.dll", "kernelbase.dll", "shcore.dll", "ole32.dll"}
 LABEL = {"implemented": "implemented in emulator", "forwarded": "forwarded by emulator to PC",
          "hooked": "PC system DLL, hooked by emulator", "pc": "PC system DLL (name match)",
-         "title": "shipped with the title", "pending": "implemented, awaiting verification", "stub": "emulator stub", "unverified": "unverified",
+         "title": "shipped with the title", "pending": "implemented, awaiting verification", "stub": "emulator stub", "unsupported": "my PC doesn't support it", "unverified": "unverified",
          "missing": "missing"}
 TOMBOX = "https://github.com/drycheetah84/TomBox/blob/master/"
 
@@ -345,8 +345,9 @@ def console_section(o, y, libs, height):
         if s not in present:
             continue
         o.append(f'<rect x="{lx}" y="{y + 2}" width="10" height="10" fill="{XCOL[s]}"/>')
-        o.append(text(lx + 14, y + 11, s, 11))
-        lx += 14 + 7 * len(s) + 14
+        nm = "my PC doesn't support it" if s == "unsupported" else s
+        o.append(text(lx + 14, y + 11, nm, 11))
+        lx += 14 + 7 * len(nm) + 14
     o.append(f'<rect x="{lx}" y="{y + 2}" width="10" height="10" fill="{lighten(XCOL["missing"])}"/>')
     o.append(text(lx + 14, y + 11, "lighter = imported by an analysed title", 11))
     y += 18
@@ -518,6 +519,7 @@ def library_map(summary, libs):
     w("| hooked | PC-twin row (below) that the emulator's OS host also hooks |")
     w("| pc | console host DLL with no same-named PC DLL and no emulator crate (minuserx, advapi32legacy, minappmodelx when not emulated): a title imports the export and its PC twin exports the same name; not implemented by the emulator |")
     w("| stub | the emulator exports it but returns a fixed result (E_NOTIMPL / S_OK / inert object) |")
+    w("| unsupported | shown red as \"my PC doesn't support it\": implemented as far as possible, but it needs something this PC does not have (an elevated account, real network access, or a console-only driver), so it cannot be run or verified here |")
     w("| unverified | imported by a binary or module that was never observed loading |")
     w("| missing | no emulator export, and no PC System32 export of that name |")
     w("")

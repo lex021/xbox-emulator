@@ -768,7 +768,7 @@ fn host_serves_audio_cursor_and_hdr_classes() {
         let created = u32::from_le_bytes(env[0x1c..0x20].try_into().unwrap());
         assert_ne!(created, 0, "the new object id sits at env+0x1c");
         let mut env = vec![0u8; AUDIO_ENVELOPE as usize];
-        env[8..12].copy_from_slice(&0x47u32.to_le_bytes());
+        env[8..12].copy_from_slice(&0x64u32.to_le_bytes());
         assert_eq!(call(a, AUDIO_ENVELOPE, env.as_mut_ptr()), S_OK);
         assert_eq!(i32::from_le_bytes(env[4..8].try_into().unwrap()), E_NOTIMPL, "ids with no decoded layout report E_NOTIMPL in the envelope");
         let mut env = vec![0u8; AUDIO_ENVELOPE as usize];
@@ -946,8 +946,103 @@ fn host_serves_package_v7_and_net_security_classes() {
         assert_eq!(String::from_utf16_lossy(&hstring_units((*arr).id)), compat_common::gdk::package::package_id());
         assert_eq!(enumerate(v7, core::ptr::null(), 1, 0, &mut n, &mut arr), S_OK);
         assert_eq!((n, arr.is_null()), (0, true), "no content packages are installed");
-        let undecoded: unsafe extern "system" fn(*mut c_void) -> i32 = core::mem::transmute(slot(v7, 30));
+        let undecoded: unsafe extern "system" fn(*mut c_void) -> i32 = core::mem::transmute(slot(v7, 7));
         assert_eq!(undecoded(v7), E_NOTIMPL, "undecoded slots fail per call, never with a retryable RPC code");
+        let state: unsafe extern "system" fn(*mut c_void, *const u16, *mut StateRec) -> i32 = core::mem::transmute(slot(v7, 3));
+        let mut st = StateRec { a: 9, b: 9, selection: 1usize as *mut c_void };
+        assert_eq!(state(v7, pkg.as_ptr(), &mut st), S_OK);
+        assert_eq!((st.a, st.b, st.selection.is_null()), (0, 0, true), "no default selection: the client selects every region");
+        assert_eq!(state(v7, other.as_ptr(), &mut st), compat_common::gdk::E_NOT_FOUND);
+        static SINK_REFS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+        unsafe extern "system" fn s_qi(_t: *mut c_void, _i: *const Guid, _o: *mut *mut c_void) -> i32 { E_NOINTERFACE }
+        unsafe extern "system" fn s_add(_t: *mut c_void) -> u32 { SINK_REFS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 }
+        unsafe extern "system" fn s_rel(_t: *mut c_void) -> u32 { SINK_REFS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1 }
+        let sink_vt: [usize; 3] = [s_qi as *const () as usize, s_add as *const () as usize, s_rel as *const () as usize];
+        let mut sink_obj: *const usize = sink_vt.as_ptr();
+        let sink = &mut sink_obj as *mut *const usize as *mut c_void;
+        let register: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> i32 = core::mem::transmute(slot(v7, 4));
+        let unregister: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32 = core::mem::transmute(slot(v7, 5));
+        let base_sinks = registered_sinks();
+        let mut reg = core::ptr::null_mut();
+        assert_eq!(register(v7, sink, &mut reg), S_OK);
+        assert_eq!(SINK_REFS.load(std::sync::atomic::Ordering::SeqCst), 2, "the host keeps a reference to the sink");
+        assert_eq!(registered_sinks(), base_sinks + 1);
+        let reg_qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(slot(reg, 0));
+        let reg_release: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(slot(reg, 2));
+        let mut ag = core::ptr::null_mut();
+        assert_eq!(reg_qi(reg, &IID_IAGILE_OBJECT, &mut ag), S_OK, "the registration answers IAgileObject for RoGetAgileReference");
+        reg_release(ag);
+        assert_eq!(unregister(v7, reg), S_OK);
+        assert_eq!(SINK_REFS.load(std::sync::atomic::Ordering::SeqCst), 1, "unregister drops the sink");
+        assert_eq!(unregister(v7, reg), compat_common::gdk::E_NOT_FOUND, "a second unregister fails");
+        reg_release(reg);
+        let mut reg2 = core::ptr::null_mut();
+        assert_eq!(register(v7, sink, &mut reg2), S_OK);
+        assert_eq!(reg_release(reg2), 0);
+        assert_eq!(SINK_REFS.load(std::sync::atomic::Ordering::SeqCst), 1, "the final release of the registration unregisters");
+        assert_eq!(registered_sinks(), base_sinks);
+        let enum6: unsafe extern "system" fn(*mut c_void, *const u16, i32, i32, *mut u32, *mut *mut PkgDetails) -> i32 = core::mem::transmute(slot(v7, 6));
+        let (mut n6, mut a6) = (0u32, core::ptr::null_mut());
+        assert_eq!(enum6(v7, core::ptr::null(), 0, 0, &mut n6, &mut a6), S_OK);
+        assert_eq!(n6, 1, "slot 6 has the slot 28 shape");
+        let det12: unsafe extern "system" fn(*mut c_void, *const u16, *mut PkgDetails) -> i32 = core::mem::transmute(slot(v7, 12));
+        let mut d12: PkgDetails = core::mem::zeroed();
+        assert_eq!(det12(v7, pkg.as_ptr(), &mut d12), S_OK);
+        assert_eq!(String::from_utf16_lossy(&hstring_units(d12.id)), compat_common::gdk::package::package_id());
+        let key: Vec<u16> = "Languages".encode_utf16().chain(Some(0)).collect();
+        let val: Vec<u16> = "en-US; fr-FR".encode_utf16().chain(Some(0)).collect();
+        let sel = [Selector { key: key.as_ptr(), values: val.as_ptr() }];
+        let install: unsafe extern "system" fn(*mut c_void, *const u16, u32, *const Selector) -> i32 = core::mem::transmute(slot(v7, 9));
+        assert_eq!(install(v7, pkg.as_ptr(), 1, sel.as_ptr()), S_OK, "installing already installed chunks completes at once");
+        assert_eq!(install(v7, other.as_ptr(), 1, sel.as_ptr()), compat_common::gdk::E_NOT_FOUND);
+        let uninst: unsafe extern "system" fn(*mut c_void, *const u16, u32, *const Selector) -> i32 = core::mem::transmute(slot(v7, 10));
+        assert_eq!(uninst(v7, pkg.as_ptr(), 1, sel.as_ptr()), E_ACCESSDENIED);
+        let order: unsafe extern "system" fn(*mut c_void, *const u16, u32, *const u32) -> i32 = core::mem::transmute(slot(v7, 13));
+        assert_eq!(order(v7, pkg.as_ptr(), 2, [1u32, 2].as_ptr()), S_OK);
+        let installed: unsafe extern "system" fn(*mut c_void, *const u16, *const u16, *mut i32) -> i32 = core::mem::transmute(slot(v7, 14));
+        let mut yes = 7;
+        assert_eq!(installed(v7, pkg.as_ptr(), pkg.as_ptr(), &mut yes), S_OK);
+        assert_eq!(yes, 1);
+        assert_eq!(installed(v7, pkg.as_ptr(), other.as_ptr(), &mut yes), S_OK);
+        assert_eq!(yes, 0, "no other package exists on the emulated console");
+        let resolve: unsafe extern "system" fn(*mut c_void, i32, *const u16, *mut *mut c_void, *mut i32) -> i32 = core::mem::transmute(slot(v7, 16));
+        let store: Vec<u16> = compat_common::gdk::store::game_store_id().encode_utf16().chain(Some(0)).collect();
+        let mut k = 9;
+        assert_eq!(resolve(v7, 0, store.as_ptr(), &mut h, &mut k), S_OK);
+        assert_eq!((String::from_utf16_lossy(&hstring_units(h)), k), (compat_common::gdk::package::package_id(), 0), "a store id resolves to the install identity, kind 0");
+        assert_eq!(resolve(v7, 0, other.as_ptr(), &mut h, &mut k), compat_common::gdk::E_NOT_FOUND);
+        for s in [20usize, 21, 31] {
+            let step: unsafe extern "system" fn(*mut c_void, *const u16, *const u16) -> i32 = core::mem::transmute(slot(v7, s));
+            assert_eq!(step(v7, pkg.as_ptr(), pkg.as_ptr()), S_OK, "slot {s}");
+            assert_eq!(step(v7, other.as_ptr(), pkg.as_ptr()), compat_common::gdk::E_NOT_FOUND, "slot {s}");
+        }
+        let consent: unsafe extern "system" fn(*mut c_void, *const u16, *const u16, *mut i32) -> i32 = core::mem::transmute(slot(v7, 30));
+        let mut c = 9;
+        assert_eq!(consent(v7, pkg.as_ptr(), pkg.as_ptr(), &mut c), S_OK);
+        assert_eq!(c, 0, "bit 0 clear: the mount needs no consent prompt");
+        let create: unsafe extern "system" fn(*mut c_void, *const u16, *const Selector, u32, *const u32, u32, i32, *mut *mut c_void) -> i32 = core::mem::transmute(slot(v7, 22));
+        let mut op = core::ptr::null_mut();
+        assert_eq!(create(v7, pkg.as_ptr(), sel.as_ptr(), 1, core::ptr::null(), 0, 0, &mut op), S_OK);
+        let next: unsafe extern "system" fn(*mut c_void, u32, *mut u32, *mut u32) -> i32 = core::mem::transmute(slot(op, 3));
+        let expect = selected_chunks(&[("Languages".into(), vec!["en-US".into(), "fr-FR".into()])], &[]);
+        let mut got = Vec::new();
+        loop {
+            let mut buf = [0u32; 2];
+            let mut m = 9u32;
+            assert_eq!(next(op, 2, buf.as_mut_ptr(), &mut m), S_OK);
+            if m == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..m as usize]);
+        }
+        assert_eq!(got, expect, "the op lists the selected chunk ids, then ends with n == 0");
+        let op_release: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(slot(op, 2));
+        assert_eq!(op_release(op), 0);
+        let snap: unsafe extern "system" fn(*mut c_void, *const u16, i32, u64, *mut u64, *mut u32, *mut *mut c_void) -> i32 = core::mem::transmute(slot(v7, 23));
+        let (mut nx, mut sn, mut sa) = (0u64, 9u32, 1usize as *mut c_void);
+        assert_eq!(snap(v7, pkg.as_ptr(), 0, 0, &mut nx, &mut sn, &mut sa), S_OK);
+        assert_eq!((sn, sa.is_null()), (0, true));
+        assert_ne!(nx, 0, "a non-zero cursor so the resume call runs");
         release(v7);
 
         let mut aux = core::ptr::null_mut();

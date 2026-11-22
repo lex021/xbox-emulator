@@ -767,7 +767,7 @@ pub struct Client3Vtbl {
     pub get_storage_device_free_space: unsafe extern "system" fn(P, W, *mut u64, *mut u64) -> HRESULT,
     pub copy_files_direct_list: unsafe extern "system" fn(P, P, u32, W, W, u32, P, P) -> HRESULT,
     pub copy_files_perf: unsafe extern "system" fn(P, W, u32, u32, u32, W, u32, P, P) -> HRESULT,
-    pub calculate_incremental_list: usize,
+    pub calculate_incremental_list: unsafe extern "system" fn(P, W, W, u32, P, P, W, P) -> HRESULT,
 }
 
 pub static CLIENT_VTBL: ClientVtbl = ClientVtbl {
@@ -804,7 +804,7 @@ pub static CLIENT3_VTBL: Client3Vtbl = Client3Vtbl {
     get_storage_device_free_space: i3_free_space,
     copy_files_direct_list: crate::client_copy::i3_copy_files_direct_list,
     copy_files_perf: crate::client_copy::i3_copy_files_perf,
-    calculate_incremental_list: crate::client_copy::I3_CALCULATE_INCREMENTAL_LIST,
+    calculate_incremental_list: crate::client_copy::i3_calculate_incremental_list,
 };
 
 impl FileIOClient {

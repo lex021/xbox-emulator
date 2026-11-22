@@ -18,8 +18,15 @@ pub fn comp_count(idx: u32) -> Option<u32> {
     })
 }
 
+pub fn fmt_row(fmt: u32) -> [u32; 3] {
+    if fmt == 104 && xg_build() == 19041 {
+        return [0, 0, 0];
+    }
+    FMT[fmt as usize]
+}
+
 pub fn safe_format(fmt: u32) -> bool {
-    fmt >= 1 && fmt <= 0x78 && comp_count(FMT[fmt as usize][0]).is_some()
+    fmt >= 1 && fmt <= 0x78 && comp_count(fmt_row(fmt)[0]).is_some()
 }
 
 pub struct Dcc {
@@ -76,7 +83,7 @@ impl Dcc {
         } else {
             self.w32(0, 0xf + (sw & 3));
         }
-        let [idx, w4, w7] = FMT[fmt as usize];
+        let [idx, w4, w7] = fmt_row(fmt);
         let bpe = 1u32 << LOG2[(idx & 63) as usize];
         let r11 = (w7.wrapping_sub(1) & !2) == 0;
         self.w32(4, bpe);
@@ -158,6 +165,30 @@ pub unsafe fn decode_export(count: u32, src: *const u8, meta: *const u8, dst: *m
 thread_local! {
     pub(crate) static ENTRY: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
     pub(crate) static VARY: core::cell::Cell<u32> = const { core::cell::Cell::new(!0) };
+    static STUB_E: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LAST_E: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+pub(crate) extern "system" fn set_entry(e: usize) {
+    STUB_E.with(|c| c.set(e));
+}
+
+pub(crate) fn take_entry() -> Option<usize> {
+    let e = STUB_E.with(|c| c.replace(0));
+    #[cfg(test)]
+    LAST_E.with(|c| c.set(e));
+    (e != 0).then_some(e)
+}
+
+pub(crate) fn with_entry<R>(e: Option<usize>, f: impl FnOnce() -> R) -> R {
+    let old = ENTRY.with(|c| c.replace(e));
+    let r = f();
+    ENTRY.with(|c| c.set(old));
+    r
 }
 
 pub(crate) const CONV_FROM_ENTRY: usize = 0x1968;
@@ -211,20 +242,27 @@ fn unknowns(k: u64) -> [u8; 64] {
     }
 }
 
+pub(crate) const SAMPLES: u64 = 7;
+
 fn enc_block(d: &mut Dcc) -> Result<u32, i32> {
     let pre = Dcc { m: d.m.clone(), b: d.b };
     let p = ENTRY.with(|c| c.get()).map(|e| e.wrapping_sub(CONV_FROM_ENTRY));
-    let (cb, ck) = enc::conv_residue(p);
+    let seen = enc::conv_seen(p);
     let mut runs = Vec::new();
     let vary = VARY.with(|v| v.get());
-    for k in 0..5u64 {
+    for k in 0..SAMPLES {
         let q = |b: u32, x: u64| if vary >> b & 1 != 0 { x } else { 7 };
         let fills = [unknowns(q(0, 3 * k)), unknowns(q(1, 3 * k + 1)), unknowns(q(2, 3 * k + 2))];
-        let r = unknowns(q(3, 100 + k));
-        let mut conv = cb;
-        for i in 0..64 {
-            if !ck[i] {
-                conv[i] = r[i];
+        let mut conv = match (vary >> 3 & 1 != 0, k) {
+            (false, _) | (true, 0) => seen,
+            (true, k) => unknowns(100 + k),
+        };
+        if vary >> 3 & 1 == 0 && vary >> 8 & 0xff != 0 && k > 0 {
+            let r = unknowns(100 + k);
+            for qd in 0..8 {
+                if vary >> (8 + qd) & 1 != 0 {
+                    conv[qd * 8..qd * 8 + 8].copy_from_slice(&r[qd * 8..qd * 8 + 8]);
+                }
             }
         }
         runs.push(enc_try(&pre, &fills, &conv)?);
@@ -312,5 +350,9 @@ mod oracle_enc;
 mod verify_enc;
 #[cfg(test)]
 mod oracle_cases;
+#[cfg(test)]
+mod oracle_seq;
+#[cfg(test)]
+mod watch;
 pub mod dec;
 pub mod enc;

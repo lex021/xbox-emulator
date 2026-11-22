@@ -60,7 +60,8 @@ fn kernelbase_family_xref_rows_route_to_the_compat_kernelbase() {
 
 #[test]
 fn rows_not_implemented_fall_back_to_the_pc() {
-    assert!(lookup("ntdll.dll", "RtlpUmsThreadYield", 19041).is_none());
+    assert!(lookup("ntdll.dll", "NtClose", 19041).is_none());
+    assert_eq!(lookup("ntdll.dll", "RtlpUmsThreadYield", 19041).map(|r| (r.lib, r.status)), Some(("ntdll", "implemented")));
     assert!(lookup("shcore.dll", "GetScaleFactorForDevice", 19041).is_none());
     assert!(lookup("user32.dll", "MessageBoxW", 19041).is_none());
     assert!(lookup("api-ms-win-core-com-l1-1-0.dll", "CoCreateInstance", 19041).is_none());
@@ -146,7 +147,7 @@ fn title_iat_is_patched_to_the_built_compat_dlls_with_pc_fallback() {
     let set = "api-ms-win-core-processtopology-obsolete-l1-1-0.dll";
     let mut img = image(&[
         ("SHCORE.dll", &["#227", "RevokeScaleChangeNotifications", "GetScaleFactorForDevice", "#225"]),
-        ("ntdll.dll", &["RtlWnfCompareChangeStamp", "RtlpUmsThreadYield"]),
+        ("ntdll.dll", &["RtlWnfCompareChangeStamp", "NtClose"]),
         (set, &["SetThreadAffinityMask"]),
     ]);
     let host_hook: &'static [&'static str] = &["api-ms-win-core-processtopology-"];
@@ -171,7 +172,7 @@ fn title_iat_is_patched_to_the_built_compat_dlls_with_pc_fallback() {
         assert_eq!(img.slot("ntdll.dll", "RtlWnfCompareChangeStamp"), GetProcAddress(nt as *mut c_void, b"RtlWnfCompareChangeStamp\0".as_ptr()) as usize);
     }
     assert_eq!(img.slot("shcore.dll", "GetScaleFactorForDevice"), before_pc);
-    assert_eq!(img.slot("ntdll.dll", "RtlpUmsThreadYield"), 0x1111_0000_0001);
+    assert_eq!(img.slot("ntdll.dll", "NtClose"), 0x1111_0000_0001);
     assert_eq!(img.slot(set, "SetThreadAffinityMask"), 0x1111_0000_0000);
     let f: extern "system" fn(u32, u32) -> i32 = unsafe { core::mem::transmute(img.slot("ntdll.dll", "RtlWnfCompareChangeStamp")) };
     assert_eq!(f(1, 2), -1);
@@ -281,7 +282,10 @@ fn run_time_loader_calls_resolve_to_routed_exports_with_pc_fallback() {
         let wnf = gpa(nt, b"RtlWnfCompareChangeStamp\0".as_ptr());
         assert!(pcg(nt, b"RtlWnfCompareChangeStamp\0".as_ptr()).is_null());
         assert_eq!(wnf, pcg(routes::module("ntdll") as *mut c_void, b"RtlWnfCompareChangeStamp\0".as_ptr()));
-        assert!(gpa(nt, b"RtlpUmsThreadYield\0".as_ptr()).is_null());
+        assert!(pcg(nt, b"RtlpUmsThreadYield\0".as_ptr()).is_null());
+        assert!(!gpa(nt, b"RtlpUmsThreadYield\0".as_ptr()).is_null());
+        assert_eq!(gpa(nt, b"RtlpUmsThreadYield\0".as_ptr()), pcg(routes::module("ntdll") as *mut c_void, b"RtlpUmsThreadYield\0".as_ptr()));
+        assert!(gpa(nt, b"TbxNoSuchNtdllExport\0".as_ptr()).is_null());
         assert_eq!(gpa(nt, b"NtClose\0".as_ptr()), pcg(nt, b"NtClose\0".as_ptr()));
 
         let a32l = la(b"advapi32legacy.dll\0".as_ptr());
@@ -390,7 +394,7 @@ fn ex_caller_and_ldr_loader_imports_are_routed_too() {
         out = core::ptr::null_mut();
         assert_eq!(ldr_gpa(sys_sh, &pcname, 0, &mut out), 0);
         assert_eq!(out, pcg(sys_sh, b"GetScaleFactorForDevice\0".as_ptr()));
-        let missing = a_str(b"RtlpUmsThreadYield");
+        let missing = a_str(b"TbxNoSuchNtdllExport");
         let nt = LoadLibraryW(w("ntdll.dll").as_ptr());
         assert_eq!(ldr_gpa(nt, &missing, 0, &mut out) as u32, 0xC000_0139);
         assert_eq!(gpac(sys_sh, 227usize as *const u8, core::ptr::null_mut()), pcg(ours, 227usize as *const u8));

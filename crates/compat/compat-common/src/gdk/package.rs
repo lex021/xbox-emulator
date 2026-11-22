@@ -168,7 +168,7 @@ pub fn load_layout(dir: &Path) -> Layout {
     Layout::default()
 }
 
-fn layout() -> &'static Layout {
+pub fn layout() -> &'static Layout {
     static L: OnceLock<Layout> = OnceLock::new();
     L.get_or_init(|| title().dir.as_deref().map(load_layout).unwrap_or_default())
 }

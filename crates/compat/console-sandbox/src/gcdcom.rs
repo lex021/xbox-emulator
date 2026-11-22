@@ -1,5 +1,5 @@
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -546,28 +546,12 @@ macro_rules! unserved {
     };
 }
 
-unserved!(v7_3, "PackageV7", 3);
-unserved!(v7_4, "PackageV7", 4);
-unserved!(v7_5, "PackageV7", 5);
-unserved!(v7_6, "PackageV7", 6);
 unserved!(v7_7, "PackageV7", 7);
-unserved!(v7_9, "PackageV7", 9);
-unserved!(v7_10, "PackageV7", 10);
-unserved!(v7_12, "PackageV7", 12);
-unserved!(v7_13, "PackageV7", 13);
-unserved!(v7_14, "PackageV7", 14);
-unserved!(v7_16, "PackageV7", 16);
 unserved!(v7_17, "PackageV7", 17);
 unserved!(v7_18, "PackageV7", 18);
 unserved!(v7_19, "PackageV7", 19);
-unserved!(v7_20, "PackageV7", 20);
-unserved!(v7_21, "PackageV7", 21);
-unserved!(v7_22, "PackageV7", 22);
-unserved!(v7_23, "PackageV7", 23);
 unserved!(v7_24, "PackageV7", 24);
 unserved!(v7_25, "PackageV7", 25);
-unserved!(v7_30, "PackageV7", 30);
-unserved!(v7_31, "PackageV7", 31);
 
 unsafe fn wide_text(p: *const u16) -> Option<String> {
     if p.is_null() {
@@ -749,10 +733,336 @@ unsafe extern "system" fn v7_enumerate(_this: *mut c_void, _filter: *const u16, 
     S_OK
 }
 
+#[repr(C)]
+pub struct StateRec {
+    pub a: i32,
+    pub b: i32,
+    pub selection: *mut c_void,
+}
+
+unsafe extern "system" fn v7_3(_this: *mut c_void, pkg: *const u16, out: *mut StateRec) -> i32 {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    *out = StateRec { a: 0, b: 0, selection: core::ptr::null_mut() };
+    if !package_known(wide_text(pkg)) {
+        return compat_common::gdk::E_NOT_FOUND;
+    }
+    compat_common::record_raw("gamecore-host", "PackageV7", "slot 3 package state: no default selection (every region selected), a=b=0");
+    S_OK
+}
+
+#[repr(C)]
+struct SinkReg {
+    vt: *const *const (),
+    refs: AtomicU32,
+    sink: AtomicUsize,
+}
+
+static SINK_REG_VT: Vt<3> = Vt([sink_reg_qi as *const (), sink_reg_add_ref as *const (), sink_reg_release as *const ()]);
+static SINKS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+pub fn registered_sinks() -> usize {
+    SINKS.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
+unsafe fn com_add_ref(p: *mut c_void) -> u32 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*(*(p as *const *const usize)).add(1));
+    f(p)
+}
+
+unsafe fn com_release(p: *mut c_void) -> u32 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*(*(p as *const *const usize)).add(2));
+    f(p)
+}
+
+unsafe fn sink_drop(reg: *const SinkReg) -> bool {
+    let sink = (*reg).sink.swap(0, Ordering::SeqCst);
+    if sink == 0 {
+        return false;
+    }
+    SINKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|&r| r != reg as usize);
+    com_release(sink as *mut c_void);
+    true
+}
+
+unsafe extern "system" fn sink_reg_qi(this: *mut c_void, iid: *const Guid, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    *out = core::ptr::null_mut();
+    if iid.is_null() {
+        return E_INVALIDARG;
+    }
+    if *iid == IID_IUNKNOWN || *iid == IID_IAGILE_OBJECT {
+        sink_reg_add_ref(this);
+        *out = this;
+        return S_OK;
+    }
+    E_NOINTERFACE
+}
+
+unsafe extern "system" fn sink_reg_add_ref(this: *mut c_void) -> u32 {
+    (*(this as *const SinkReg)).refs.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+unsafe extern "system" fn sink_reg_release(this: *mut c_void) -> u32 {
+    let r = (*(this as *const SinkReg)).refs.fetch_sub(1, Ordering::SeqCst) - 1;
+    if r == 0 {
+        sink_drop(this as *const SinkReg);
+        drop(Box::from_raw(this as *mut SinkReg));
+    }
+    r
+}
+
+unsafe extern "system" fn v7_4(_this: *mut c_void, sink: *mut c_void, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    *out = core::ptr::null_mut();
+    if sink.is_null() {
+        return E_INVALIDARG;
+    }
+    com_add_ref(sink);
+    let reg = Box::into_raw(Box::new(SinkReg { vt: SINK_REG_VT.0.as_ptr(), refs: AtomicU32::new(1), sink: AtomicUsize::new(sink as usize) }));
+    SINKS.lock().unwrap_or_else(|e| e.into_inner()).push(reg as usize);
+    compat_common::record_raw("gamecore-host", "PackageV7", "slot 4 install sink registered; the installed dump never changes state, so it receives no progress or installed calls");
+    *out = reg as *mut c_void;
+    S_OK
+}
+
+unsafe extern "system" fn v7_5(_this: *mut c_void, reg: *mut c_void) -> i32 {
+    if reg.is_null() {
+        return E_INVALIDARG;
+    }
+    let live = SINKS.lock().unwrap_or_else(|e| e.into_inner()).contains(&(reg as usize));
+    if !live || !sink_drop(reg as *const SinkReg) {
+        return compat_common::gdk::E_NOT_FOUND;
+    }
+    compat_common::record_raw("gamecore-host", "PackageV7", "slot 5 install sink unregistered");
+    S_OK
+}
+
+#[repr(C)]
+pub struct Selector {
+    pub key: *const u16,
+    pub values: *const u16,
+}
+
+unsafe fn selectors(sel: *const Selector, n: u32) -> Vec<(String, Vec<String>)> {
+    if sel.is_null() {
+        return Vec::new();
+    }
+    (0..n as usize).map(|i| {
+        let s = &*sel.add(i);
+        let key = wide_text(s.key).unwrap_or_default();
+        let values = wide_text(s.values).unwrap_or_default().split(';').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect();
+        (key, values)
+    }).collect()
+}
+
+pub fn selected_chunks(sel: &[(String, Vec<String>)], ids: &[u32]) -> Vec<u32> {
+    let l = compat_common::gdk::package::layout();
+    let mut all: Vec<u32> = l.entries.iter().map(|c| c.id).collect();
+    if all.is_empty() {
+        all = l.chunks.clone();
+    }
+    let mut out: Vec<u32> = all.into_iter().filter(|&id| {
+        let by_sel = sel.is_empty() || sel.iter().any(|(k, vs)| {
+            let kind = if k.eq_ignore_ascii_case("Languages") { 0 } else if k.eq_ignore_ascii_case("Tags") { 1 } else { return false };
+            vs.iter().any(|v| l.select(kind, v, 0).contains(&id))
+        });
+        by_sel || ids.contains(&id)
+    }).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+unsafe extern "system" fn v7_9(_this: *mut c_void, pkg: *const u16, n: u32, sel: *const Selector) -> i32 {
+    if !package_known(wide_text(pkg)) {
+        return compat_common::gdk::E_NOT_FOUND;
+    }
+    let s = selectors(sel, n);
+    compat_common::record_raw("gamecore-host", "PackageV7", &format!("slot 9 install chunks for {} selectors: chunks {:?} are already installed, nothing to queue", s.len(), selected_chunks(&s, &[])));
+    S_OK
+}
+
+unsafe extern "system" fn v7_10(_this: *mut c_void, pkg: *const u16, _n: u32, _sel: *const Selector) -> i32 {
+    if !package_known(wide_text(pkg)) {
+        return compat_common::gdk::E_NOT_FOUND;
+    }
+    compat_common::record_raw("gamecore-host", "PackageV7", "slot 10 uninstall chunks refused: the installed package is the read-only game dump; E_ACCESSDENIED");
+    E_ACCESSDENIED
+}
+
+unsafe extern "system" fn v7_13(_this: *mut c_void, pkg: *const u16, n: u32, ids: *const u32) -> i32 {
+    if !package_known(wide_text(pkg)) {
+        return compat_common::gdk::E_NOT_FOUND;
+    }
+    let ids = if ids.is_null() { &[][..] } else { core::slice::from_raw_parts(ids, n as usize) };
+    compat_common::record_raw("gamecore-host", "PackageV7", &format!("slot 13 install order {ids:?}: no chunk is pending, the order is already complete"));
+    S_OK
+}
+
+fn same_package(id: Option<String>) -> bool {
+    let Some(id) = id else { return false };
+    id.eq_ignore_ascii_case(&compat_common::gdk::package::package_id()) || id.eq_ignore_ascii_case(&compat_common::gdk::store::game_store_id())
+}
+
+unsafe extern "system" fn v7_14(_this: *mut c_void, watched: *const u16, installed: *const u16, out: *mut i32) -> i32 {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    *out = (same_package(wide_text(watched)) && same_package(wide_text(installed))) as i32;
+    S_OK
+}
+
+unsafe extern "system" fn v7_16(_this: *mut c_void, kind: i32, id: *const u16, out: *mut *mut c_void, kind_out: *mut i32) -> i32 {
+    if out.is_null() || kind_out.is_null() {
+        return E_POINTER;
+    }
+    *out = core::ptr::null_mut();
+    *kind_out = 0;
+    let id = wide_text(id).unwrap_or_default();
+    let hit = kind == 0 && id.eq_ignore_ascii_case(&compat_common::gdk::store::game_store_id());
+    compat_common::record_raw("gamecore-host", "PackageV7", &format!("slot 16 resolve kind {kind} '{id}' -> {}", if hit { "this package" } else { "not found" }));
+    if !hit {
+        return compat_common::gdk::E_NOT_FOUND;
+    }
+    put_hstring(out, &wide(&compat_common::gdk::package::package_id()))
+}
+
+unsafe extern "system" fn v7_mount_step(slot: u32, target: *const u16, caller: *const u16) -> i32 {
+    let t = wide_text(target);
+    let c = wide_text(caller).unwrap_or_default();
+    if !package_known(t) {
+        return compat_common::gdk::E_NOT_FOUND;
+    }
+    compat_common::record_raw("gamecore-host", "PackageV7", &format!("slot {slot} mount step for caller '{c}': the package is already mounted read-only"));
+    S_OK
+}
+
+unsafe extern "system" fn v7_20(_this: *mut c_void, target: *const u16, caller: *const u16) -> i32 {
+    v7_mount_step(20, target, caller)
+}
+
+unsafe extern "system" fn v7_21(_this: *mut c_void, target: *const u16, caller: *const u16) -> i32 {
+    v7_mount_step(21, target, caller)
+}
+
+unsafe extern "system" fn v7_31(_this: *mut c_void, target: *const u16, caller: *const u16) -> i32 {
+    v7_mount_step(31, target, caller)
+}
+
+unsafe extern "system" fn v7_30(_this: *mut c_void, target: *const u16, _caller: *const u16, out: *mut i32) -> i32 {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    *out = 0;
+    if !package_known(wide_text(target)) {
+        return compat_common::gdk::E_NOT_FOUND;
+    }
+    S_OK
+}
+
+#[repr(C)]
+struct ChunkOp {
+    vt: *const *const (),
+    refs: AtomicU32,
+    ids: std::sync::Mutex<std::collections::VecDeque<u32>>,
+}
+
+static CHUNK_OP_VT: Vt<7> = Vt([chunk_op_qi as *const (), chunk_op_add_ref as *const (), chunk_op_release as *const (), chunk_op_next as *const (), chunk_op_4 as *const (), chunk_op_5 as *const (), chunk_op_6 as *const ()]);
+
+unsafe extern "system" fn chunk_op_qi(this: *mut c_void, iid: *const Guid, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    *out = core::ptr::null_mut();
+    if iid.is_null() {
+        return E_INVALIDARG;
+    }
+    if *iid == IID_IUNKNOWN || *iid == IID_IAGILE_OBJECT {
+        chunk_op_add_ref(this);
+        *out = this;
+        return S_OK;
+    }
+    E_NOINTERFACE
+}
+
+unsafe extern "system" fn chunk_op_add_ref(this: *mut c_void) -> u32 {
+    (*(this as *const ChunkOp)).refs.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+unsafe extern "system" fn chunk_op_release(this: *mut c_void) -> u32 {
+    let r = (*(this as *const ChunkOp)).refs.fetch_sub(1, Ordering::SeqCst) - 1;
+    if r == 0 {
+        drop(Box::from_raw(this as *mut ChunkOp));
+    }
+    r
+}
+
+unsafe extern "system" fn chunk_op_next(this: *mut c_void, cap: u32, ids: *mut u32, n: *mut u32) -> i32 {
+    if n.is_null() || (ids.is_null() && cap != 0) {
+        return E_POINTER;
+    }
+    let mut q = (*(this as *const ChunkOp)).ids.lock().unwrap_or_else(|e| e.into_inner());
+    let k = (cap as usize).min(q.len());
+    for i in 0..k {
+        *ids.add(i) = q.pop_front().unwrap_or_default();
+    }
+    *n = k as u32;
+    S_OK
+}
+
+unsafe extern "system" fn chunk_op_4(_this: *mut c_void) -> i32 {
+    compat_common::record_raw("gamecore-host", "PackageV7.ChunkOp", "slot 4 has no caller in the console client; E_NOTIMPL");
+    E_NOTIMPL
+}
+
+unsafe extern "system" fn chunk_op_5(_this: *mut c_void) -> i32 {
+    compat_common::record_raw("gamecore-host", "PackageV7.ChunkOp", "slot 5 has no caller in the console client; E_NOTIMPL");
+    E_NOTIMPL
+}
+
+unsafe extern "system" fn chunk_op_6(_this: *mut c_void) -> i32 {
+    compat_common::record_raw("gamecore-host", "PackageV7.ChunkOp", "slot 6 has no caller in the console client; E_NOTIMPL");
+    E_NOTIMPL
+}
+
+unsafe extern "system" fn v7_22(_this: *mut c_void, pkg: *const u16, sel: *const Selector, n_sel: u32, ids: *const u32, n_ids: u32, _flag: i32, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    *out = core::ptr::null_mut();
+    if !package_known(wide_text(pkg)) {
+        return compat_common::gdk::E_NOT_FOUND;
+    }
+    let s = selectors(sel, n_sel);
+    let want = if ids.is_null() { Vec::new() } else { core::slice::from_raw_parts(ids, n_ids as usize).to_vec() };
+    let chunks = selected_chunks(&s, &want);
+    compat_common::record_raw("gamecore-host", "PackageV7", &format!("slot 22 chunk operation over {} selectors -> chunks {chunks:?}", s.len()));
+    let op = Box::new(ChunkOp { vt: CHUNK_OP_VT.0.as_ptr(), refs: AtomicU32::new(1), ids: std::sync::Mutex::new(chunks.into()) });
+    *out = Box::into_raw(op) as *mut c_void;
+    S_OK
+}
+
+unsafe extern "system" fn v7_23(_this: *mut c_void, _pkg: *const u16, phase: i32, cursor: u64, next: *mut u64, n: *mut u32, arr: *mut *mut c_void) -> i32 {
+    if next.is_null() || n.is_null() || arr.is_null() {
+        return E_POINTER;
+    }
+    *n = 0;
+    *arr = core::ptr::null_mut();
+    *next = cursor.max(1);
+    compat_common::record_raw("gamecore-host", "PackageV7", &format!("slot 23 install snapshot phase {phase} cursor {cursor}: no package was installed in between"));
+    S_OK
+}
+
 static PACKAGE_V7_VT: Vt<PACKAGE_V7_SLOTS> = Vt([
     qi as *const (), add_ref as *const (), release as *const (),
-    v7_3 as *const (), v7_4 as *const (), v7_5 as *const (), v7_6 as *const (), v7_7 as *const (), v7_path as *const (), v7_9 as *const (), v7_10 as *const (),
-    v7_estimate as *const (), v7_12 as *const (), v7_13 as *const (), v7_14 as *const (), v7_locale as *const (), v7_16 as *const (), v7_17 as *const (), v7_18 as *const (),
+    v7_3 as *const (), v7_4 as *const (), v7_5 as *const (), v7_enumerate as *const (), v7_7 as *const (), v7_path as *const (), v7_9 as *const (), v7_10 as *const (),
+    v7_estimate as *const (), v7_details as *const (), v7_13 as *const (), v7_14 as *const (), v7_locale as *const (), v7_16 as *const (), v7_17 as *const (), v7_18 as *const (),
     v7_19 as *const (), v7_20 as *const (), v7_21 as *const (), v7_22 as *const (), v7_23 as *const (), v7_24 as *const (), v7_25 as *const (),
     v7_features as *const (), v7_uninstall as *const (), v7_enumerate as *const (), v7_details as *const (), v7_30 as *const (), v7_31 as *const (),
 ]);

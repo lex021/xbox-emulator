@@ -345,6 +345,16 @@ pub fn find_first(path: &str, data: &mut Win32FindDataW) -> isize {
     }
 }
 
+pub fn find_first_search(pattern: &str, data: &mut Win32FindDataW) -> isize {
+    match crate::paths::host_search_path(pattern) {
+        Ok(h) => unsafe { FindFirstFileExW(h.wide.as_ptr(), 1, data, 0, core::ptr::null_mut(), 0) },
+        Err(e) => {
+            unsafe { SetLastError(e) };
+            INVALID_HANDLE_VALUE
+        }
+    }
+}
+
 pub fn find_close(h: isize) {
     unsafe { FindClose(h) };
 }

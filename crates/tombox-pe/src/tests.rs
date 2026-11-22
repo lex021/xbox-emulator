@@ -265,3 +265,74 @@ fn rva_mapping_rejects_virtual_only_section_bytes() {
         assert_eq!(pe.rva_to_offset(rva), Err(ParseError::UnmappableRva { rva }));
     }
 }
+
+fn pe_with_export_dir(
+    number_of_functions: u32,
+    number_of_names: u32,
+    address_of_functions: u32,
+    address_of_names: u32,
+    address_of_name_ordinals: u32,
+) -> Vec<u8> {
+    fn u16_at(b: &mut [u8], o: usize, v: u16) {
+        b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    fn u32_at(b: &mut [u8], o: usize, v: u32) {
+        b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    let mut bytes = vec![0u8; 0x200];
+    u16_at(&mut bytes, 0, 0x5a4d); // MZ
+    u32_at(&mut bytes, 0x3c, 0x80); // e_lfanew
+    u32_at(&mut bytes, 0x80, 0x4550); // PE\0\0
+    u16_at(&mut bytes, 0x84, constants::IMAGE_FILE_MACHINE_AMD64);
+    u16_at(&mut bytes, 0x86, 1); // NumberOfSections
+    u16_at(&mut bytes, 0x94, 0xf0); // SizeOfOptionalHeader
+    u16_at(&mut bytes, 0x98, 0x20b); // PE32+
+    u32_at(&mut bytes, 0x98 + 32, 0x1000); // SectionAlignment
+    u32_at(&mut bytes, 0x98 + 36, 0x200); // FileAlignment
+    u32_at(&mut bytes, 0x98 + 56, 0x2000); // SizeOfImage
+    u32_at(&mut bytes, 0x98 + 60, 0x200); // SizeOfHeaders
+    u32_at(&mut bytes, 0x98 + 108, 16); // NumberOfRvaAndSizes
+
+    let section = 0x188;
+    bytes[section..section + 5].copy_from_slice(b".test");
+    u32_at(&mut bytes, section + 8, 0x10); // VirtualSize
+    u32_at(&mut bytes, section + 12, 0x1000); // VirtualAddress
+    u32_at(&mut bytes, section + 16, 0x10); // SizeOfRawData
+    u32_at(&mut bytes, section + 20, 0x1f0); // PointerToRawData
+
+    let export_rva = 0x1b0u32;
+    u32_at(&mut bytes, 0x108, export_rva); // DataDir[0].VirtualAddress
+    u32_at(&mut bytes, 0x10c, 40); // DataDir[0].Size
+
+    let e = export_rva as usize;
+    u32_at(&mut bytes, e + 12, 0); // Name RVA
+    u32_at(&mut bytes, e + 16, 1); // Base
+    u32_at(&mut bytes, e + 20, number_of_functions);
+    u32_at(&mut bytes, e + 24, number_of_names);
+    u32_at(&mut bytes, e + 28, address_of_functions);
+    u32_at(&mut bytes, e + 32, address_of_names);
+    u32_at(&mut bytes, e + 36, address_of_name_ordinals);
+    bytes
+}
+
+#[test]
+fn export_address_of_functions_near_u32_max_does_not_panic() {
+    let bytes = pe_with_export_dir(2, 0, 0xffff_ffff, 0, 0);
+    let pe = PeFile::parse(&bytes).expect("malformed export table stays inspectable");
+    let exp = pe.exports.as_ref().expect("export directory recognised");
+    assert_eq!(exp.number_of_functions, 2);
+    assert!(exp.unnamed_ordinals.is_empty());
+}
+
+#[test]
+fn export_named_func_rva_near_u32_max_does_not_panic() {
+    let names_rva = 0x1a0u32;
+    let ords_rva = 0x1a8u32;
+    let mut bytes = pe_with_export_dir(2, 1, 0xffff_ffff, names_rva, ords_rva);
+    bytes[names_rva as usize..names_rva as usize + 4].copy_from_slice(&0u32.to_le_bytes());
+    bytes[ords_rva as usize..ords_rva as usize + 2].copy_from_slice(&0xffffu16.to_le_bytes());
+    let pe = PeFile::parse(&bytes).expect("malformed export table stays inspectable");
+    let exp = pe.exports.as_ref().expect("export directory recognised");
+    assert_eq!(exp.named.len(), 1);
+}

@@ -610,6 +610,6 @@ fn export_table_matches_console_dll() {
     let e4 = ex.iter().find(|e| e.ordinal == 4).unwrap();
     assert!(xtfcommon::exports::source_defines(concat!(env!("CARGO_MANIFEST_DIR"), "/src"), e4));
     let e5 = ex.iter().find(|e| e.ordinal == 5).unwrap();
-    assert_eq!((e5.name.as_str(), e5.status.as_str()), ("XtfCreateFileIOClient", "missing"));
-    assert!(!xtfcommon::exports::source_defines(concat!(env!("CARGO_MANIFEST_DIR"), "/src"), e5));
+    assert_eq!((e5.name.as_str(), e5.status.as_str()), ("XtfCreateFileIOClient", "implemented"));
+    assert!(xtfcommon::exports::source_defines(concat!(env!("CARGO_MANIFEST_DIR"), "/src"), e5));
 }

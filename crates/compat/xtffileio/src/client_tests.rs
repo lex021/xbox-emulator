@@ -86,7 +86,7 @@ pub(crate) fn open_client(port: u32, address: &str) -> Result<Client, HRESULT> {
     TEST_PORT.with(|p| p.set(port));
     let w = wide(address);
     let mut out = null_mut();
-    let hr = unsafe { create_client(w.as_ptr(), &IID_XTF_FILEIO_CLIENT, &mut out) };
+    let hr = unsafe { crate::XtfCreateFileIOClient(w.as_ptr(), &IID_XTF_FILEIO_CLIENT, &mut out) };
     TEST_PORT.with(|p| p.set(0));
     if hr < 0 {
         assert!(out.is_null());

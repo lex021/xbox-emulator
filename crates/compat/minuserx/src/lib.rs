@@ -451,11 +451,54 @@ fn wide_slice(p: *const u16) -> Option<Vec<u16>> {
     Some(v)
 }
 
+pub fn headless() -> bool {
+    static H: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *H.get_or_init(|| matches!(std::env::var("TOMBOX_HEADLESS").ok().as_deref().map(str::trim), Some("1") | Some("on") | Some("true") | Some("yes")))
+}
+
+const WS_VISIBLE: u32 = 0x1000_0000;
+const WS_CHILD: u32 = 0x4000_0000;
+const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+const WS_EX_APPWINDOW: u32 = 0x0004_0000;
+const SW_SHOWNA: i32 = 8;
+const DWMWA_CLOAK: u32 = 13;
+
+#[link(name = "dwmapi")]
+extern "system" {
+    fn DwmSetWindowAttribute(h: *mut c_void, attr: u32, v: *const c_void, n: u32) -> i32;
+}
+
+pub fn headless_applies(style: u32, parent_is_null: bool) -> bool {
+    parent_is_null && style & WS_CHILD == 0
+}
+
+pub fn headless_styles(style: u32, ex: u32) -> (u32, u32, bool) {
+    (style & !WS_VISIBLE, (ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) & !WS_EX_APPWINDOW, style & WS_VISIBLE != 0)
+}
+
+pub fn headless_show_cmd(cmd: i32) -> i32 {
+    match cmd {
+        1 | 9 | 10 => 4,
+        3 | 5 => 8,
+        2 | 6 | 11 => 7,
+        c => c,
+    }
+}
+
 unsafe fn create_window_w(ex: u32, cls: *const u16, name: Option<Vec<u16>>, style: u32, x: i32, y: i32, w: i32, h: i32, parent: *mut c_void, menu: *mut c_void, inst: *mut c_void, p: *mut c_void) -> *mut c_void {
     let test = test_run() && parent.is_null();
     let title = window_title(name.as_deref(), test);
     let ex = if test { ex | WS_EX_NOACTIVATE } else { ex };
+    let hl = headless() && headless_applies(style, parent.is_null());
+    let (style, ex, show_after) = if hl { headless_styles(style, ex) } else { (style, ex, false) };
     let hwnd = CreateWindowExW(ex, cls, title.as_ref().map(|t| t.as_ptr()).unwrap_or(core::ptr::null()), style, x, y, w, h, parent, menu, inst, p);
+    if hl && !hwnd.is_null() {
+        let on: i32 = 1;
+        DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &on as *const i32 as *const c_void, 4);
+        if show_after {
+            ShowWindow(hwnd, SW_SHOWNA);
+        }
+    }
     if test && !hwnd.is_null() {
         let mut plain = name.unwrap_or_default();
         if plain.last() != Some(&0) {
@@ -469,6 +512,9 @@ unsafe fn create_window_w(ex: u32, cls: *const u16, name: Option<Vec<u16>>, styl
 static TEST_WINDOWS: std::sync::Mutex<Vec<(usize, Vec<u16>)>> = std::sync::Mutex::new(Vec::new());
 
 fn restore_test_windows() {
+    if headless() {
+        return;
+    }
     let wins: Vec<(usize, Vec<u16>)> = core::mem::take(&mut *TEST_WINDOWS.lock().unwrap_or_else(|e| e.into_inner()));
     for (h, title) in wins {
         let h = h as *mut c_void;
@@ -531,5 +577,8 @@ pub fn show_cmd(cmd: i32, test: bool) -> i32 {
 
 #[no_mangle]
 pub unsafe extern "system" fn mux_ShowWindow(h: *mut c_void, cmd: i32) -> i32 {
+    if headless() {
+        return ShowWindow(h, headless_show_cmd(cmd));
+    }
     ShowWindow(h, show_cmd(cmd, test_run() && !crate::queue::taken_over()))
 }

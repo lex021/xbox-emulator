@@ -1543,7 +1543,7 @@ pub(crate) unsafe fn reapply(list: *mut c_void) {
                 },
             }
         }
-        if let Some(p) = s.pso { w_pso(list, p as *mut c_void); }
+        if let Some(p) = s.pso { w_pso(list, p as *mut c_void); crate::dred_marks::remark(list, p as *mut c_void); }
         if let Some(t) = s.topology { w_topology(list, t); }
         if let Some(v) = &s.viewports { w_viewports(list, (v.len() / 24) as u32, v.as_ptr()); }
         if let Some(v) = &s.scissors { w_scissors(list, (v.len() / 16) as u32, v.as_ptr()); }
@@ -1750,6 +1750,7 @@ pub(crate) unsafe fn reopen(list: *mut c_void) -> bool {
         record("d3d12_xs", "cl2_state", &format!("list split {list:p}: PC Reset FAILED hr={hr:#010x}"));
         return false;
     }
+    crate::dred_marks::begin_recording(list as usize);
     with(list, |s| s.open = true);
     unsafe { reapply(list) };
     true

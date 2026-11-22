@@ -37,6 +37,7 @@ pub mod live;
 pub mod title_os;
 pub mod kmd_bridge;
 pub mod private_heap;
+pub mod headless;
 
 #[global_allocator]
 static TB_ALLOC: private_heap::PrivateHeap = private_heap::PrivateHeap;

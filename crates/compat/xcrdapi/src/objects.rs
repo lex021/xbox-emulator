@@ -1,5 +1,5 @@
 use crate::abi::*;
-use crate::request::{execute, validate, Source, XRequest};
+use crate::request::{execute_with_intermediate, validate, Source, XRequest};
 use crate::{log, log_fatal};
 use core::ffi::c_void;
 use std::fs::File;
@@ -795,13 +795,13 @@ impl QueueInner {
                 return E_DSTORAGE_ACCESS_VIOLATION;
             }
             let src = unsafe { core::slice::from_raw_parts(req.source as *const u8, req.source_size as usize) };
-            execute(req.compression(), Source::Memory(src), req.source_size, dst)
+            execute_with_intermediate(req.compression(), req.field34, Source::Memory(src), req.source_size, dst)
         } else {
             let handle = match file.and_then(|f| f.handle()) {
                 Some(h) => h,
                 None => return E_DSTORAGE_INVALID_FILE_HANDLE,
             };
-            execute(req.compression(), Source::File(&handle, req.source_offset), req.source_size, dst)
+            execute_with_intermediate(req.compression(), req.field34, Source::File(&handle, req.source_offset), req.source_size, dst)
         };
         match result {
             Ok(o) => {

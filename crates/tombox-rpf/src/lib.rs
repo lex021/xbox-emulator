@@ -136,8 +136,6 @@ pub fn inspect(b: &[u8]) -> Result<Rpf, String> {
     inspect_prefix(b, b.len() as u64)
 }
 
-/// Inspect a leading slice of an archive with a known total size.
-/// Only complete plain RPF8 entries within the slice are returned.
 pub fn inspect_prefix(b: &[u8], file_size: u64) -> Result<Rpf, String> {
     if b.len() as u64 > file_size {
         return Err("inspected bytes exceed the archive size".into());
@@ -292,6 +290,19 @@ mod tests {
         let r = inspect(&rpf8(272)).unwrap();
         assert_eq!(r.version, 8);
         assert!(matches!(r.header, Header::V8 { ref entries, .. } if entries.is_empty()));
+    }
+
+    #[test]
+    fn rpf8_prefix_skips_partial_entries_but_rejects_truncated_files() {
+        let mut prefix = vec![0u8; 272 + 24 + 8];
+        prefix[..4].copy_from_slice(b"8FPR");
+        prefix[4..8].copy_from_slice(&2u32.to_le_bytes());
+        prefix[12..14].copy_from_slice(&0xffu16.to_le_bytes());
+        let file_size = 272 + 2 * 24;
+        let rpf = inspect_prefix(&prefix, file_size).unwrap();
+        assert!(matches!(rpf.header, Header::V8 { entry_count: 2, ref entries, .. } if entries.len() == 1));
+        assert!(inspect_prefix(&prefix, file_size - 1).unwrap_err().contains("truncated"));
+        assert!(inspect(&prefix).unwrap_err().contains("truncated"));
     }
 
     #[test]

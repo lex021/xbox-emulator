@@ -1,6 +1,7 @@
 pub mod abi;
 pub mod objects;
 pub mod request;
+pub mod bcpack;
 pub mod stats;
 pub mod access_cache;
 pub mod pool;

@@ -385,7 +385,7 @@ pub unsafe fn dump(list: usize, compute: bool, name: &dyn Fn(usize) -> String) -
                 }
                 match s.descs.get(&(heap.cpu + (first + slot) * heap.inc)) {
                     Some(e) if s.frame.wrapping_sub(e.frame) <= 1 => items.push(Item { param, slot, d: Some(e.d.clone()), age: 0 }),
-                    Some(e) => items.push(Item { param, slot, d: None, age: s.frame.wrapping_sub(e.frame) }),
+                    Some(e) => items.push(Item { param, slot, d: Some(e.d.clone()), age: s.frame.wrapping_sub(e.frame) }),
                     None => {
                         let found = unsafe { desc_bytes(heap.cpu + (first + slot) * heap.inc, heap.inc) }.and_then(|b| s.by_bytes.get(&b).cloned());
                         match found {
@@ -451,7 +451,8 @@ pub unsafe fn dump(list: usize, compute: bool, name: &dyn Fn(usize) -> String) -
                         None => name(res),
                     }
                 };
-                out.push_str(&format!("    param[{}]+{} {kind} {what} | {view}\n", it.param, it.slot));
+                let aged = if it.age > 1 { format!(" (written {} frames ago)", it.age) } else { String::new() };
+                out.push_str(&format!("    param[{}]+{} {kind} {what} | {view}{aged}\n", it.param, it.slot));
             }
             Desc::Sampler { desc } => {
                 let u = |o: usize| u32::from_le_bytes(desc[o..o + 4].try_into().unwrap());
