@@ -225,6 +225,17 @@ impl Timer {
         }
     }
 
+    pub fn mark_plus(&mut self, name: &'static str, extra: f64) {
+        self.mark(name);
+        if let Some(e) = self.table.iter_mut().find(|e| e.0.eq_ignore_ascii_case(name)) {
+            e.1 += extra;
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<f64> {
+        self.table.iter().find(|e| e.0.eq_ignore_ascii_case(name)).map(|e| e.1)
+    }
+
     pub fn names(&self) -> Vec<&'static str> {
         self.table.iter().map(|e| e.0).collect()
     }
@@ -242,6 +253,26 @@ impl Timer {
         }
         hr
     }
+}
+
+pub trait Channel {
+    unsafe fn send(&mut self, msg: *mut c_void) -> HRESULT;
+    unsafe fn receive_more(&mut self, timeout: u32) -> Result<Com, HRESULT>;
+}
+
+impl Channel for Session {
+    unsafe fn send(&mut self, msg: *mut c_void) -> HRESULT {
+        self.send_more(msg)
+    }
+    unsafe fn receive_more(&mut self, timeout: u32) -> Result<Com, HRESULT> {
+        Session::receive_more(self, timeout)
+    }
+}
+
+pub trait CopyNotify {
+    unsafe fn start(&mut self, root: &str, pattern: &str, name: &str, info: &crate::file::FileInfo, dest: &str) -> HRESULT;
+    unsafe fn progress(&mut self, src: &str, dst: &str, size: u64, done: u64) -> HRESULT;
+    unsafe fn end(&mut self, root: &str, pattern: &str, name: &str, info: &crate::file::FileInfo, dest: &str, hr: HRESULT) -> HRESULT;
 }
 
 static ERROR_TOKENS: Mutex<VecDeque<(u64, HRESULT)>> = Mutex::new(VecDeque::new());
@@ -305,7 +336,7 @@ unsafe fn to_console(session: usize, request: *mut c_void, response: *mut c_void
             get_u64(body.0, "LastErrorToken", &mut token);
             let mut flags = 0u32;
             get_low_flags(body.0, &mut flags);
-            hr = xfer::messages_to_files(Session(session as *mut c_void), request, flags, &mut timer, &mut count, no_json);
+            hr = xfer::messages_to_files(&mut Session(session as *mut c_void), request, flags, &mut timer, &mut count, no_json, None);
             if hr < 0 {
                 add_error_token(token, hr);
             }
@@ -382,7 +413,8 @@ unsafe fn from_console(session: usize, request: *mut c_void, response: *mut c_vo
         timer.mark("ReadFileScan");
         let dst = bstr_units(&req.dst);
         let mut count = 0u32;
-        let hr_xfer = xfer::files_to_messages(Session(session as *mut c_void), &found.root, &found.files, &dst, req.dst_is_directory, req.flags, &mut timer, &mut count, no_json);
+        let out = xfer::Outgoing { flags: req.flags, no_json, token: 0, root: "", pattern: "" };
+        let hr_xfer = xfer::files_to_messages(&mut Session(session as *mut c_void), &found.root, &found.files, &dst, req.dst_is_directory, &out, &mut timer, &mut count, None);
         if found.hr < 0 {
             break 'reply found.hr;
         }

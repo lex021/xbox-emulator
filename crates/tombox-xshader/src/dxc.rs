@@ -152,11 +152,42 @@ pub fn compile_fma(hlsl: &str, profile: &str, fma: crate::shader_cache::Fma, ext
     if minor < 2 {
         return compile_bf(hlsl, bf.as_deref(), profile, &[], &with(true));
     }
+    let early = (profile.starts_with("cs_") && cs_parallel_enabled() && may_need_denorm_any(hlsl)).then(|| {
+        let (h, b, p) = (hlsl.to_string(), bf.clone(), profile.to_string());
+        let args: Vec<String> = with(true).into_iter().map(String::from).collect();
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                compile_bf(&h, b.as_deref(), &p, &["-denorm", "any"], &a)
+            })
+            .ok()
+    }).flatten();
     let code = compile_bf(hlsl, bf.as_deref(), profile, &["-denorm", "preserve"], &with(false))?;
     if profile.starts_with("cs_") && disassemble(&code).map(|t| has_preserve_unselectable(&t)).unwrap_or(false) {
+        if let Some(r) = early.and_then(|t| t.join().ok()) {
+            return r;
+        }
         return compile_bf(hlsl, bf.as_deref(), profile, &["-denorm", "any"], &with(true));
     }
     Ok(code)
+}
+
+pub fn cs_parallel_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TOMBOX_DXC_CS_PARALLEL").map(|v| v != "0").unwrap_or(true))
+}
+
+pub fn may_need_denorm_any(hlsl: &str) -> bool {
+    let r = crate::shader_cache::reduced(hlsl);
+    let b = r.as_bytes();
+    ["log", "log2", "log10", "sqrt", "pow", "length", "distance", "refract"].iter().any(|n| {
+        r.match_indices(n).any(|(i, _)| {
+            let before = i.checked_sub(1).map(|k| b[k]).unwrap_or(b' ');
+            let after = &r[i + n.len()..];
+            !(before.is_ascii_alphanumeric() || before == b'_' || before == b'.') && after.trim_start().starts_with('(')
+        })
+    })
 }
 
 pub fn branch_free_enabled() -> bool {
@@ -366,6 +397,42 @@ mod tests {
             let (preserve, text) = denorm_of(&cs(body), "cs_6_2");
             assert!(has_preserve_unselectable(&text), "{body}: expected a Log/Sqrt op");
             assert!(!preserve, "{body}: compute shader with Log/Sqrt still compiled with fp32 denorm preserve");
+        }
+    }
+
+    #[test]
+    fn denorm_any_prediction_follows_reachable_intrinsics() {
+        assert!(may_need_denorm_any(&cs("log2(x)")));
+        assert!(may_need_denorm_any(&cs("length(float2(x, y))")));
+        assert!(!may_need_denorm_any(&cs("exp2(x) * rsqrt(y)")));
+        assert!(!may_need_denorm_any(&cs("tb_log_x + x.length")));
+    }
+
+    #[test]
+    fn parallel_compute_compile_matches_the_sequential_flow_byte_for_byte() {
+        let fma = crate::shader_cache::Fma { preserve: true, any: false, hybrid: false, f2h: false };
+        for body in ["log2(x)", "sqrt(x) + y", "pow(x, y)", "length(float2(x, y))", "exp2(x) * rsqrt(y)"] {
+            let src = cs(body);
+            let par = compile_fma(&src, "cs_6_2", fma, &[]).expect("parallel flow");
+            let pre = compile_args(&src, "cs_6_2", &["-denorm", "preserve"], &fma_defines(fma, false)).expect("preserve");
+            let seq = if disassemble(&pre).map(|t| has_preserve_unselectable(&t)).unwrap_or(false) {
+                compile_args(&src, "cs_6_2", &["-denorm", "any"], &fma_defines(fma, true)).expect("any")
+            } else {
+                pre
+            };
+            let bf = branch_free_source(&src);
+            let seq_bf = match &bf {
+                Some(b) => {
+                    let pre = compile_args(b, "cs_6_2", &["-denorm", "preserve"], &fma_defines(fma, false)).expect("preserve bf");
+                    if disassemble(&pre).map(|t| has_preserve_unselectable(&t)).unwrap_or(false) {
+                        compile_args(b, "cs_6_2", &["-denorm", "any"], &fma_defines(fma, true)).expect("any bf")
+                    } else {
+                        pre
+                    }
+                }
+                None => seq,
+            };
+            assert!(par == seq_bf, "{body}: parallel compute compile differs from the sequential flow");
         }
     }
 

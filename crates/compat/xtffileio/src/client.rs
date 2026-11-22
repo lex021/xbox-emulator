@@ -754,7 +754,7 @@ pub struct Client2Vtbl {
     pub query_interface: unsafe extern "system" fn(P, *const GUID, *mut P) -> HRESULT,
     pub add_ref: unsafe extern "system" fn(P) -> u32,
     pub release: unsafe extern "system" fn(P) -> u32,
-    pub copy_files: unsafe extern "system" fn(P, W, u32, u32, u32, W, u32, P) -> HRESULT,
+    pub copy_files: unsafe extern "system" fn(P, W, *const W, u32, W, u32, P) -> HRESULT,
 }
 
 #[repr(C)]
@@ -865,6 +865,12 @@ impl FileIOClient {
 
     pub fn port(&self) -> u32 {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).port
+    }
+
+    pub fn connection(&self) -> (Bstr, u32, u32) {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let addr = Bstr::from_str(&st.address.to_string()).unwrap_or_else(|_| Bstr::null());
+        (addr, st.port, self.redirect)
     }
 
     pub fn session_a(&self) -> Com {

@@ -549,7 +549,7 @@ pub fn compute(d: &Desc) -> Option<Layout> {
 }
 
 pub fn is_depth_stencil_planar(dxgi: u32) -> bool {
-    ROWS.get(dxgi as usize).is_some_and(|r| r[4] == 1 && r[6] != 0)
+    ROWS.get(dxgi as usize).is_some_and(|r| r[4] == 1 && r[5] != 0 && r[6] != 0)
 }
 
 pub fn compute_depth_msaa(d: &Desc) -> Option<Layout> {

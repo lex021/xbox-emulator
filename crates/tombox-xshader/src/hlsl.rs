@@ -5952,6 +5952,9 @@ impl<'a> Emitter<'a> {
                 .collect();
             if target == 13 && !misc.is_empty() {
                 for (ei, c) in misc {
+                    if self.durango.is_none() && osig.iter().any(|e| e.sysval == 5) {
+                        return Err("position export 13 (misc vector) writes SV_ViewportArrayIndex, which RDNA2 packs into layer bits 19:16; not lowered".into());
+                    }
                     if (en >> if c == "z" { 2 } else { 3 }) & 1 == 0 {
                         return Err(format!("position export 13 (misc vector) leaves the {c} lane of {} disabled", osig[ei].name));
                     }
@@ -6219,10 +6222,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             return Ok(h);
         }
         let _ = writeln!(h, "struct SIn {{");
-        // HLSL requires system-generated inputs (SV_IsFrontFace, SV_SampleIndex,
-        // SV_PrimitiveID, ...) to follow all ordinary parameters, so emit them last.
-        // Field names stay tied to the signature element index.
-        let sysgen = |e: &SigElement| is_ps && !matches!(e.sysval, 0 | 1);
+        let sysgen = |e: &SigElement| is_ps && !matches!(e.sysval, 0..=5);
         let pos_field = match ex.input_sig.iter().position(|e| e.sysval == 1) {
             Some(ei) => format!("i.i{ei}"),
             None => "i.tb_pos".to_string(),

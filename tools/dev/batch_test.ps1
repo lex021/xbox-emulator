@@ -1,4 +1,4 @@
-param(
+﻿param(
   [switch]$DryRun,
   [switch]$SkipBuild,
   [ValidateSet('release', 'dev-fast')][string]$Profile = 'release',
@@ -11,6 +11,7 @@ param(
   [int]$TerrariaSeconds = 600,
   [int]$MinecraftSeconds = 600,
   [int]$CaptureEvery = 60,
+  [int]$IdleSeconds = 120,
   [string]$PadScript = '',
   [string]$MinecraftGameArgs = '',
   [string]$CompatDir = 'D:\TomBox\tools\dev\compat',
@@ -264,6 +265,16 @@ public static class TbAudio {
 }
 '@ }
 
+if (-not ('TbIdle' -as [type])) { Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class TbIdle {
+  [StructLayout(LayoutKind.Sequential)] struct LII { public uint cbSize; public uint dwTime; }
+  [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LII p);
+  [DllImport("kernel32.dll")] static extern ulong GetTickCount64();
+  public static double Seconds() { LII l = new LII(); l.cbSize = 8; if (!GetLastInputInfo(ref l)) return -1; return ((uint)GetTickCount64() - l.dwTime) / 1000.0; }
+}
+'@ }
 if (-not ('TbFrame' -as [type])) { Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -425,6 +436,7 @@ function Set-BatchEnv {
   $env:TOMBOX_NET_REDIRECT = '127.0.0.1'
   $env:TOMBOX_NET_BACKEND = 'builtin'
   $env:TOMBOX_HOST_PAD = '0'
+  $env:TOMBOX_TEST_RUN = '1'
   $env:TOMBOX_HOST_KBM = '0'
   $env:TOMBOX_PRELAUNCH_UI = '0'
   $env:TOMBOX_FN_GAMESERVER = '127.0.0.1:7777'
@@ -536,6 +548,24 @@ foreach ($t in $Titles) {
   }
 
   foreach ($f in Get-SourceFiles $t.LogDir) { if ($f.Src -ne 'launcher') { Remove-Item -LiteralPath $f.Path -Force -ErrorAction SilentlyContinue } }
+  $userPlaying = 'D:\TomBox\tools\dev\batch_runs\USER_PLAYING'
+  $titleProcs = '^(Terraria|GbxGame|XDefiant|Minecraft|FortniteClient|Rogue_scarlett)'
+  $userWaitSaid = $false
+  $idleWaitSaid = $false
+  while ($true) {
+    if (Test-Path -LiteralPath $userPlaying) {
+      $txt = try { Get-Content -LiteralPath $userPlaying -Raw -ErrorAction Stop } catch { '' }
+      $pids = @([regex]::Matches([string]$txt, '(?:script|game)_pid=(\d+)') | ForEach-Object { [int]$_.Groups[1].Value } | Where-Object { $_ -gt 0 })
+      $alive = @($pids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+      if (-not $alive.Count) { Remove-Item -LiteralPath $userPlaying -Force -ErrorAction SilentlyContinue; Say "  removed stale USER_PLAYING (no live pid among: $($pids -join ','))" 'DarkGray' }
+    }
+    $idle = [TbIdle]::Seconds()
+    $busy = (Test-Path -LiteralPath $userPlaying) -or (Get-Process | Where-Object { $_.Name -match $titleProcs })
+    if (-not $busy -and ($idle -lt 0 -or $idle -ge $IdleSeconds)) { break }
+    if (-not $busy -and -not $idleWaitSaid) { Say ("  waiting: the user touched keyboard/mouse/pad {0:N0}s ago; the test starts after {1}s with no input" -f $idle, $IdleSeconds) 'Yellow'; $idleWaitSaid = $true }
+    if ($busy -and -not $userWaitSaid) { Say '  waiting: the user is playing (USER_PLAYING exists or a title is running); the test starts when they stop' 'Yellow'; $userWaitSaid = $true }
+    Start-Sleep -Seconds 10
+  }
   $lock = 'D:\TomBox\tools\dev\batch_runs\GAME_LOCK'
   $lockWait = (Get-Date).AddMinutes(30)
   while ($true) {
@@ -569,6 +599,11 @@ foreach ($t in $Titles) {
   $padLines = New-Object System.Collections.Generic.List[string]
   $padRx = @($padQueue | Where-Object { $_.Rx }).Count -gt 0
   $launcher = Join-Path $dir 'launcher.txt'
+  $takeFile = Join-Path $dir 'TAKEN_OVER'
+  Remove-Item -LiteralPath $takeFile -Force -ErrorAction SilentlyContinue
+  $env:TOMBOX_TAKEOVER_FILE = $takeFile
+  $env:TOMBOX_USER_PLAYING_FILE = $userPlaying
+  $takenOver = $false
   $start = Get-Date
   $ps = Start-Process -FilePath 'powershell.exe' -ArgumentList $la -RedirectStandardOutput $launcher -RedirectStandardError (Join-Path $dir 'launcher.err.txt') -WindowStyle Hidden -PassThru
   $streams = @(foreach ($f in Get-SourceFiles $t.LogDir) { if ($f.Src -ne 'launcher') { [pscustomobject]@{ Src = $f.Src; Path = $f.Path; Pos = 0L; Rest = '' } } })
@@ -590,6 +625,13 @@ foreach ($t in $Titles) {
     try { $mh = [TbAudio]::Sessions([uint32[]]$pids, $true, $null); if ($mh -gt 0 -and -not $muted) { $muted = $true; Say ("  +{0:N1}s audio session muted (original state saved)" -f $el) } } catch {}
     if ((Get-Date) -lt $nextLog) { $ps.Refresh(); if ($ps.HasExited) { break }; continue }
     $nextLog = (Get-Date).AddMilliseconds(500)
+    if (-not $takenOver -and (Test-Path -LiteralPath $takeFile)) {
+      $takenOver = $true
+      $why = try { (Get-Content -LiteralPath $takeFile -Raw -ErrorAction Stop).Trim() } catch { '' }
+      $padQueue.Clear(); $splashPresses = 99
+      $res.Notes.Add("taken over by user at +$([int]$el)s ($why): pad script stopped, host pad/keyboard/mouse unhidden, no time limit; the run is the user's play session")
+      Say ("  +{0:N0}s TAKEN OVER BY USER ({1}); pad script stopped, waiting for the user to close the game" -f $el, $why) 'Magenta'
+    }
     foreach ($s in $streams) {
       foreach ($l in Read-New $s) {
         foreach ($m in $MilestoneDefs[$t.Kind]) {
@@ -641,10 +683,10 @@ foreach ($t in $Titles) {
       Say ("  +{0:N0}s virtual pad: {1}" -f $el, $pc.Cmd) 'DarkGray'
       Invoke-FrameCapture $res ([uint32[]]$pids) $el ('_pre' + ($pc.Cmd -replace '[^a-z0-9]', ''))
     }
-    if ($el -ge $nextShot) { Invoke-FrameCapture $res ([uint32[]]$pids) $el ''; $nextShot = if ($nextShot -lt 45) { 45 } else { $nextShot + $CaptureEvery } }
+    if (-not $takenOver -and $el -ge $nextShot) { Invoke-FrameCapture $res ([uint32[]]$pids) $el ''; $nextShot = if ($nextShot -lt 45) { 45 } else { $nextShot + $CaptureEvery } }
     $ps.Refresh()
     if ($ps.HasExited) { break }
-    if ($el -ge $t.Seconds) { $timedOut = $true; Invoke-FrameCapture $res ([uint32[]]$pids) $el '_final'; break }
+    if (-not $takenOver -and $el -ge $t.Seconds) { $timedOut = $true; Invoke-FrameCapture $res ([uint32[]]$pids) $el '_final'; break }
   }
   $res.Elapsed = [Math]::Round(((Get-Date) - $start).TotalSeconds, 1)
   if ($timedOut) {
@@ -671,7 +713,7 @@ foreach ($t in $Titles) {
   $compat = Join-Path $dir 'tombox_compat.log'
   if (Test-Path $compat) { $res.Tail = @(Get-Content $compat -Tail 40) }
   $crashed = $res.Exit -and $res.Exit -notmatch '^0 '
-  $res.Status = if ($timedOut) { if ($crashed) { 'timeout (title exit code set)' } else { 'ran to timeout' } } elseif ($crashed) { "crashed (exit $($res.Exit))" } elseif ($res.Exit) { "exited (exit $($res.Exit))" } else { 'ended without an exit record' }
+  $res.Status = if ($takenOver) { 'taken over by user' } elseif ($timedOut) { if ($crashed) { 'timeout (title exit code set)' } else { 'ran to timeout' } } elseif ($crashed) { "crashed (exit $($res.Exit))" } elseif ($res.Exit) { "exited (exit $($res.Exit))" } else { 'ended without an exit record' }
   Say "  result: $($res.Status) after $($res.Elapsed)s" $(if ($crashed) { 'Red' } else { 'Cyan' })
   $results += [pscustomobject]$res
 }
@@ -681,6 +723,7 @@ try { if ([TbAudio]::HeldCount) { foreach ($m in [TbAudio]::Restore()) { Say "au
 
 . (Join-Path $PSScriptRoot 'compat_list.ps1')
 $BuildStamp = Get-BuildStamp $Root
+Remove-Item Env:TOMBOX_TAKEOVER_FILE, Env:TOMBOX_USER_PLAYING_FILE -ErrorAction SilentlyContinue
 if ($DryRun) { $CompatDir = Join-Path $RunRoot 'compat' }
 if ($true) {
   $entries = [ordered]@{}

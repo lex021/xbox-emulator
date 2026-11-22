@@ -59,10 +59,55 @@ unsafe fn hidden_reading(rd: *mut c_void) -> bool {
     if !hide_reading_kind(kind) {
         return false;
     }
+    if user_pressed(rd, kind) {
+        crate::host_input::take_over(&format!("host input reading kind={kind:#x} with a button pressed while the title window has focus"));
+        return false;
+    }
     if HIDDEN_DROPS.fetch_add(1, Ordering::Relaxed) == 0 {
         super::log("host input", &format!("first hidden host reading dropped (kind={kind:#x}; TOMBOX_HOST_PAD/TOMBOX_HOST_KBM)"));
     }
     true
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn GetForegroundWindow() -> *mut c_void;
+    fn GetWindowThreadProcessId(h: *mut c_void, pid: *mut u32) -> u32;
+}
+
+fn title_focused() -> bool {
+    let mut pid = 0u32;
+    let h = unsafe { GetForegroundWindow() };
+    !h.is_null() && unsafe { GetWindowThreadProcessId(h, &mut pid) } != 0 && pid == std::process::id()
+}
+
+unsafe fn user_pressed(rd: *mut c_void, kind: u32) -> bool {
+    if !crate::host_input::test_run() || crate::host_input::taken_over() || !title_focused() {
+        return false;
+    }
+    if kind & super::KIND_GAMEPAD != 0 {
+        let pad_f: unsafe extern "system" fn(*mut c_void, *mut u8) -> u32 = core::mem::transmute(vfn(rd, 22));
+        let mut st = [0u8; 28];
+        if pad_f(rd, st.as_mut_ptr()) == 0 {
+            return false;
+        }
+        let buttons = u32::from_le_bytes([st[0], st[1], st[2], st[3]]);
+        let trig = |o: usize| f32::from_le_bytes([st[o], st[o + 1], st[o + 2], st[o + 3]]);
+        return buttons != 0 || trig(4) > 0.5 || trig(8) > 0.5;
+    }
+    if kind & 0x10 != 0 {
+        let count_f: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(vfn(rd, 14));
+        return count_f(rd) != 0;
+    }
+    if kind & 0x20 != 0 {
+        let mouse_f: unsafe extern "system" fn(*mut c_void, *mut u8) -> u32 = core::mem::transmute(vfn(rd, 16));
+        let mut st = [0u8; 64];
+        if mouse_f(rd, st.as_mut_ptr()) == 0 {
+            return false;
+        }
+        return u32::from_le_bytes([st[0], st[1], st[2], st[3]]) & 0x1f != 0;
+    }
+    false
 }
 
 pub unsafe fn drop_host_pad(hr: i32, out: *mut *mut c_void) -> i32 {
@@ -195,6 +240,20 @@ unsafe extern "system" fn device_tramp(token: u64, ctx: *mut c_void, dev: *mut c
     let t = &*(ctx as *const Tramp);
     if !dev.is_null() && dev != super::vdev() && crate::host_input::hide_device(supported(dev), crate::host_input::pad_hidden(), crate::host_input::kbm_hidden()) {
         note_device(dev, &format!("device callback token={token:#x} status {prev:#x} -> {cur:#x} NOT passed to the title (TOMBOX_HOST_PAD/TOMBOX_HOST_KBM)"));
+        if crate::host_input::test_run() {
+            let mut held = HELD_DEVICES.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(h) = held.iter_mut().find(|h| h.ctx == ctx as usize && h.dev == dev as usize) {
+                h.token = token;
+                h.ts = ts;
+                h.cur = cur;
+                h.prev = prev;
+            } else {
+                let add: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(vfn(dev, 1));
+                add(dev);
+                held.push(Held { ctx: ctx as usize, dev: dev as usize, token, ts, cur, prev });
+            }
+            crate::host_input::on_takeover(replay_held_devices);
+        }
         return;
     }
     patch_device(dev);
@@ -202,6 +261,29 @@ unsafe extern "system" fn device_tramp(token: u64, ctx: *mut c_void, dev: *mut c
     note_device(dev, &format!("device callback to title token={token:#x} status {prev:#x} -> {cur:#x}"));
     let f: super::DeviceCb = core::mem::transmute(t.cb);
     f(token, t.ctx as *mut c_void, dev, ts, cur, prev);
+}
+
+struct Held {
+    ctx: usize,
+    dev: usize,
+    token: u64,
+    ts: u64,
+    cur: u32,
+    prev: u32,
+}
+
+static HELD_DEVICES: Mutex<Vec<Held>> = Mutex::new(Vec::new());
+
+fn replay_held_devices() {
+    let held: Vec<Held> = core::mem::take(&mut *HELD_DEVICES.lock().unwrap_or_else(|e| e.into_inner()));
+    super::log("host input", &format!("takeover: replaying {} held host device callback(s) to the title", held.len()));
+    for h in held {
+        unsafe {
+            device_tramp(h.token, h.ctx as *mut c_void, h.dev as *mut c_void, h.ts, h.cur, h.prev);
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(vfn(h.dev as *mut c_void, 2));
+            rel(h.dev as *mut c_void);
+        }
+    }
 }
 
 pub fn wrap_device_callback(ctx: *mut c_void, cb: usize) -> (*mut c_void, usize) {

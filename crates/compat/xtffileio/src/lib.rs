@@ -19,6 +19,9 @@ mod tests;
 #[cfg(test)]
 mod client_tests;
 
+#[cfg(test)]
+mod client_copy_tests;
+
 use com::*;
 use core::ffi::c_void;
 
