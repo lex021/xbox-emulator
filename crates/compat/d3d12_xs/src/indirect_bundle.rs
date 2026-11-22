@@ -644,7 +644,7 @@ unsafe fn split(list: *mut c_void, mut c: Call) -> bool {
         crate::cl2_state::reapply(b);
         crate::cmdlist_wrap::set_real(shim as *mut c_void, b);
     }
-    crate::cmdlist_x::note_shim(b, shim as *mut c_void);
+    crate::cmdlist_x::inherit_shim(list, b);
     log(&format!("ExecuteIndirectBundleX in list {list:p}: candidates go in part {x:p} ({}); recording continues on {b:p} with the pre-call state", if queue != 0 { "list already executing on its queue: part submitted now, re-resolved if the closed list is executed again" } else { "re-resolved against the closed bundles at each ExecuteCommandLists" }));
     defer(|m| m.insert(x as usize, c));
     true

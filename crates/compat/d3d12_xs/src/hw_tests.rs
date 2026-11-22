@@ -148,6 +148,61 @@ unsafe fn raw_list(dev: usize) -> *mut c_void {
     l
 }
 
+#[test]
+#[ignore = "requires a D3D12 adapter"]
+fn hw_placed_creation_without_output_uses_the_xbox_result() {
+    let g = gpu();
+    unsafe {
+        call!(g.dev, 1, () -> u32);
+        let dev = crate::device_wrap::wrap_device(g.dev as *mut c_void);
+        let iid_heap = Guid { d1: 0x6b3b_2502, d2: 0x6e51, d3: 0x45b3, d4: [0x90, 0xee, 0x98, 0x84, 0x26, 0x5e, 0x8d, 0xf3] };
+        let mut heap = core::ptr::null_mut();
+        let mut heap_desc = [0u64; 6];
+        heap_desc[0] = 0x2_0000;
+        heap_desc[1] = HEAP_DEFAULT as u64;
+        heap_desc[2] = 1u64 << 32;
+        heap_desc[3] = 1;
+        heap_desc[5] = 0xc0; // ALLOW_ONLY_BUFFERS.
+        assert_eq!(call!(dev, 28, (*const u64, *const Guid, *mut *mut c_void) -> i32,
+            heap_desc.as_ptr(), &iid_heap, &mut heap), 0);
+
+        let mut desc = [0u8; 56];
+        desc[..4].copy_from_slice(&1u32.to_le_bytes());
+        desc[0x10..0x18].copy_from_slice(&0x100u64.to_le_bytes());
+        desc[0x18..0x1c].copy_from_slice(&1u32.to_le_bytes());
+        desc[0x1c..0x20].copy_from_slice(&0x0001_0001u32.to_le_bytes());
+        desc[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        desc[0x2c..0x30].copy_from_slice(&1u32.to_le_bytes());
+        let create = |heap, offset, desc: &[u8; 56], out| call!(dev, 29,
+            (*mut c_void, u64, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32,
+            heap, offset, desc.as_ptr(), ST_COMMON, core::ptr::null(), &IID_RESOURCE, out);
+        let create_x = |addr, desc: &[u8; 56]| call!(dev, 44,
+            (u64, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32,
+            addr, desc.as_ptr(), ST_COMMON, core::ptr::null(), &IID_RESOURCE, core::ptr::null_mut());
+        let no_output = core::ptr::null_mut();
+        // Check a plain placed allocation, then the emulated sub-page buffer path.
+        assert_eq!(create(heap, 0, &desc, no_output), 0);
+        assert_eq!(create(heap, 0x200, &desc, no_output), 0);
+        assert!(create(heap, 0x2_0000, &desc, no_output) < 0);
+
+        extern "system" {
+            fn VirtualAlloc(address: *mut c_void, size: usize, alloc_type: u32, protect: u32) -> *mut c_void;
+            fn VirtualFree(address: *mut c_void, size: usize, free_type: u32) -> i32;
+        }
+        let base = VirtualAlloc(core::ptr::null_mut(), 0x2_0000, 0x2000, 1);
+        assert!(!base.is_null());
+        let va = base as u64 + 0x200;
+        let placements = crate::placed::count();
+        assert_eq!(create_x(va, &desc), 0);
+        assert_eq!(create(core::ptr::null_mut(), va, &desc, no_output), 0);
+        assert_eq!(crate::placed::count(), placements);
+        assert!(crate::gpu_va::lookup(va).is_none());
+        assert_ne!(VirtualFree(base, 0, 0x8000), 0);
+        call!(heap, 2, () -> u32);
+        call!(dev, 2, () -> u32);
+    }
+}
+
 unsafe fn title_list(dev: usize) -> *mut c_void {
     crate::cmdlist_wrap::wrap(unsafe { raw_list(dev) })
 }
@@ -564,7 +619,8 @@ fn hw_execute_indirect_bundle_honours_gpu_size_max_records_and_predication() {
         assert!(reached(fp, 1, Duration::from_secs(5)));
         let l = title_list(g.dev);
         let null = core::ptr::null_mut::<c_void>();
-        let eib = |res: usize, off: u64, max: u32, sz: *mut c_void, so: u32| call!(l, crate::cl_ext::CL_EXECUTE_INDIRECT_BUNDLE, (*mut c_void, u64, u32, *mut c_void, u32, u32) -> (), res as *mut c_void, off, max, sz, so, 0);
+        let eib_with_pred_offset = |res: usize, off: u64, max: u32, sz: *mut c_void, so: u32, po: u32| call!(l, crate::cl_ext::CL_EXECUTE_INDIRECT_BUNDLE, (*mut c_void, u64, u32, *mut c_void, u32, u32) -> (), res as *mut c_void, off, max, sz, so, po);
+        let eib = |res, off, max, sz, so| eib_with_pred_offset(res, off, max, sz, so, 0);
         let mut n = 0u64;
         let mut snap = || {
             raw_barrier(l, out.res, ST_UAV, ST_COPY_SOURCE);
@@ -573,7 +629,8 @@ fn hw_execute_indirect_bundle_honours_gpu_size_max_records_and_predication() {
             n += 1;
         };
         let szp = szb.res as *mut c_void;
-        eib(bb.res, 0x100, 32, null, 0);
+        // The retail UMD always writes zero into this packet field.
+        eib_with_pred_offset(bb.res, 0x100, 32, null, 0, 4);
         snap();
         eib(bb.res, 0x100, 32, szp, 0);
         snap();
@@ -601,6 +658,26 @@ fn hw_execute_indirect_bundle_honours_gpu_size_max_records_and_predication() {
         assert!(reached(f, 1, Duration::from_secs(5)));
         let got: Vec<(u32, u32)> = (0..8).map(|i| (rd(&rb, i * 8), rd(&rb, i * 8 + 4))).collect();
         assert_eq!(got, vec![(1, 1), (2, 1), (2, 1), (3, 1), (4, 2), (4, 2), (5, 3), (6, 4)], "per-call bundle execution counts (A, B)");
+
+        call!(g.dev, 1, () -> u32);
+        let debug_device = crate::device_wrap::wrap_device_for_driver(g.dev as *mut c_void, crate::process_debug::Driver::Debug);
+        let mut allocator = core::ptr::null_mut();
+        assert_eq!(call!(g.dev, 9, (u32, *const Guid, *mut *mut c_void) -> i32, 0, &IID_ALLOCATOR, &mut allocator), 0);
+        let params = [0u32, 0, 1, 0];
+        let mut debug = core::ptr::null_mut();
+        assert_eq!(call!(debug_device, 73, (*const u32, *mut c_void, *mut c_void, *const Guid, *mut *mut c_void) -> i32,
+            params.as_ptr(), allocator, null, &IID_LIST, &mut debug), 0);
+        call!(debug, crate::cl_ext::CL_EXECUTE_INDIRECT_BUNDLE, (*mut c_void, u64, u32, *mut c_void, u32, u32) -> (),
+            bb.res as *mut c_void, 0x100, 32, null, 0, 4);
+        raw_barrier(debug, out.res, ST_UAV, ST_COPY_SOURCE);
+        call!(debug, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (), rb.res, 64, out.res, 0, 8);
+        assert!(call!(debug, X_CLOSE, () -> i32) >= 0);
+        submit(g.a, debug, f, 2);
+        assert!(reached(f, 2, Duration::from_secs(5)));
+        assert_eq!((rd(&rb, 64), rd(&rb, 68)), (6, 4), "debug UMD rejects a nonzero offset");
+        call!(debug, 2, () -> u32);
+        call!(allocator, 2, () -> u32);
+        call!(debug_device, 2, () -> u32);
         crate::placed::forget(bb.res as *mut c_void);
         drop(bundles);
     }

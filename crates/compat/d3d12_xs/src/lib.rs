@@ -144,13 +144,14 @@ static IID_ID3D12DEBUG: device_wrap::Guid = device_wrap::Guid {
 
 /// Enable the D3D12 debug layer (best-effort) so validation errors are emitted via
 /// OutputDebugString and captured by the tracer. Gated on env TOMBOX_D3D12_DEBUG.
-fn maybe_enable_debug_layer(params: *const c_void) {
-    if !unsafe { process_debug::on_create_device(params, std::env::var("TOMBOX_D3D12_DEBUG").is_ok()) } {
-        return;
+fn maybe_enable_debug_layer(params: *const c_void) -> process_debug::Driver {
+    let (driver, enable) = unsafe { process_debug::on_create_device(params, std::env::var("TOMBOX_D3D12_DEBUG").is_ok()) };
+    if !enable {
+        return driver;
     }
     let p = host_proc(b"D3D12GetDebugInterface\0");
     if p == 0 {
-        return;
+        return driver;
     }
     let f: unsafe extern "system" fn(*const device_wrap::Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(p) };
@@ -168,6 +169,7 @@ fn maybe_enable_debug_layer(params: *const c_void) {
     } else {
         record(M, "debug", &format!("D3D12GetDebugInterface hr={hr:#010x} (SDK layers missing?)"));
     }
+    driver
 }
 
 fn host_d3d12() -> HMODULE {
@@ -230,7 +232,7 @@ pub extern "system" fn D3D12XboxCreateDevice(
     present::start_window_clamp();
     agility::select();
     enable_experimental_shader_models();
-    maybe_enable_debug_layer(_params);
+    let driver = maybe_enable_debug_layer(_params);
     dred::enable_before_create();
     let p = host_proc(b"D3D12CreateDevice\0");
     if p == 0 {
@@ -246,7 +248,7 @@ pub extern "system" fn D3D12XboxCreateDevice(
         let real = unsafe { *pp_device };
         if !real.is_null() {
             dred::watch(real);
-            let wrapped = device_wrap::wrap_device(real);
+            let wrapped = device_wrap::wrap_device_for_driver(real, driver);
             unsafe { *pp_device = wrapped };
             record(M, "D3D12XboxCreateDevice", &format!("host device {real:p} wrapped as {wrapped:p} (hr={hr:#010x})"));
             return hr;

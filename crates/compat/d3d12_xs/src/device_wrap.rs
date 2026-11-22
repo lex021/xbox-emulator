@@ -50,6 +50,7 @@ pub struct DeviceWrapper {
     vtable: *const usize,
     real: *mut c_void,
     refs: AtomicU32,
+    debug_umd: bool,
 }
 
 fn guid_str(g: &Guid) -> String {
@@ -266,7 +267,11 @@ unsafe extern "system" fn create_command_list_x(
         // Hand the title a shim object (Xbox vtable layout + inert inline-buffer fields)
         // instead of the real PC command list; see cmdlist_wrap.
         unsafe {
-            *ppv = if dma { crate::dma_list::wrap(*ppv) } else { crate::cmdlist_wrap::wrap(*ppv) };
+            *ppv = if dma {
+                crate::dma_list::wrap(*ppv)
+            } else {
+                crate::cmdlist_wrap::wrap_for_driver(*ppv, (*this).debug_umd)
+            };
         }
     }
     record("d3d12_xs", "CreateCommandList", &format!("nodeMask={node_mask} type={list_type} dma={dma} -> hr={hr:#010x}"));
@@ -1375,6 +1380,14 @@ pub(crate) fn resource_riid(riid: *const Guid) -> bool {
     !riid.is_null() && unsafe { &*riid } == &IID_ID3D12RESOURCE
 }
 
+unsafe fn release_temporary_resource(resource: *mut c_void) {
+    if !resource.is_null() {
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 =
+            unsafe { core::mem::transmute(*real_vtbl(resource).add(2)) };
+        unsafe { release(resource) };
+    }
+}
+
 unsafe extern "system" fn create_placed_resource(
     this: *mut DeviceWrapper, heap: *mut c_void, offset: u64, pdesc: *const u8,
     init_state: u32, pclear: *const c_void, riid: *const Guid, ppv: *mut *mut c_void,
@@ -1392,16 +1405,21 @@ unsafe extern "system" fn create_placed_resource(
     if pdesc.is_null() {
         return unsafe { f(real, heap, offset, pdesc, init_state, pclear, riid, ppv) };
     }
+    // Xbox creates the resource even when the caller discards the output.
+    let discard = ppv.is_null();
+    let mut temporary = core::ptr::null_mut();
+    let ppv = if discard { &mut temporary } else { ppv };
     let mut d = unsafe { core::slice::from_raw_parts(pdesc, 0x38).to_vec() };
     let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
     d[0x30..0x34].copy_from_slice(&(flags & 0xFF).to_le_bytes());
     let init_state = crate::xone_barrier::initial_state(u32::from_le_bytes(d[0..4].try_into().unwrap()), init_state);
     let da: [u8; 0x38] = d[..0x38].try_into().unwrap();
-    let mut hr = match (d[0], ppv.is_null()) {
-        (1, false) => unsafe { crate::placed_offset::place_in_heap(real, heap, offset, &da, init_state, pclear, ppv) },
-        _ => None,
-    }
-    .unwrap_or_else(|| unsafe { f(real, heap, offset, d.as_ptr(), init_state, pclear, &IID_ID3D12RESOURCE, ppv) });
+    let placed = if d[0] == 1 {
+        unsafe { crate::placed_offset::place_in_heap(real, heap, offset, &da, init_state, pclear, ppv) }
+    } else {
+        None
+    };
+    let mut hr = placed.unwrap_or_else(|| unsafe { f(real, heap, offset, d.as_ptr(), init_state, pclear, &IID_ID3D12RESOURCE, ppv) });
     if hr < 0 && d[0] >= 2 && offset % 0x1000 == 0 && offset % 0x1_0000 != 0 && u64::from_le_bytes(d[8..16].try_into().unwrap()) == 0 {
         let mut small = d.clone();
         small[8..16].copy_from_slice(&0x1000u64.to_le_bytes());
@@ -1410,15 +1428,19 @@ unsafe extern "system" fn create_placed_resource(
             d = small;
         }
     }
-    if hr >= 0 && !ppv.is_null() {
+    if discard {
+        unsafe { release_temporary_resource(temporary) };
+        return hr;
+    }
+    if hr >= 0 {
         crate::map_x::ensure_patched(unsafe { *ppv });
         unsafe { crate::gpu_va::note_resource(real, *ppv, &d, init_state, None) };
     }
-    if hr >= 0 && crate::rtcap::enabled() && d[0] == 1 && !ppv.is_null() {
+    if hr >= 0 && crate::rtcap::enabled() && d[0] == 1 {
         let width = u64::from_le_bytes(d[0x10..0x18].try_into().unwrap());
         unsafe { crate::bindtrace::note_buffer(*ppv, width, crate::bindtrace::heap_type_of(heap as usize)) };
     }
-    if hr >= 0 && !ppv.is_null() && d[0] == 3 {
+    if hr >= 0 && d[0] == 3 {
         unsafe { crate::rtcap::register(*ppv, &d[..0x38], init_state) };
     }
     static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -1440,10 +1462,13 @@ unsafe extern "system" fn create_placed_resource_x(
         record("d3d12_xs", "CreatePlacedResourceX", "riid is not IID_ID3D12Resource -> E_NOINTERFACE, nothing created (xgs12 0x477cb / xgs12_10 0x4d85e)");
         return E_NOINTERFACE;
     }
-    if pdesc.is_null() || ppv.is_null() {
-        record("d3d12_xs", "CreatePlacedResourceX", "null desc/out -> E_INVALIDARG");
+    if pdesc.is_null() {
+        record("d3d12_xs", "CreatePlacedResourceX", "null desc -> E_INVALIDARG");
         return 0x80070057u32 as i32;
     }
+    let discard = ppv.is_null();
+    let mut temporary = core::ptr::null_mut();
+    let ppv = if discard { &mut temporary } else { ppv };
     let orig: [u8; 0x38] = unsafe { core::slice::from_raw_parts(pdesc, 0x38) }.try_into().unwrap();
     let mut d = orig;
     let dim = u32::from_le_bytes(d[0..4].try_into().unwrap());
@@ -1473,7 +1498,9 @@ unsafe extern "system" fn create_placed_resource_x(
             "#{n} va={va:#x} state={init_state:#x} clear={pclear:p} {} -> {how} hr={hr:#010x} res={:p}",
             desc_str(&orig), unsafe { *ppv }));
     }
-    if hr >= 0 {
+    if discard {
+        unsafe { release_temporary_resource(temporary) };
+    } else if hr >= 0 {
         // One reference for the placement registry (released by upload.rs).
         let res = unsafe { *ppv };
         crate::map_x::ensure_patched(res);
@@ -1634,11 +1661,17 @@ pub(crate) fn vtable() -> *const usize {
 }
 
 /// Wrap a real `ID3D12Device` so we can intercept QueryInterface.
+#[cfg(test)]
 pub fn wrap_device(real: *mut c_void) -> *mut c_void {
+    wrap_device_for_driver(real, crate::process_debug::Driver::Stock)
+}
+
+pub fn wrap_device_for_driver(real: *mut c_void, driver: crate::process_debug::Driver) -> *mut c_void {
     if crate::rtcap::enabled() && !real.is_null() {
         unsafe { patch_real_device(real) };
     }
-    let w = Box::new(DeviceWrapper { vtable: vtable(), real, refs: AtomicU32::new(1) });
+    let debug_umd = driver == crate::process_debug::Driver::Debug;
+    let w = Box::new(DeviceWrapper { vtable: vtable(), real, refs: AtomicU32::new(1), debug_umd });
     let p = Box::into_raw(w) as *mut c_void;
     WRAPPED.lock().unwrap_or_else(|e| e.into_inner()).push((real as usize, p as usize));
     p

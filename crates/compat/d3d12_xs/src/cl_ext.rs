@@ -254,6 +254,8 @@ unsafe extern "system" fn cl_execute_indirect_bundle(this: *mut c_void, bundle: 
     let bw = unsafe { res_desc(bundle) }.map(|d| desc_width(&d));
     let sw = unsafe { res_desc(size_buf) }.map(|d| desc_width(&d));
     let ty = unsafe { list_type(this) };
+    // The retail UMD always writes zero. The debug UMD rejects a nonzero argument.
+    let pred_off = if crate::cmdlist_x::debug_umd(this) { pred_off } else { 0 };
     if let Some(e) = bundle_error(bw, offset, max_size, sw, size_off, ty, pred_off).or_else(|| bundle_list_error(ty)) {
         return reject(&BUNDLE_LOG, W, e);
     }

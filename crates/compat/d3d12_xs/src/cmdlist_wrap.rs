@@ -464,7 +464,12 @@ unsafe fn build_shim_thunks() {
 }
 
 /// Wrap a freshly created real command list in a shim object for the title.
+#[cfg(test)]
 pub fn wrap(real_list: *mut c_void) -> *mut c_void {
+    wrap_for_driver(real_list, false)
+}
+
+pub fn wrap_for_driver(real_list: *mut c_void, debug_umd: bool) -> *mut c_void {
     if real_list.is_null() {
         return real_list;
     }
@@ -477,7 +482,7 @@ pub fn wrap(real_list: *mut c_void) -> *mut c_void {
         assert!(!p.is_null(), "d3d12_xs: cannot allocate command-list shim");
         *(p as *mut usize) = SHIM_VT.as_ptr() as usize;
         *(p.add(SHIM_REAL_OFF) as *mut usize) = real_list as usize;
-        crate::cmdlist_x::note_shim(real_list, p as *mut c_void);
+        crate::cmdlist_x::note_shim(real_list, p as *mut c_void, debug_umd);
         static N_WRAPPED: AtomicUsize = AtomicUsize::new(0);
         if N_WRAPPED.fetch_add(1, Ordering::Relaxed) < 3 {
             record("d3d12_xs", "cmdlist.shim", &format!("real {real_list:p} wrapped as shim {p:p}"));

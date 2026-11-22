@@ -31,7 +31,13 @@ static REAL_QI: AtomicUsize = AtomicUsize::new(0);
 static REAL_RATE: AtomicUsize = AtomicUsize::new(0);
 static REAL_RATE_IMAGE: AtomicUsize = AtomicUsize::new(0);
 static VRS_TIER: AtomicI32 = AtomicI32::new(-1);
-static SHIMS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+#[derive(Clone, Copy)]
+struct Shim {
+    address: usize,
+    debug_umd: bool,
+}
+
+static SHIMS: Mutex<Option<HashMap<usize, Shim>>> = Mutex::new(None);
 
 pub unsafe fn install(xbox_vt: &[AtomicUsize], real_vt: *const usize) {
     REAL_QI.store(*real_vt, Ordering::Relaxed);
@@ -139,14 +145,31 @@ unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u32, barriers
     f(this, n, barriers)
 }
 
-pub fn note_shim(real: *mut c_void, shim: *mut c_void) {
+pub fn note_shim(real: *mut c_void, shim: *mut c_void, debug_umd: bool) {
     let mut g = SHIMS.lock().unwrap_or_else(|e| e.into_inner());
-    g.get_or_insert_with(HashMap::new).insert(real as usize, shim as usize);
+    g.get_or_insert_with(HashMap::new).insert(real as usize, Shim { address: shim as usize, debug_umd });
+}
+
+fn shim_metadata(real: *mut c_void) -> Option<Shim> {
+    let g = SHIMS.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().and_then(|m| m.get(&(real as usize)).copied())
 }
 
 pub(crate) fn shim_of(real: *mut c_void) -> Option<usize> {
-    let g = SHIMS.lock().unwrap_or_else(|e| e.into_inner());
-    g.as_ref().and_then(|m| m.get(&(real as usize)).copied())
+    shim_metadata(real).map(|shim| shim.address)
+}
+
+pub(crate) fn debug_umd(real: *mut c_void) -> bool {
+    shim_metadata(real).is_some_and(|shim| shim.debug_umd)
+}
+
+pub(crate) fn inherit_shim(from: *mut c_void, to: *mut c_void) {
+    let mut shims = SHIMS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(shims) = shims.as_mut() {
+        if let Some(shim) = shims.get(&(from as usize)).copied() {
+            shims.insert(to as usize, shim);
+        }
+    }
 }
 
 unsafe fn vrs_tier(list: *mut c_void) -> i32 {
@@ -293,8 +316,11 @@ mod tests {
 
     #[test]
     fn shim_registry() {
-        note_shim(0x1000 as *mut c_void, 0x2000 as *mut c_void);
+        note_shim(0x1000 as *mut c_void, 0x2000 as *mut c_void, true);
         assert_eq!(shim_of(0x1000 as *mut c_void), Some(0x2000));
         assert_eq!(shim_of(0x3000 as *mut c_void), None);
+        inherit_shim(0x1000 as *mut c_void, 0x3000 as *mut c_void);
+        assert!(debug_umd(0x3000 as *mut c_void));
+        assert_eq!(shim_of(0x3000 as *mut c_void), Some(0x2000));
     }
 }

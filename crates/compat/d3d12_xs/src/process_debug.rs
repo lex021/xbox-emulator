@@ -103,7 +103,7 @@ pub fn mark_device_created() {
     DEVICE_CREATED.store(true, Ordering::SeqCst);
 }
 
-pub unsafe fn on_create_device(params: *const c_void, env_forced: bool) -> bool {
+pub unsafe fn on_create_device(params: *const c_void, env_forced: bool) -> (Driver, bool) {
     let flags = unsafe { store_create_params(params) };
     let d = driver_for(flags);
     let want = wants_debug_layer(flags, env_forced);
@@ -117,7 +117,7 @@ pub unsafe fn on_create_device(params: *const c_void, env_forced: bool) -> bool 
             d.console_umd()
         ),
     );
-    claimed
+    (d, claimed)
 }
 
 #[no_mangle]

@@ -229,7 +229,7 @@ pub unsafe fn split_for_wait(list: *mut c_void, op: Op) -> bool {
         crate::cl2_state::reapply(seg);
         crate::cmdlist_wrap::set_real(shim as *mut c_void, seg);
     }
-    crate::cmdlist_x::note_shim(seg, shim as *mut c_void);
+    crate::cmdlist_x::inherit_shim(list, seg);
     gpu_wait::note(seg, op);
     if once(8) {
         record("d3d12_xs", "list_split", &format!("wait in list {list:p}: recorded part closed, recording continues on segment {seg:p}; the queue waits between the two at submit"));
@@ -250,7 +250,7 @@ pub unsafe fn continue_on_segment(list: *mut c_void) -> *mut c_void {
     reg(|r| r.add(list as usize, seg as usize));
     crate::cl2_state::clone_state(list, seg);
     unsafe { crate::cmdlist_wrap::set_real(shim as *mut c_void, seg) };
-    crate::cmdlist_x::note_shim(seg, shim as *mut c_void);
+    crate::cmdlist_x::inherit_shim(list, seg);
     seg
 }
 
