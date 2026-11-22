@@ -1,0 +1,74 @@
+name: Rust
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  rust-core:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: rust-core-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-core-${{ runner.os }}-
+      - name: cargo check
+        shell: bash
+        run: cargo check --locked -p tombox-pe -p tombox-archive -p tombox-rpf -p tombox-disasm -p tombox-xshader --all-targets
+      - name: cargo test (no dumps, WARP only)
+        shell: bash
+        run: cargo test --locked -p tombox-pe -p tombox-archive -p tombox-rpf -p tombox-disasm -p tombox-xshader --no-fail-fast
+
+  rust-workspace-check:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: rust-ws-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-ws-${{ runner.os }}-
+      - name: cargo check --workspace
+        shell: bash
+        run: cargo check --locked --workspace

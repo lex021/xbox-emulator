@@ -150,6 +150,9 @@ pub fn inspect_prefix(b: &[u8], file_size: u64) -> Result<Rpf, String> {
     let (header, header_len) = match digit {
         b'7' => (Header::V7 { entry_count: u32_at(b, 4)?, names_length: u32_at(b, 8)?, encryption: u32_at(b, 12)? }, 16),
         b'8' => {
+            if b.len() < 272 {
+                return Err(format!("truncated: RPF8 header is 272 bytes, file is {}", b.len()));
+            }
             let (entry_count, tag) = (u32_at(b, 4)?, u32_at(b, 12)?);
             let mut entries = Vec::new();
             if tag as u16 == 0xff {
@@ -270,6 +273,25 @@ mod tests {
         assert!(matches!(rpf.header, Header::V8 { entry_count: 2, ref entries, .. } if entries.len() == 1));
         assert!(inspect_prefix(&prefix, file_size - 1).unwrap_err().contains("truncated"));
         assert!(inspect(&prefix).unwrap_err().contains("truncated"));
+    }
+
+    #[test]
+    fn rejects_truncated_rpf8_header() {
+        let rpf8 = |len: usize| {
+            let mut b = vec![0u8; len];
+            b[..4].copy_from_slice(&0x5250_4638u32.to_le_bytes());
+            if len >= 14 {
+                b[12..14].copy_from_slice(&0xffu16.to_le_bytes());
+            }
+            b
+        };
+        for len in [16usize, 0x10f] {
+            let e = inspect(&rpf8(len)).unwrap_err();
+            assert!(e.contains("truncated"), "len {len}: {e}");
+        }
+        let r = inspect(&rpf8(272)).unwrap();
+        assert_eq!(r.version, 8);
+        assert!(matches!(r.header, Header::V8 { ref entries, .. } if entries.is_empty()));
     }
 
     #[test]

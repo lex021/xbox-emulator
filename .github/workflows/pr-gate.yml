@@ -1,0 +1,36 @@
+name: PR gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-gate-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  no-binaries-or-game-data:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Use the gate script from the base branch
+        shell: bash
+        run: |
+          if git show "HEAD^1:.github/scripts/pr_gate.py" > "$RUNNER_TEMP/pr_gate.py" 2>/dev/null && [ -s "$RUNNER_TEMP/pr_gate.py" ]; then
+            echo "gate script taken from the base branch"
+          else
+            cp .github/scripts/pr_gate.py "$RUNNER_TEMP/pr_gate.py"
+          fi
+      - name: Tracked files
+        run: python3 -I "$RUNNER_TEMP/pr_gate.py" --tree
+      - name: Changes in this pull request
+        if: github.event_name == 'pull_request'
+        run: python3 -I "$RUNNER_TEMP/pr_gate.py" --base "HEAD^1" --head HEAD

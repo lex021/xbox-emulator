@@ -29,3 +29,5 @@ emulator/
 *.part
 *.crdownload
 tools/progress/proposed_*.json
+__pycache__/
+*.pyc
