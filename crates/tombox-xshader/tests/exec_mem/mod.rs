@@ -91,17 +91,27 @@ pub fn extract_code(words: &[u32], pos: bool, code: Option<&[u32]>) -> ShaderExt
 }
 
 unsafe fn ser_ranges(params: &[Vec<[u32; 5]>]) -> Result<Vec<u8>, String> {
+    ser_ranges_with_constant(params, false)
+}
+
+unsafe fn ser_ranges_with_constant(params: &[Vec<[u32; 5]>], constant: bool) -> Result<Vec<u8>, String> {
     let d3d = LoadLibraryA(b"d3d12.dll\0".as_ptr());
     let ser: unsafe extern "system" fn(*const u8, u32, *mut *mut c_void, *mut *mut c_void) -> i32 =
         core::mem::transmute(GetProcAddress(d3d, b"D3D12SerializeRootSignature\0".as_ptr()));
-    let mut ps = vec![0u8; 32 * params.len().max(1)];
+    let count = params.len() + usize::from(constant);
+    let mut ps = vec![0u8; 32 * count.max(1)];
     for (i, r) in params.iter().enumerate() {
         let o = i * 32;
         ps[o + 8..o + 12].copy_from_slice(&(r.len() as u32).to_le_bytes());
         ps[o + 16..o + 24].copy_from_slice(&(r.as_ptr() as u64).to_le_bytes());
     }
+    if constant {
+        let o = 32 * params.len();
+        ps[o..o + 4].copy_from_slice(&1u32.to_le_bytes()); // 32-bit constants
+        ps[o + 16..o + 20].copy_from_slice(&1u32.to_le_bytes()); // one constant at b0
+    }
     let mut desc = [0u8; 40];
-    desc[0..4].copy_from_slice(&(params.len() as u32).to_le_bytes());
+    desc[0..4].copy_from_slice(&(count as u32).to_le_bytes());
     desc[8..16].copy_from_slice(&(ps.as_ptr() as u64).to_le_bytes());
     let mut blob: *mut c_void = core::ptr::null_mut();
     let mut err: *mut c_void = core::ptr::null_mut();

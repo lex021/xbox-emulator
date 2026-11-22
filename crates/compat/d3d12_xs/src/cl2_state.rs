@@ -370,8 +370,18 @@ pub fn on_new_list(list: *mut c_void) {
     }
 }
 
+pub(crate) fn note_initial_pso(list: *mut c_void, pso: *mut c_void) {
+    if !pso.is_null() {
+        with(list, |s| s.pso = Some(pso as usize));
+    }
+}
+
 pub(crate) fn bound_pso(list: *mut c_void) -> Option<usize> {
     with(list, |s| s.pso)
+}
+
+pub(crate) fn compute_root(list: *mut c_void) -> Option<usize> {
+    with(list, |s| s.root[0])
 }
 
 pub(crate) fn predication_of(list: *mut c_void) -> Option<(usize, u64, u32)> {
@@ -379,7 +389,10 @@ pub(crate) fn predication_of(list: *mut c_void) -> Option<(usize, u64, u32)> {
 }
 
 pub(crate) fn note_predication(list: *mut c_void, res: usize, off: u64, op: u32) {
-    rec(list, |s| s.predication = Some((res, off, op)));
+    rec(list, |s| {
+        s.predication = Some((res, off, op));
+        s.plain_predicate = false;
+    });
 }
 
 pub(crate) fn queue_of(list: *mut c_void) -> usize {
@@ -465,7 +478,7 @@ pub(crate) fn plain_null_is_noop(plain_active: bool, res: usize) -> bool {
     res == 0 && !plain_active
 }
 
-unsafe extern "system" fn w_predication(this: *mut c_void, res: *mut c_void, off: u64, op: u32) {
+pub(crate) unsafe extern "system" fn w_predication(this: *mut c_void, res: *mut c_void, off: u64, op: u32) {
     if plain_null_is_noop(with(this, |s| s.plain_predicate), res as usize) {
         if once(8) {
             record("d3d12_xs", "cl2_state", &format!("SetPredication(NULL) on list {this:p} with no SetPredication resource active: the console UMD emits no packet (xgs12 0x56fd1 / xgs12_10 0x5e672 test flag bit 1), so the current predicate, including one from SetPredicationBufferX, stays in force"));
@@ -1382,6 +1395,7 @@ pub(crate) unsafe fn reapply_so(list: *mut c_void) {
 
 pub unsafe fn note_executed(queue: *mut c_void, lists: &[*mut c_void]) {
     unsafe { crate::dbcount::note_executed(queue, lists) };
+    unsafe { crate::gws_scratch::submitted(queue, lists) };
     let Some(&first) = lists.first() else { return };
     let keys: Vec<usize> = lists.iter().map(|&l| crate::list_split::origin_of(l)).collect();
     if !store(|st| st.holds_any(&keys)) {
@@ -1751,6 +1765,7 @@ pub(crate) unsafe fn reopen(list: *mut c_void) -> bool {
         return false;
     }
     crate::dred_marks::begin_recording(list as usize);
+    crate::gws_scratch::forget(list);
     with(list, |s| s.open = true);
     unsafe { reapply(list) };
     true
@@ -1820,6 +1835,7 @@ unsafe extern "system" fn w_reset(this: *mut c_void, alloc: *mut c_void, pso: *m
     clear_presubmitted(&[this]);
     release_list_parts(this);
     if hr >= 0 {
+        crate::gws_scratch::forget(this);
         crate::cl_fw::forget(crate::list_split::origin_of(this));
         with(this, |s| {
             *s = ListState { open: true, list9: s.list9, pso: (!pso.is_null()).then_some(pso as usize), ..ListState::default() };
@@ -1829,7 +1845,8 @@ unsafe extern "system" fn w_reset(this: *mut c_void, alloc: *mut c_void, pso: *m
     hr
 }
 
-unsafe extern "system" fn w_clear_state(this: *mut c_void, pso: *mut c_void) {
+pub(crate) unsafe extern "system" fn w_clear_state(this: *mut c_void, pso: *mut c_void) {
+    crate::cl_fw::forget(crate::list_split::origin_of(this));
     with(this, |s| {
         s.clear_bindings();
         s.pso = (!pso.is_null()).then_some(pso as usize);

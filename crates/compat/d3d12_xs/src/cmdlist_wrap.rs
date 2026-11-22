@@ -404,6 +404,7 @@ pub fn apply(real_list: *mut c_void) {
             crate::resolve_x::install(&XBOX_VT);
             crate::dred_marks::install(&XBOX_VT);
             crate::pso_async::install(&XBOX_VT);
+            crate::gws_dispatch::install(&XBOX_VT);
             XBOX_VT[CONSOLE_NULL_SLOT].store(0, Ordering::Relaxed);
             record("d3d12_xs", "cmdlist.vtable",
                 &format!("built Xbox-layout cmdlist vtable from real {real_vt:p} (+4 shift at PC28)"));

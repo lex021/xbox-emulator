@@ -321,4 +321,36 @@ mod tests {
         assert_eq!(calls_for(p as usize).last().copied(), Some((0x4560, 0x18, 0)));
         assert_eq!(crate::cl2_state::predication_of(p), Some((0x4560, 0x18, 0)), "Write64BitValueBottomOfPipeX and list splits lift and restore the predicate from cl2_state, so it must match the one the PC list now has");
     }
+
+    #[test]
+    fn clear_state_drops_the_cursor_so_advance_after_clear_state_does_nothing() {
+        crate::gpu_va::insert(crate::gpu_va::Entry { start: 0x7f_0000_0000, len: 0x100, res: 0x3344, buffer: true });
+        let vt: &Vec<usize> = Box::leak(Box::new(fake_vt()));
+        let l: &FakeList = Box::leak(Box::new(FakeList { vt: vt.as_ptr(), ty: LIST_TYPE_DIRECT }));
+        let p = l as *const FakeList as *mut c_void;
+        unsafe { set_predication_buffer(p, &PredicationBufferDesc { va: 0x7f_0000_0000, offset: 0 }) };
+        assert!(cursor(p as usize).is_some());
+        assert_eq!(crate::cl2_state::predication_of(p), Some((0x3344, 0, 0)));
+        unsafe { crate::cl2_state::w_clear_state(p, core::ptr::null_mut()) };
+        assert_eq!(cursor(p as usize), None, "ClearState must drop the predication cursor");
+        assert_eq!(crate::cl2_state::predication_of(p), None, "ClearState must clear predication in list state");
+        unsafe { advance_predication(p) };
+        assert_eq!(calls_for(p as usize), vec![(0x3344, 0, 0)], "an AdvancePredicationX after ClearState must not re-arm the previous recording's predicate");
+    }
+
+    #[test]
+    fn buffer_predication_clears_plain_predicate_flag_so_subsequent_null_predication_is_noop() {
+        crate::gpu_va::insert(crate::gpu_va::Entry { start: 0x8a_0000_0000, len: 0x100, res: 0x5566, buffer: true });
+        let vt: &Vec<usize> = Box::leak(Box::new(fake_vt()));
+        let l: &FakeList = Box::leak(Box::new(FakeList { vt: vt.as_ptr(), ty: LIST_TYPE_DIRECT }));
+        let p = l as *const FakeList as *mut c_void;
+        unsafe { crate::cl2_state::w_predication(p, 0x1234 as *mut c_void, 0, 0) };
+        assert_eq!(crate::cl2_state::predication_of(p), Some((0x1234, 0, 0)));
+        unsafe { set_predication_buffer(p, &PredicationBufferDesc { va: 0x8a_0000_0000, offset: 0 }) };
+        assert_eq!(crate::cl2_state::predication_of(p), Some((0x5566, 0, 0)));
+        let calls_before = calls_for(p as usize).len();
+        unsafe { crate::cl2_state::w_predication(p, core::ptr::null_mut(), 0, 0) };
+        assert_eq!(crate::cl2_state::predication_of(p), Some((0x5566, 0, 0)), "SetPredication(NULL) must not disable buffer predication");
+        assert_eq!(calls_for(p as usize).len(), calls_before, "SetPredication(NULL) with buffer predication must emit no PC packet");
+    }
 }

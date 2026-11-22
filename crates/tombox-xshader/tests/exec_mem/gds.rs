@@ -1,6 +1,7 @@
 use super::ds::{cs_prog, ds, dv, ev};
 use super::*;
 use tombox_xshader::gds_abi::{TB_GDS_HLSL_DECL, TB_GDS_TITLE_DWORDS};
+use tombox_xshader::hlsl::{PhasedGws, Translated};
 
 const GDS_BYTES: u64 = 0x1_0000;
 const T: u32 = 64;
@@ -12,21 +13,35 @@ fn gds_op(op: u32, offset: u32, addr: u32, d0: u32, d1: u32, vdst: u32) -> [u32;
 }
 
 fn exec_gds(words: &[u32], gds_init: &[u32]) -> Result<(Vec<u32>, Vec<u32>), String> {
-    let ex = cs_extract(words, T);
-    let t = translate(&ex)?;
+    exec_gds_dispatch(words, gds_init, T, 1)
+}
+
+fn exec_gds_dispatch(words: &[u32], gds_init: &[u32], threads: u32, groups: u32) -> Result<(Vec<u32>, Vec<u32>), String> {
+    let ex = cs_extract(words, threads);
+    exec_gds_shader(translate(&ex)?, gds_init, groups)
+}
+
+fn exec_gds_shader(t: Translated, gds_init: &[u32], groups: u32) -> Result<(Vec<u32>, Vec<u32>), String> {
+    execute(&t, gds_init, groups, None).map(|(output, gds, _)| (output, gds))
+}
+
+fn execute(t: &Translated, gds_init: &[u32], groups: u32, phased: Option<(&PhasedGws, u32)>) -> Result<(Vec<u32>, Vec<u32>, Vec<u32>), String> {
     if !t.hlsl.contains(TB_GDS_HLSL_DECL) {
         return Err(format!("no GDS binding in\n{}", t.hlsl));
     }
-    let hlsl = t.hlsl.replace(TB_GDS_HLSL_DECL, "RWByteAddressBuffer tb_gds : register(u1);");
+    let hlsl = t.hlsl
+        .replace(TB_GDS_HLSL_DECL, "RWByteAddressBuffer tb_gds : register(u1);")
+        .replace("register(u1, space4000002)", "register(u2)")
+        .replace("register(b0, space4000002)", "register(b0)");
     let code = dxc::compile(&hlsl, &dxc::profile_for(t.profile)).map_err(|e| format!("dxc: {e}\n{hlsl}"))?;
     let m = CTX.get_or_init(|| Mutex::new(unsafe { ctx_new() }));
     let mut c = m.lock().unwrap_or_else(|e| e.into_inner());
-    unsafe { run(&mut c, &hlsl, &code, gds_init) }.map_err(|e| format!("{e}\n{hlsl}"))
+    unsafe { run(&mut c, &hlsl, &code, gds_init, groups, phased) }.map_err(|e| format!("{e}\n{hlsl}"))
 }
 
-unsafe fn run(c: &mut Ctx, hlsl: &str, code: &[u8], gds_init: &[u32]) -> Result<(Vec<u32>, Vec<u32>), String> {
+unsafe fn run(c: &mut Ctx, hlsl: &str, code: &[u8], gds_init: &[u32], groups: u32, phased: Option<(&PhasedGws, u32)>) -> Result<(Vec<u32>, Vec<u32>, Vec<u32>), String> {
     let g = &c.gpu;
-    let blob = ser_ranges(&[vec![[1, 8, 0, 0, 0xffff_ffff]]])?;
+    let blob = ser_ranges_with_constant(&[vec![[1, 8, 0, 0, 0xffff_ffff]]], phased.is_some())?;
     let mut rs: *mut c_void = core::ptr::null_mut();
     let hr = vcall!(g.device, 16, fn(u32, *const u8, usize, *const Guid, *mut *mut c_void) -> i32, 0, blob.as_ptr(), blob.len(), &d3d::IID_ROOTSIG, &mut rs);
     if hr < 0 {
@@ -44,10 +59,12 @@ unsafe fn run(c: &mut Ctx, hlsl: &str, code: &[u8], gds_init: &[u32]) -> Result<
     }
     let (vh, vcpu, vgpu, vinc) = g.heap(0, 8, true)?;
     let ubuf = g.buffer(CS_BYTES, 1, d3d::COPY_DEST, true)?;
-    let gbuf = g.buffer(GDS_BYTES, 1, d3d::COPY_DEST, true)?;
-    let up = g.buffer(CS_BYTES + GDS_BYTES, 2, d3d::GENERIC_READ, false)?;
-    let rb = g.buffer(CS_BYTES + GDS_BYTES, 3, d3d::COPY_DEST, false)?;
-    let mut bytes = vec![0u8; (CS_BYTES + GDS_BYTES) as usize];
+    let gds_and_scratch = GDS_BYTES + phased.map_or(0, |(plan, _)| u64::from(plan.scratch_bytes));
+    let total = CS_BYTES + gds_and_scratch;
+    let gbuf = g.buffer(gds_and_scratch, 1, d3d::COPY_DEST, true)?;
+    let up = g.buffer(total, 2, d3d::GENERIC_READ, false)?;
+    let rb = g.buffer(total, 3, d3d::COPY_DEST, false)?;
+    let mut bytes = vec![0u8; total as usize];
     for (i, w) in gds_init.iter().enumerate() {
         let o = CS_BYTES as usize + 4 * i;
         bytes[o..o + 4].copy_from_slice(&w.to_le_bytes());
@@ -65,10 +82,15 @@ unsafe fn run(c: &mut Ctx, hlsl: &str, code: &[u8], gds_init: &[u32]) -> Result<
     gd[16..20].copy_from_slice(&((GDS_BYTES / 4) as u32).to_le_bytes());
     gd[32..36].copy_from_slice(&1u32.to_le_bytes());
     vcall!(g.device, 19, fn(*mut c_void, *mut c_void, *const u8, usize) -> (), gbuf, core::ptr::null_mut(), gd.as_ptr(), vcpu + vinc as usize);
+    if let Some((plan, _)) = phased {
+        gd[8..16].copy_from_slice(&(GDS_BYTES / 4).to_le_bytes());
+        gd[16..20].copy_from_slice(&(plan.scratch_bytes / 4).to_le_bytes());
+        vcall!(g.device, 19, fn(*mut c_void, *mut c_void, *const u8, usize) -> (), gbuf, core::ptr::null_mut(), gd.as_ptr(), vcpu + 2 * vinc as usize);
+    }
     c.gpu.begin();
     let l = c.gpu.list;
     vcall!(l, 15, fn(*mut c_void, u64, *mut c_void, u64, u64) -> (), ubuf, 0, up, 0, CS_BYTES);
-    vcall!(l, 15, fn(*mut c_void, u64, *mut c_void, u64, u64) -> (), gbuf, 0, up, CS_BYTES, GDS_BYTES);
+    vcall!(l, 15, fn(*mut c_void, u64, *mut c_void, u64, u64) -> (), gbuf, 0, up, CS_BYTES, gds_and_scratch);
     c.gpu.barrier(ubuf, d3d::COPY_DEST, 8);
     c.gpu.barrier(gbuf, d3d::COPY_DEST, 8);
     let heaps = [vh];
@@ -76,16 +98,29 @@ unsafe fn run(c: &mut Ctx, hlsl: &str, code: &[u8], gds_init: &[u32]) -> Result<
     vcall!(l, 29, fn(*mut c_void) -> (), rs);
     vcall!(l, 31, fn(u32, u64) -> (), 0, vgpu);
     vcall!(l, 25, fn(*mut c_void) -> (), pso);
-    vcall!(l, 14, fn(u32, u32, u32) -> (), 1, 1, 1);
+    if let Some((plan, rounds)) = phased {
+        let [x, y, z] = plan.groups;
+        let uav_barrier = [2u64, 0, 0, 0];
+        for _ in 0..rounds {
+            for group in 0..x {
+                vcall!(l, 33, fn(u32, u32, u32) -> (), 1, group, 0);
+                vcall!(l, 14, fn(u32, u32, u32) -> (), x, y, z);
+                vcall!(l, 26, fn(u32, *const u64) -> (), 1, uav_barrier.as_ptr());
+            }
+        }
+    } else {
+        vcall!(l, 14, fn(u32, u32, u32) -> (), groups, 1, 1);
+    }
     c.gpu.barrier(ubuf, 8, d3d::COPY_SOURCE);
     c.gpu.barrier(gbuf, 8, d3d::COPY_SOURCE);
     vcall!(l, 15, fn(*mut c_void, u64, *mut c_void, u64, u64) -> (), rb, 0, ubuf, 0, CS_BYTES);
-    vcall!(l, 15, fn(*mut c_void, u64, *mut c_void, u64, u64) -> (), rb, CS_BYTES, gbuf, 0, GDS_BYTES);
+    vcall!(l, 15, fn(*mut c_void, u64, *mut c_void, u64, u64) -> (), rb, CS_BYTES, gbuf, 0, gds_and_scratch);
     let r = c.gpu.submit();
-    let out = r.and_then(|_| Gpu::map_read(rb, (CS_BYTES + GDS_BYTES) as usize).ok_or_else(|| "map".to_string())).map(|b| {
+    let out = r.and_then(|_| Gpu::map_read(rb, total as usize).ok_or_else(|| "map".to_string())).map(|b| {
         let w: Vec<u32> = b.chunks(4).map(|x| u32::from_le_bytes(x.try_into().unwrap())).collect();
         let k = (CS_BYTES / 4) as usize;
-        (w[..k].to_vec(), w[k..].to_vec())
+        let j = k + (GDS_BYTES / 4) as usize;
+        (w[..k].to_vec(), w[k..j].to_vec(), w[j..].to_vec())
     });
     for k in [pso, rs, vh, ubuf, gbuf, up, rb] {
         d3d::release(k);
@@ -245,7 +280,7 @@ fn ds_gds_shared_counters() {
     for t in 0..T {
         assert_eq!(gds[slot(t) + 256], dv(t));
     }
-    for op in [0x19u32, 0x1d, 0x3f] {
+    for op in [0x1du32, 0x3f] {
         let words = prog(0, &gds_op(op, 0, 1, 2, 0, 10), &[10]);
         assert!(translate(&cs_extract(&words, T)).is_err(), "op {op:#x} must be refused");
     }
@@ -322,4 +357,284 @@ fn ds_gds_append_consume() {
     } else {
         println!("ds_gds_append_consume: WARP waves are narrower than an RDNA2 wave32, so only the counter totals were checked. Set TOMBOX_EXEC_HW=1 to check the per-wave return values on a wave32 device.");
     }
+}
+
+#[test]
+fn ds_gws_counter_updates_once_per_guest_wave() {
+    use tombox_xshader::gds_abi::{TB_GWS_COUNTER_MASK, TB_GWS_TABLE_DWORD};
+
+    let offset = 7;
+    let base = 61;
+    let index = (TB_GWS_TABLE_DWORD + 4) as usize;
+    let initialize = gds_op(0x19, offset, 0, 20, 0, 0);
+    let increment = gds_op(0x1a, offset, 0, 0, 0, 0);
+
+    for (threads, threshold, expected) in [(32, 4, Some(7)), (32, 30, Some(33)), (32, 31, None), (64, 32, Some(35))] {
+        let mut body = vec![sop1(3, 40, 126), vop2(0x25, 20, LIT, 0), 0x1000];
+        // Keep only logical lanes with gtid.x greater than the threshold.
+        body.extend_from_slice(&[vopc(0xd1, ic(threshold), 0)]);
+        body.extend_from_slice(&initialize);
+        body.extend_from_slice(&increment);
+        body.extend_from_slice(&increment);
+        body.push(sop1(3, 126, 40));
+        let words = prog(base << 16, &body, &[0]);
+        let g0 = init();
+        let (_, actual) = exec_gds_dispatch(&words, &g0, threads, 1).unwrap();
+        let mut want = g0;
+        if let Some(count) = expected {
+            want[index] = count & TB_GWS_COUNTER_MASK;
+        }
+        assert_eq!(actual[index], want[index], "threshold {threshold}");
+        assert_eq!(actual, want, "another GDS resource was modified");
+    }
+}
+
+#[test]
+fn ds_gws_concurrent_posts_preserve_all_increments() {
+    use tombox_xshader::gds_abi::TB_GWS_TABLE_DWORD;
+
+    let mut body = vec![vopc(0xd1, ic(30), 0)];
+    body.extend_from_slice(&gds_op(0x1a, 7, 0, 0, 0, 0));
+    let words = prog(61 << 16, &body, &[]);
+    let index = (TB_GWS_TABLE_DWORD + 4) as usize;
+    for (threads, expected) in [(32, 21), (64, 25)] {
+        let mut want = init();
+        want[index] = 17;
+        let (_, actual) = exec_gds_dispatch(&words, &want, threads, 4).unwrap();
+        want[index] = expected;
+        assert_eq!(actual, want);
+    }
+}
+
+#[test]
+fn ds_gws_bulk_post_uses_first_active_lane_in_each_group() {
+    use tombox_xshader::gds_abi::{TB_GWS_COUNTER_MASK, TB_GWS_TABLE_DWORD};
+
+    let mut body = vec![vop2(0x25, 20, LIT, 0), 0x1000, vopc(0xd1, ic(4), 0)];
+    body.extend_from_slice(&gds_op(0x1b, 7, 0, 20, 0, 0));
+    let words = prog(61 << 16, &body, &[]);
+    let index = (TB_GWS_TABLE_DWORD + 4) as usize;
+    // The first active lane of each wave contributes its own count. On the
+    // second wave all lanes are active, so its first lane contributes 32.
+    for (threads, credits_per_group) in [(32, 5), (64, 5 + 32)] {
+        let mut want = init();
+        want[index] = TB_GWS_COUNTER_MASK - 1;
+        let (_, actual) = exec_gds_dispatch(&words, &want, threads, 4).unwrap();
+        want[index] += 4 * credits_per_group;
+        assert_eq!(actual, want);
+        assert_eq!(actual[index] & TB_GWS_COUNTER_MASK, 4 * credits_per_group - 2);
+    }
+}
+
+#[test]
+fn ds_gws_refuses_unsupported_group_and_wait() {
+    let init = gds_op(0x19, 7, 0, 20, 0, 0);
+    let words = prog(0, &init, &[0]);
+    let e = translate(&cs_extract(&words, 1025)).err().unwrap();
+    assert!(e.contains("wave32 compute group"), "{e}");
+
+    let wait = gds_op(0x1c, 7, 0, 0, 0, 0);
+    let words = prog(0, &wait, &[0]);
+    let e = translate(&cs_extract(&words, 32)).err().unwrap();
+    assert!(e.contains("global wave sync"), "{e}");
+}
+
+#[test]
+fn ds_gws_counter_boundaries_across_rows_and_partial_waves() {
+    use tombox_xshader::gds_abi::{TB_GWS_COUNTER_MASK, TB_GWS_TABLE_DWORD};
+    let idx = (TB_GWS_TABLE_DWORD + 7) as usize;
+    for (dims, waves) in [([1, 1, 1], 1), ([17, 3, 1], 2), ([16, 2, 3], 3), ([32, 32, 1], 32)] {
+        let post = prog(0, &gds_op(0x1a, 7, 0, 0, 0, 0), &[]);
+        let mut ex = cs_extract(&post, dims[0]);
+        ex.isa_preamble[1..].copy_from_slice(&dims);
+        let mut gds = init();
+        gds[idx] = 4096 - waves;
+        let (_, actual) = exec_gds_shader(translate(&ex).unwrap(), &gds, 1).unwrap();
+        assert_eq!(actual[idx] & TB_GWS_COUNTER_MASK, 0, "{dims:?}");
+        gds[idx] = actual[idx];
+        assert_eq!(actual, gds);
+    }
+
+    for value in [0u32, 4095, 4096, 4097, u32::MAX] {
+        let mut setup = vec![vop1(1, 20, LIT), value];
+        setup.extend_from_slice(&gds_op(0x19, 7, 0, 20, 0, 0));
+        setup.extend_from_slice(&gds_op(0x1b, 7, 0, 20, 0, 0));
+        let mut expected = init();
+        let (_, actual) = exec_gds_dispatch(&prog(0, &setup, &[]), &expected, 32, 1).unwrap();
+        expected[idx] = 2 * (value & 4095);
+        assert_eq!(actual, expected, "initialization and bulk post with {value:#x}");
+    }
+}
+
+#[test]
+fn ds_gws_waiting_wave_resumes_after_peer_posts() {
+    use tombox_xshader::gds_abi::TB_GWS_TABLE_DWORD;
+    use tombox_xshader::hlsl::translate_gws_single_group;
+
+    const RESOURCE: u32 = 7;
+    const SENTINEL: u32 = 0x51ab_1e7e;
+    // A missing count denotes a release-all on that resource.
+    for (post, waiter_arrives_late) in [
+        (None, false),
+        (Some((RESOURCE + 1, Some(1))), false),
+        (Some((RESOURCE, Some(1))), false),
+        (Some((RESOURCE, Some(5))), false),
+        (Some((RESOURCE, None)), false),
+        (Some((RESOURCE + 1, None)), false),
+        (Some((RESOURCE, None)), true),
+    ] {
+        let mut words = vec![sop1(3, 40, 126), vopc(0xd1, ic(31), 0)];
+        let branch = words.len();
+        words.push(0);
+        // Wave 0 waits first, then it can write the marker from logical lane 0.
+        words.push(sop1(3, 126, 40));
+        if waiter_arrives_late {
+            words.extend_from_slice(&[0xbf80_0000; 4]);
+        }
+        words.extend_from_slice(&gds_op(0x1c, RESOURCE, 0, 0, 0, 0));
+        words.extend_from_slice(&smem(2, 8, 4, 0, SNULL));
+        words.extend_from_slice(&[vop1(1, 10, LIT), SENTINEL, vopc(0xd2, ic(0), 0)]);
+        words.extend_from_slice(&[0xe070_1000, 0x8002_0a01]);
+        words.push(S_ENDPGM);
+        // Wave 1 follows the forward branch. It takes several rounds to post.
+        words[branch] = 0xbf89_0000 | (words.len() - branch - 1) as u32;
+        words.extend_from_slice(&[sop1(3, 126, 40), 0xbf80_0000, 0xbf80_0000]);
+        if let Some((resource, count)) = post {
+            match count {
+                None => words.extend_from_slice(&gds_op(0x18, resource, 0, 0, 0, 0)),
+                Some(1) => words.extend_from_slice(&gds_op(0x1a, resource, 0, 0, 0, 0)),
+                Some(count) => {
+                    words.push(vop1(1, 20, ic(count as i32)));
+                    words.extend_from_slice(&gds_op(0x1b, resource, 0, 20, 0, 0));
+                }
+            }
+        }
+        words.push(S_ENDPGM);
+        let ex = cs_extract(&words, 64);
+        assert!(translate(&ex).is_err());
+        assert!(translate_gws_single_group(&ex, [2, 1, 1]).is_err());
+        let translated = translate_gws_single_group(&ex, [1, 1, 1]).unwrap();
+        let mut gds = init();
+        let counter = (TB_GWS_TABLE_DWORD + RESOURCE) as usize;
+        gds[counter] = 0;
+        gds[counter + 1] = 0;
+        let (output, actual) = exec_gds_shader(translated, &gds, 1).unwrap();
+        let woke = !waiter_arrives_late && post.is_some_and(|(resource, _)| resource == RESOURCE);
+        assert_eq!(output[0], if woke { SENTINEL } else { 0 }, "post {post:?}, late={waiter_arrives_late}");
+        assert!(output[1..].iter().all(|&value| value == 0));
+        if let Some((resource, Some(count))) = post {
+            let slot = (TB_GWS_TABLE_DWORD + resource) as usize;
+            gds[slot] = count - u32::from(woke);
+        }
+        assert_eq!(actual, gds, "a matching post must be consumed exactly once");
+    }
+}
+
+#[test]
+fn ds_gws_posts_wake_waiters_across_guest_workgroups() {
+    use tombox_xshader::gds_abi::TB_GWS_TABLE_DWORD;
+    use tombox_xshader::hlsl::translate_gws_fused_dispatch;
+
+    const RESOURCE: u32 = 7;
+    for (op, expected) in [
+        (0x1a, [0, 0x51ab_1e7e]),
+        (0x18, [0x51ab_1e7e, 0x51ab_1e7e]),
+    ] {
+        // s5 is the guest group ID with this fixture's one root parameter.
+        let mut words = vec![sop1(3, 40, 126), vop1(1, 21, 5), vopc(0xd2, ic(2), 21)];
+        let producer = words.len();
+        words.push(0);
+        words.extend_from_slice(&[sop1(3, 126, 40), vopc(0xd2, ic(1), 21)]);
+        let early_waiter = words.len();
+        words.push(0);
+        words.extend_from_slice(&[0xbf80_0000; 2]);
+        words[early_waiter] = 0xbf89_0000 | (words.len() - early_waiter - 1) as u32;
+        words.push(sop1(3, 126, 40));
+        // Group 1 queues before group 0, even though its index is larger.
+        words.extend_from_slice(&gds_op(0x1c, RESOURCE, 0, 0, 0, 0));
+        words.extend_from_slice(&smem(2, 8, 4, 0, SNULL));
+        words.extend_from_slice(&[
+            vop2(0x1a, 1, ic(2), 21),
+            vop1(1, 10, LIT),
+            0x51ab_1e7e,
+            vopc(0xd2, ic(0), 0),
+            0xe070_1000,
+            0x8002_0a01,
+            S_ENDPGM,
+        ]);
+        words[producer] = 0xbf89_0000 | (words.len() - producer - 1) as u32;
+        words.push(sop1(3, 126, 40));
+        words.extend_from_slice(&[0xbf80_0000; 8]);
+        words.extend_from_slice(&gds_op(op, RESOURCE, 0, 0, 0, 0));
+        words.push(S_ENDPGM);
+
+        let ex = cs_extract(&words, 32);
+        assert!(translate(&ex).is_err());
+        assert!(translate_gws_fused_dispatch(&ex, [5, 1, 1]).is_err());
+        let t = translate_gws_fused_dispatch(&ex, [3, 1, 1]).unwrap();
+        let mut gds = init();
+        gds[(TB_GWS_TABLE_DWORD + RESOURCE) as usize] = 0;
+        let (output, actual) = exec_gds_shader(t, &gds, 1).unwrap();
+        assert_eq!(output[..2], expected, "semaphore op {op:#x}");
+        assert!(output[2..].iter().all(|&value| value == 0));
+        assert_eq!(actual, gds);
+    }
+}
+
+#[test]
+fn ds_gws_phased_dispatch_wakes_across_physical_groups() {
+    use tombox_xshader::gds_abi::{TB_GWS_TABLE_DWORD, tb_gds_byte_offset};
+    use tombox_xshader::hlsl::translate_gws_phased_dispatch;
+
+    const RESOURCE: u32 = 7;
+    const SENTINEL: u32 = 0x51ab_1e7e;
+    // Each group has its own SV_GroupID. Group zero queues first, group one
+    // posts later, and the output needs a VGPR value saved before the wait.
+    let mut words = vec![sop1(3, 40, 126), vop1(1, 21, 5), vopc(0xd2, ic(1), 21)];
+    let branch = words.len();
+    words.push(0);
+    words.extend_from_slice(&[sop1(3, 126, 40), vop1(1, 10, LIT), SENTINEL]);
+    words.extend_from_slice(&gds_op(0x1c, RESOURCE, 0, 0, 0, 0));
+    words.extend_from_slice(&smem(2, 8, 4, 0, SNULL));
+    words.extend_from_slice(&[vop2(0x1a, 1, ic(2), 21), vopc(0xd2, ic(0), 0)]);
+    words.extend_from_slice(&[0xe070_1000, 0x8002_0a01, S_ENDPGM]);
+    words[branch] = 0xbf89_0000 | (words.len() - branch - 1) as u32;
+    words.push(sop1(3, 126, 40));
+    words.extend_from_slice(&[0xbf80_0000; 6]);
+    let post = words.len();
+    words.extend_from_slice(&gds_op(0x1a, RESOURCE, 0, 0, 0, 0));
+    words.push(S_ENDPGM);
+
+    let ex = cs_extract(&words, 32);
+    assert!(translate_gws_phased_dispatch(&ex, [9, 1, 1]).is_err());
+    let mut gds = init();
+    gds[(TB_GWS_TABLE_DWORD + RESOURCE) as usize] = 0;
+
+    let two = translate_gws_phased_dispatch(&ex, [2, 1, 1]).unwrap();
+    let (output, actual, scratch) = execute(&two.shader, &gds, 2, Some((&two, 8))).unwrap();
+    assert!(output.iter().all(|&value| value == 0), "group zero wrote before the post");
+    assert_eq!(scratch[1 + 2], tb_gds_byte_offset(TB_GWS_TABLE_DWORD + RESOURCE));
+    assert_eq!(actual, gds);
+    let (output, actual, scratch) = execute(&two.shader, &gds, 2, Some((&two, two.max_rounds))).unwrap();
+    assert_eq!(output[0], SENTINEL);
+    assert!(output[1..].iter().all(|&value| value == 0));
+    assert_eq!(scratch[1 + 2], 0);
+    assert_eq!(actual, gds);
+
+    // Beyond the fused path's limit. Only the oldest of the four waiters wakes.
+    let five = translate_gws_phased_dispatch(&ex, [5, 1, 1]).unwrap();
+    let (output, actual, scratch) = execute(&five.shader, &gds, 5, Some((&five, five.max_rounds))).unwrap();
+    assert_eq!(output[0], SENTINEL);
+    assert!(output[1..].iter().all(|&value| value == 0));
+    let pending_addr = tb_gds_byte_offset(TB_GWS_TABLE_DWORD + RESOURCE);
+    assert_eq!(&scratch[1 + 5..1 + 2 * 5], &[0, 0, pending_addr, pending_addr, pending_addr]);
+    assert_eq!(actual, gds);
+
+    words[post..post + 2].copy_from_slice(&gds_op(0x18, RESOURCE, 0, 0, 0, 0));
+    let release = translate_gws_phased_dispatch(&cs_extract(&words, 32), [5, 1, 1]).unwrap();
+    let (output, actual, scratch) = execute(&release.shader, &gds, 5, Some((&release, release.max_rounds))).unwrap();
+    assert_eq!(&output[..5], &[SENTINEL, 0, SENTINEL, SENTINEL, SENTINEL]);
+    assert!(output[5..].iter().all(|&value| value == 0));
+    assert_eq!(&scratch[1 + 5..1 + 2 * 5], &[0; 5]);
+    assert_eq!(actual, gds, "release-all must not deposit credits");
 }

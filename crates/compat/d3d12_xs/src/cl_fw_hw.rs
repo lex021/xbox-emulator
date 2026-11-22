@@ -106,6 +106,7 @@ fn hw_execute_indirect_bundle_honours_and_restores_a_predicate_set_by_buffer_and
 }
 
 const X_RESET: usize = 10;
+const X_CLEAR_STATE: usize = 11;
 
 unsafe fn title_list_and_allocator(dev: usize) -> (*mut c_void, *mut c_void) {
     let mut a: *mut c_void = core::ptr::null_mut();
@@ -176,6 +177,27 @@ fn hw_reset_drops_the_predication_buffer_cursor() {
         call!(l, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (), dst.res, 0, src.res, 0, 8);
         finish(g, l, &dst, &out, 8);
         assert_eq!(core::ptr::read_volatile(out.cpu as *const u64), MARK, "an AdvancePredicationX after Reset re-armed the previous recording's predicate (buffer+8 = 0) and skipped the copy");
+    }
+}
+
+#[test]
+#[ignore = "needs a D3D12 device; run: cargo test -p d3d12_xs --lib hw_ -- --ignored --test-threads=1 (TOMBOX_HW_ADAPTER=warp for WARP)"]
+fn hw_clear_state_drops_the_predication_buffer_cursor() {
+    let g = gpu();
+    unsafe {
+        let pred = predicates(g, &[1, 0]);
+        let src = source(g, MARK);
+        let dst = buffer(g.dev, HEAP_DEFAULT, 256, 0, ST_COPY_DEST);
+        let out = buffer(g.dev, HEAP_READBACK, 256, 0, ST_COPY_DEST);
+        let l = title_list(g.dev);
+        set_buffer(l, Some(PredicationBufferDesc { va: pred.va, offset: 0 }));
+        assert!(crate::cl_fw::cursor(crate::list_split::origin_of(crate::cmdlist_wrap::unwrap(l))).is_some());
+        call!(l, X_CLEAR_STATE, (*mut c_void) -> (), core::ptr::null_mut());
+        assert_eq!(crate::cl_fw::cursor(crate::list_split::origin_of(crate::cmdlist_wrap::unwrap(l))), None, "ClearState must drop the cursor");
+        advance(l);
+        call!(l, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (), dst.res, 0, src.res, 0, 8);
+        finish(g, l, &dst, &out, 8);
+        assert_eq!(core::ptr::read_volatile(out.cpu as *const u64), MARK, "an AdvancePredicationX after ClearState re-armed the previous recording's predicate (buffer+8 = 0) and skipped the copy");
     }
 }
 

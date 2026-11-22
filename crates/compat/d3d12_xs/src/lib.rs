@@ -88,6 +88,8 @@ mod cl_ext;
 mod dbcount;
 mod cl_fw;
 mod gds;
+mod gws_dispatch;
+mod gws_scratch;
 pub mod centroid_bind;
 mod list_split;
 mod sys_ts;

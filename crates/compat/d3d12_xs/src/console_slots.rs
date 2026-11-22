@@ -213,7 +213,7 @@ unsafe extern "system" fn cl_dispatch_x(this: *mut c_void, x: u32, y: u32, z: u3
         record("d3d12_xs", "console_slots", &format!("DispatchX: Flags {flags:#x} contains invalid bits (console debug validation); dispatched as the release UMD does"));
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = unsafe { core::mem::transmute(pc_fn(this, PC_SLOT_DISPATCH)) };
-    unsafe { f(this, x, y, z) }
+    unsafe { crate::gws_dispatch::dispatch_with(this, x, y, z, f) }
 }
 
 #[repr(C)]

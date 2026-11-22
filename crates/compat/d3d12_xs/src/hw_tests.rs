@@ -393,6 +393,148 @@ fn hw_gds_round_trip_through_the_shader_binding() {
     }
 }
 
+fn gws_shader_fixture(opcode: u32, resource: u32) -> Vec<u8> {
+    // Synthetic Xbox compute container with one global semaphore instruction.
+    let isa = [
+        0xd580_0000u32, 0x03fe_0000, 0, // VOP3 nop, including the literal operand
+        0xd800_0000 | (opcode << 18) | (1 << 17) | resource, 0,
+        0xbf81_0000,
+    ];
+    let section = [16, 32, 1, 1].into_iter().chain(isa).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+    let mut fssm = vec![0u8; 0x100];
+    fssm[..4].copy_from_slice(b"FSSM");
+    fssm[0xc0..0xc4].copy_from_slice(&0x100u32.to_le_bytes());
+    fssm[0xc8..0xcc].copy_from_slice(&(section.len() as u32).to_le_bytes());
+    fssm.extend_from_slice(&section);
+    let mut dxil = vec![0u8; 24];
+    dxil[..4].copy_from_slice(&0x0005_0060u32.to_le_bytes());
+    dxil.extend_from_slice(b"XDAT");
+    dxil.extend_from_slice(&1u32.to_le_bytes());
+    dxil.extend_from_slice(&miniz_oxide::deflate::compress_to_vec_zlib(&fssm, 6));
+    let mut dxbc = vec![0u8; 44];
+    dxbc[..4].copy_from_slice(b"DXBC");
+    dxbc[20..24].copy_from_slice(&1u32.to_le_bytes());
+    dxbc[24..28].copy_from_slice(&(44 + dxil.len() as u32).to_le_bytes());
+    dxbc[28..32].copy_from_slice(&1u32.to_le_bytes());
+    dxbc[32..36].copy_from_slice(&36u32.to_le_bytes());
+    dxbc[36..40].copy_from_slice(b"DXIL");
+    dxbc[40..44].copy_from_slice(&(dxil.len() as u32).to_le_bytes());
+    dxbc.extend_from_slice(&dxil);
+    dxbc
+}
+
+#[test]
+#[ignore = "needs D3D12 and DXC; set TOMBOX_HW_ADAPTER=warp for WARP"]
+fn hw_gws_compute_pso_selects_dispatch_variant() {
+    const RESOURCE: u32 = 7;
+    let dxbc = gws_shader_fixture(0x1c, RESOURCE);
+    let post_shader = gws_shader_fixture(0x1a, RESOURCE);
+    let ex = tombox_xshader::extract(&dxbc).expect("Xbox fixture");
+    assert_eq!(ex.isa_preamble[1..], [32, 1, 1]);
+    assert!(tombox_xshader::hlsl::translate(&ex).is_err());
+    crate::shader_xlat::compile_gws(&ex, 2).expect("GWS variant must compile");
+
+    let g = gpu();
+    unsafe {
+        let no_op = "[numthreads(1, 1, 1)] void main() {}";
+        let root_hlsl = format!("[RootSignature(\"UAV(u0, space={})\")] {no_op}", tombox_xshader::gds_abi::TB_GDS_SPACE);
+        let dev = crate::device_wrap::wrap_device(g.dev as *mut c_void);
+        let phased = crate::gws_dispatch::phased_enabled();
+        let (rs, normal) = if phased {
+            let code = tombox_xshader::dxc::compile(&format!("[RootSignature(\"\")] {no_op}"), "cs_6_0").unwrap();
+            let mut rs = core::ptr::null_mut();
+            let hr = call!(dev, 16, (u32, *const u8, usize, *const Guid, *mut *mut c_void) -> i32, 0, code.as_ptr(), code.len(), &IID_ROOT_SIGNATURE, &mut rs);
+            assert!(hr >= 0 && !rs.is_null(), "wrapped root signature hr={hr:#010x}");
+            compute_pso(g.dev, no_op, Some(rs))
+        } else {
+            let (rs, normal) = compute_pso(g.dev, &root_hlsl, None);
+            crate::gds::note_root_signature(rs, 0);
+            (rs, normal)
+        };
+        let list = title_list(g.dev);
+        let mut desc = [0u8; 56];
+        desc[0..8].copy_from_slice(&(rs as u64).to_le_bytes());
+        desc[8..16].copy_from_slice(&(dxbc.as_ptr() as u64).to_le_bytes());
+        desc[16..24].copy_from_slice(&(dxbc.len() as u64).to_le_bytes());
+        let mut pso: *mut c_void = core::ptr::null_mut();
+        let hr = call!(dev, 11, (*const u8, *const Guid, *mut *mut c_void) -> i32, desc.as_ptr(), &IID_PSO, &mut pso);
+        assert!(hr >= 0 && !pso.is_null(), "GWS PSO creation hr={hr:#010x}");
+
+        desc[8..16].copy_from_slice(&(post_shader.as_ptr() as u64).to_le_bytes());
+        desc[16..24].copy_from_slice(&(post_shader.len() as u64).to_le_bytes());
+        let mut producer = core::ptr::null_mut();
+        let hr = call!(dev, 11, (*const u8, *const Guid, *mut *mut c_void) -> i32, desc.as_ptr(), &IID_PSO, &mut producer);
+        assert!(hr >= 0 && !producer.is_null(), "GWS producer PSO creation hr={hr:#010x}");
+
+        let src = buffer(g.dev, HEAP_UPLOAD, 256, 0, ST_GENERIC_READ);
+        core::ptr::write_volatile(src.cpu as *mut u32, 0);
+        let dst = buffer(g.dev, HEAP_DEFAULT, 256, 0, ST_COPY_DEST);
+        let out = buffer(g.dev, HEAP_READBACK, 256, 0, ST_COPY_DEST);
+        let raw = crate::cmdlist_wrap::unwrap(list);
+        let counter = tombox_xshader::gds_abi::TB_GWS_TABLE_DWORD + RESOURCE;
+        // The emulated semaphore table is outside the title-visible GDS range.
+        crate::gds::copy(raw, true, counter, 1, src.va, "seed GWS test");
+        call!(list, X_SET_COMPUTE_ROOT_SIGNATURE, (*mut c_void) -> (), rs);
+        // Credits must survive a guest dispatch boundary and a compute PSO switch.
+        call!(list, X_SET_PSO, (*mut c_void) -> (), producer);
+        call!(list, X_DISPATCH, (u32, u32, u32) -> (), 12, 1, 1);
+        let uav_barrier = [2u64, 0, 0, 0];
+        call!(list, X_BARRIER, (u32, *const u64) -> (), 1, uav_barrier.as_ptr());
+        call!(list, X_SET_PSO, (*mut c_void) -> (), pso);
+        for groups in [[2, 1, 1], [3, 1, 1], [1, 1, 1], [2, 2, 1], [5, 1, 1], [0, 1, 1]] {
+            let [x, y, z] = groups;
+            if x == 3 {
+                call!(list, crate::console_slots::CL_DISPATCH_X, (u32, u32, u32, u32) -> (), x, y, z, 0);
+            } else {
+                call!(list, X_DISPATCH, (u32, u32, u32) -> (), x, y, z);
+            }
+            // No resource transition occurs between the two valid launches.
+            let mut barrier = [0u8; 32];
+            barrier[..4].copy_from_slice(&2u32.to_le_bytes());
+            call!(list, X_BARRIER, (u32, *const u8) -> (), 1, barrier.as_ptr());
+        }
+        call!(list, X_SET_PSO, (*mut c_void) -> (), normal);
+        call!(list, X_DISPATCH, (u32, u32, u32) -> (), 2, 1, 1);
+        crate::gds::copy(raw, false, counter, 1, dst.va, "read GWS test");
+        let mut barrier = [0u8; 32];
+        barrier[8..16].copy_from_slice(&(dst.res as u64).to_le_bytes());
+        barrier[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        barrier[20..24].copy_from_slice(&ST_COPY_DEST.to_le_bytes());
+        barrier[24..28].copy_from_slice(&ST_COPY_SOURCE.to_le_bytes());
+        call!(list, X_BARRIER, (u32, *const u8) -> (), 1, barrier.as_ptr());
+        call!(list, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (), out.res, 0, dst.res, 0, 4);
+        crate::fill::barrier_pub(raw, dst.res, ST_COPY_SOURCE, ST_COPY_DEST);
+        assert!(call!(list, X_CLOSE, () -> i32) >= 0);
+        let f = fence(g.dev);
+        submit(g.a, list, f, 1);
+        assert!(reached(f, 1, Duration::from_secs(5)));
+        let expected = 12 - 2 - 3 - if phased { 5 } else { 0 };
+        assert_eq!(rd(&out, 0), expected);
+        if phased {
+            // A second submission must start with zeroed checkpoints even though
+            // the command list and its scratch allocation are the same.
+            let scratch_alive = crate::gws_scratch::recording_probe(raw);
+            let gate = fence(g.dev);
+            assert!(call!(g.a, 15, (*mut c_void, u64) -> i32, gate, 1) >= 0);
+            submit(g.a, list, f, 2);
+            let mut alloc = core::ptr::null_mut();
+            assert!(call!(g.dev, 9, (u32, *const Guid, *mut *mut c_void) -> i32, 0, &IID_ALLOCATOR, &mut alloc) >= 0);
+            let reset_hr = call!(list, 10, (*mut c_void, *mut c_void) -> i32, alloc, core::ptr::null_mut());
+            let held_while_in_flight = scratch_alive();
+            assert!(call!(gate, 10, (u64) -> i32, 1) >= 0);
+            assert!(reset_hr >= 0);
+            assert!(held_while_in_flight);
+            assert!(reached(f, 2, Duration::from_secs(5)));
+            assert_eq!(rd(&out, 0), expected);
+            let start = Instant::now();
+            while scratch_alive() {
+                assert!(start.elapsed() < Duration::from_secs(5), "scratch survives completion and reset");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+}
+
 fn counter_window(t0: i64, t1: i64, qpf: i64) -> (u64, u64) {
     let hz = crate::sys_ts::system_counter_hz() as u128;
     let tol = hz / 500;

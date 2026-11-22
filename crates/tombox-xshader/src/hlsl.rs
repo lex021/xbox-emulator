@@ -999,13 +999,59 @@ pub fn translate_linked(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>) -> R
         Stage::Vertex | Stage::Geometry | Stage::Mesh => feeds_ps.cloned().unwrap_or_default(),
         _ => InputInterp::default(),
     };
-    match translate_with(ex, &out_interp, None, BTreeSet::new()) {
-        Err(e) if disassemble(&ex.isa).iter().take(16).any(|i| i.mnemonic == "s_swappc_b64") => translate_with(ex, &out_interp, Some(8), BTreeSet::new()).map_err(|e2| if e2.contains("not a buffer descriptor") || e2.contains("not a root table") { e } else { e2 }),
+    match translate_with(ex, &out_interp, None, BTreeSet::new(), None) {
+        Err(e) if disassemble(&ex.isa).iter().take(16).any(|i| i.mnemonic == "s_swappc_b64") => translate_with(ex, &out_interp, Some(8), BTreeSet::new(), None).map_err(|e2| if e2.contains("not a buffer descriptor") || e2.contains("not a root table") { e } else { e2 }),
         r => r,
     }
 }
 
-fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_override: Option<usize>, uav_force: BTreeSet<u32>) -> Result<Translated, String> {
+/// Translate the cooperative GWS subset. The resulting shader must be dispatched
+/// as exactly one workgroup. General pipeline translation uses `translate`.
+pub fn translate_gws_single_group(ex: &ShaderExtract, dispatch_groups: [u32; 3]) -> Result<Translated, String> {
+    if dispatch_groups != [1, 1, 1] {
+        return Err("cooperative GWS requires a single-workgroup dispatch".into());
+    }
+    translate_gws_fused_dispatch(ex, dispatch_groups)
+}
+
+/// Translate up to four X groups as a single host group, preserving guest group
+/// and thread IDs. The caller must issue exactly one host group.
+pub fn translate_gws_fused_dispatch(ex: &ShaderExtract, guest_groups: [u32; 3]) -> Result<Translated, String> {
+    match guest_groups {
+        [x @ 1..=4, 1, 1] => translate_with(ex, &InputInterp::default(), None, BTreeSet::new(), Some(gds::Mode::Fused(x))),
+        _ => Err("cooperative GWS requires 1–4 workgroups on the X axis".into()),
+    }
+}
+
+/// Bounded GWS execution across distinct D3D12 workgroups. Allocate a private, zeroed
+/// scratch UAV for each guest dispatch. In each round, set the control constant to
+/// each X group index in order, dispatch `groups`, and record a global UAV barrier
+/// after each phase. The same shader and scratch buffer are used for every phase.
+pub struct PhasedGws {
+    pub shader: Translated,
+    pub groups: [u32; 3],
+    pub scratch_bytes: u32,
+    pub max_rounds: u32,
+}
+
+pub fn translate_gws_phased_dispatch(ex: &ShaderExtract, groups: [u32; 3]) -> Result<PhasedGws, String> {
+    let [x @ 2..=8, 1, 1] = groups else {
+        return Err("phased GWS requires 2–8 workgroups on the X axis".into());
+    };
+    let instructions = disassemble(&ex.isa);
+    if instructions.len() > 64 {
+        return Err("phased GWS supports up to 64 instructions".into());
+    }
+    let waits = instructions.iter().filter(|i| i.mnemonic == "ds_gws_sema_p").count() as u32;
+    Ok(PhasedGws {
+        shader: translate_with(ex, &InputInterp::default(), None, BTreeSet::new(), Some(gds::Mode::Phased(x)))?,
+        groups,
+        scratch_bytes: gds::scratch_bytes(x),
+        max_rounds: (instructions.len() as u32 + waits) * x + 1,
+    })
+}
+
+fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_override: Option<usize>, uav_force: BTreeSet<u32>, cooperative_gws: Option<gds::Mode>) -> Result<Translated, String> {
     let (profile, is_ps) = match ex.stage {
         Stage::Vertex => ("vs_5_0", false),
         Stage::Pixel => ("ps_5_0", true),
@@ -1120,7 +1166,7 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
     if !clash.is_empty() {
         let mut force = em.uav_force.clone();
         force.extend(clash);
-        return translate_with(ex, out_interp, user_base_override, force);
+        return translate_with(ex, out_interp, user_base_override, force, cooperative_gws);
     }
     if is_ps {
         em.find_export_epilogs();
@@ -1128,8 +1174,12 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
     em.infer_tbuf_types();
     let live_in = em.live_in();
     em.live = live_in.clone();
-    em.emit_body(is_ps)?;
-    let mut hlsl = em.finish(is_ps)?;
+    if let Some(mode) = cooperative_gws {
+        em.emit_cooperative_gws(mode)?;
+    } else {
+        em.emit_body(is_ps)?;
+    }
+    let mut hlsl = em.finish(is_ps, cooperative_gws)?;
     hlsl.insert_str(0, &format!("// entry-live registers (read before written): {}
 ", live_in.join(" ")));
     // ps_5_0 forces UAV slots to start after the render-target outputs (FXC X4509);
@@ -6238,7 +6288,7 @@ impl<'a> Emitter<'a> {
         out
     }
 
-    fn finish(&mut self, is_ps: bool) -> Result<String, String> {
+    fn finish(&mut self, is_ps: bool, cooperative_gws: Option<gds::Mode>) -> Result<String, String> {
         let dg_init = self.dg_sgpr_init();
         let ex = self.ex;
         let mut h = String::new();
@@ -6382,6 +6432,21 @@ impl<'a> Emitter<'a> {
         if let Some(x) = self.xlane_header()? {
             let _ = writeln!(h, "{x}");
         }
+        if self.body.contains("tb_gws_first") {
+            let _ = writeln!(h, "groupshared uint tb_gws_first;");
+        }
+        if self.body.contains("tb_gws_counter_first") {
+            let [_, x, y, z] = ex.isa_preamble;
+            let _ = writeln!(h, "groupshared uint tb_gws_counter_first[{}];", (x * y * z).div_ceil(32));
+        }
+        if let Some(mode) = cooperative_gws {
+            let waves = ex.isa_preamble[1] * mode.groups() / 32;
+            let _ = writeln!(h, "#define TB_GWS_WAVES {waves}u");
+            h.push_str(gds::COOPERATIVE_STATE);
+            if mode.phased() {
+                let _ = writeln!(h, "{}\n{}", crate::gds_abi::TB_GWS_SCRATCH_HLSL_DECL, crate::gds_abi::TB_GWS_CONTROL_HLSL_DECL);
+            }
+        }
         if let Some(x) = gds::gds_header(&self.body) {
             let _ = writeln!(h, "{x}");
         }
@@ -6405,7 +6470,12 @@ impl<'a> Emitter<'a> {
             let (tx, ty_, tz) = (p[1].max(1), p[2].max(1), p[3].max(1));
             let nparams = ex.root_sig.as_ref().map(|r| r.params.len()).unwrap_or(4);
             let g = self.cs_tgid_base(nparams);
-            let _ = writeln!(h, "[numthreads({tx}, {ty_}, {tz})]
+            let fused_groups = match cooperative_gws {
+                Some(gds::Mode::Fused(groups)) => groups,
+                _ => 1,
+            };
+            let host_x = tx * fused_groups;
+            let _ = writeln!(h, "[numthreads({host_x}, {ty_}, {tz})]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             let _ = writeln!(h, "    uint exec_lo = 1u, exec_hi = 0u, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
             for r in ["v0", "v1", "v2"] {
@@ -6415,10 +6485,19 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
                 self.regs.insert(format!("s{}", g + k));
             }
             let _ = writeln!(h, "{}", self.reg_decls());
-            let _ = writeln!(h, "    v0 = gtid.x; v1 = gtid.y; v2 = gtid.z;");
-            let _ = writeln!(h, "    s{} = gid.x; s{} = gid.y; s{} = gid.z;", g, g + 1, g + 2);
+            if fused_groups > 1 {
+                let _ = writeln!(h, "    v0 = gtid.x % {tx}u; v1 = 0u; v2 = 0u;");
+                let _ = writeln!(h, "    s{g} = gtid.x / {tx}u; s{} = 0u; s{} = 0u;", g + 1, g + 2);
+            } else {
+                let _ = writeln!(h, "    v0 = gtid.x; v1 = gtid.y; v2 = gtid.z;");
+                let _ = writeln!(h, "    s{} = gid.x; s{} = gid.y; s{} = gid.z;", g, g + 1, g + 2);
+            }
             h.push_str(&dg_init);
-            h.push_str(&self.body);
+            if let Some(gds::Mode::Phased(groups)) = cooperative_gws {
+                h.push_str(&self.checkpoint_phased_gws(groups)?);
+            } else {
+                h.push_str(&self.body);
+            }
             h.push_str("}
 ");
             return Ok(h);

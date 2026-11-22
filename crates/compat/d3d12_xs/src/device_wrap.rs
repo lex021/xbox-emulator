@@ -265,6 +265,7 @@ unsafe extern "system" fn create_command_list_x(
         unsafe { core::mem::transmute(*real_vtbl(real).add(12)) };
     let dma = !riid.is_null() && unsafe { *riid == crate::dma_list::IID_XBOX_DMA_COMMAND_LIST };
     let pc_riid = if dma { &crate::dma_list::IID_GRAPHICS_COMMAND_LIST as *const Guid } else { riid };
+    let init_state = if dma { init_state } else { crate::pso_async::swap(init_state) };
     let hr = unsafe { f(real, node_mask, list_type, alloc, init_state, pc_riid, ppv) };
     if hr == S_OK && !ppv.is_null() {
         // Hand the title a shim object (Xbox vtable layout + inert inline-buffer fields)
@@ -273,7 +274,10 @@ unsafe extern "system" fn create_command_list_x(
             *ppv = if dma {
                 crate::dma_list::wrap(*ppv)
             } else {
-                crate::cmdlist_wrap::wrap_for_driver(*ppv, (*this).debug_umd)
+                let list = *ppv;
+                let shim = crate::cmdlist_wrap::wrap_for_driver(list, (*this).debug_umd);
+                crate::cl2_state::note_initial_pso(list, init_state);
+                shim
             };
         }
     }
@@ -1066,21 +1070,42 @@ unsafe extern "system" fn real_create_root_signature(real: *mut c_void, mask: u3
     let f: unsafe extern "system" fn(*mut c_void, u32, *const u8, usize, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(real_orig(16)) };
     let stripped = unsafe { crate::rs_xbox::pc_blob_raw(blob, len) };
     let (blob, len) = stripped.as_ref().map_or((blob, len), |b| (b.as_ptr(), b.len()));
-    let mut gds = unsafe { crate::gds::patch_root_signature(blob, len) };
+    let phased = if crate::gws_dispatch::phased_enabled() {
+        unsafe { crate::gds::patch_root_signature_with_gws(blob, len) }
+    } else {
+        None
+    };
+    let mut phased_root = phased.is_some();
+    let mut gds = phased.or_else(|| unsafe { crate::gds::patch_root_signature(blob, len) });
     let (gb, gl) = gds.as_ref().map_or((blob, len), |(b, _)| (b.as_ptr(), b.len()));
-    let cen = unsafe { crate::centroid_bind::create(gb, gl, &|b, l| f(real, mask, b, l, riid, ppv), ppv) };
+    let mut cen = unsafe { crate::centroid_bind::create(gb, gl, &|b, l| f(real, mask, b, l, riid, ppv), ppv) };
     let mut hr = match (&cen, &gds) {
         (Some(hr), _) => *hr,
         (None, Some((b, _))) => unsafe { f(real, mask, b.as_ptr(), b.len(), riid, ppv) },
         (None, None) => unsafe { f(real, mask, blob, len, riid, ppv) },
     };
+    if hr < 0 && phased_root {
+        phased_root = false;
+        gds = unsafe { crate::gds::patch_root_signature(blob, len) };
+        let (gb, gl) = gds.as_ref().map_or((blob, len), |(b, _)| (b.as_ptr(), b.len()));
+        cen = unsafe { crate::centroid_bind::create(gb, gl, &|b, l| f(real, mask, b, l, riid, ppv), ppv) };
+        hr = match cen {
+            Some(hr) => hr,
+            None => unsafe { f(real, mask, gb, gl, riid, ppv) },
+        };
+    }
     if hr < 0 && gds.is_some() {
         record("d3d12_xs", "gds", &format!("root signature with the GDS parameter rejected hr={hr:#010x}; created without GDS"));
         gds = None;
         hr = unsafe { f(real, mask, blob, len, riid, ppv) };
     }
     if hr >= 0 && !ppv.is_null() {
-        if let Some((_, idx)) = gds { crate::gds::note_root_signature(unsafe { *ppv }, idx) }
+        if let Some((_, idx)) = gds {
+            crate::gds::note_root_signature(unsafe { *ppv }, idx);
+            if phased_root {
+                unsafe { crate::gws_dispatch::note_phased_root(*ppv, idx) };
+            }
+        }
         if cen.is_none() { crate::centroid_bind::forget(unsafe { *ppv }) }
     }
     if hr >= 0 && !ppv.is_null() && !blob.is_null() && len != 0 {
@@ -1173,13 +1198,18 @@ unsafe fn patch_real_device(real: *mut c_void) {
             record("d3d12_xs", "bindtrace", "could not unprotect the device method table - descriptor trace disabled");
             return;
         }
-        for (slot, f) in hooks {
+        let trace = crate::rtcap::enabled();
+        for (slot, f) in hooks.into_iter().filter(|(slot, _)| trace || *slot == 16) {
             REAL_ORIG[slot].store(*vt.add(slot), Ordering::Relaxed);
             *vt.add(slot) = f;
         }
         let mut tmp = 0u32;
         VirtualProtect(vt.add(16) as *mut c_void, 9 * 8, old, &mut tmp);
-        record("d3d12_xs", "bindtrace", "descriptor hooks installed on the real device method table");
+        record("d3d12_xs", "bindtrace", if trace {
+            "root signature and descriptor hooks installed on the real device method table"
+        } else {
+            "root signature hook installed for phased GWS"
+        });
     });
 }
 
@@ -1429,9 +1459,14 @@ unsafe extern "system" fn create_compute_pso_sync(
     }
     let p = u64::from_le_bytes(desc[8..16].try_into().unwrap()) as *const u8;
     let n = u64::from_le_bytes(desc[16..24].try_into().unwrap()) as usize;
+    let f: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(*real_vtbl(real).add(11)) }; // PC CreateComputePipelineState
     let code = match unsafe { crate::shader_xlat::translate(p, n) } {
         Ok(c) => c,
         Err(e) => {
+            if let Some(hr) = unsafe { crate::gws_dispatch::try_create(f, real, &desc, p, n, riid, ppv) } {
+                return hr;
+            }
             if FAIL.fetch_add(1, Ordering::Relaxed) < 6 {
                 record("d3d12_xs", "CreateComputePSO_X",
                     &format!("untranslatable compute shader -> E_FAIL ({})", e.lines().next().unwrap_or("")));
@@ -1441,8 +1476,6 @@ unsafe extern "system" fn create_compute_pso_sync(
     };
     desc[8..16].copy_from_slice(&(code.as_ptr() as u64).to_le_bytes());
     desc[16..24].copy_from_slice(&(code.len() as u64).to_le_bytes());
-    let f: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 =
-        unsafe { core::mem::transmute(*real_vtbl(real).add(11)) }; // PC CreateComputePipelineState
     let hr = unsafe { f(real, desc.as_ptr(), riid, ppv) };
     if hr == 0 && !ppv.is_null() && crate::rtcap::enabled() {
         crate::rtcap::note_compute_pso(unsafe { *ppv } as usize, code.as_ptr() as usize);
@@ -1807,7 +1840,7 @@ pub fn wrap_device(real: *mut c_void) -> *mut c_void {
 }
 
 pub fn wrap_device_for_driver(real: *mut c_void, driver: crate::process_debug::Driver) -> *mut c_void {
-    if crate::rtcap::enabled() && !real.is_null() {
+    if (crate::rtcap::enabled() || crate::gws_dispatch::phased_enabled()) && !real.is_null() {
         unsafe { patch_real_device(real) };
     }
     let debug_umd = driver == crate::process_debug::Driver::Debug;

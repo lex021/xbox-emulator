@@ -11,6 +11,13 @@ pub const TB_GDS_OA_FIELD_COUNTER_DWORD: u32 = 0;
 pub const TB_GDS_OA_FIELD_CNTL: u32 = 1;
 pub const TB_GDS_OA_FIELD_STAGE: u32 = 2;
 pub const TB_GDS_OA_FIELD_WAVE_RELEASE: u32 = 3;
+pub const TB_GWS_TABLE_DWORD: u32 = TB_GDS_OA_TABLE_DWORD + TB_GDS_OA_COUNTERS * TB_GDS_OA_STRIDE_DWORDS;
+pub const TB_GWS_RESOURCES: u32 = 64;
+// GFX103 GDS_GWS_RESOURCE.COUNTER occupies bits 1..=12. Our private
+// buffer stores the count starting at bit zero.
+pub const TB_GWS_COUNTER_MASK: u32 = (1 << 12) - 1;
+pub const TB_GWS_SCRATCH_HLSL_DECL: &str = "RWByteAddressBuffer tb_gws_scratch : register(u1, space4000002);";
+pub const TB_GWS_CONTROL_HLSL_DECL: &str = "cbuffer TbGwsControl : register(b0, space4000002) { uint tb_gws_selected; };";
 
 pub const fn tb_gds_byte_offset(title_dword: u32) -> u32 {
     title_dword * TB_GDS_BYTES_PER_TITLE_DWORD
@@ -29,7 +36,8 @@ mod tests {
         assert_eq!(tb_gds_byte_offset(5), 20);
         assert_eq!(tb_gds_oa_byte_offset(0, TB_GDS_OA_FIELD_COUNTER_DWORD), TB_GDS_TITLE_DWORDS * 4);
         let end = tb_gds_oa_byte_offset(TB_GDS_OA_COUNTERS, 0) as u64;
-        assert!(end <= TB_GDS_BYTES);
+        assert_eq!(end, tb_gds_byte_offset(TB_GWS_TABLE_DWORD) as u64);
+        assert!(tb_gds_byte_offset(TB_GWS_TABLE_DWORD + TB_GWS_RESOURCES) as u64 <= TB_GDS_BYTES);
         assert_eq!(tb_gds_oa_byte_offset(1, TB_GDS_OA_FIELD_WAVE_RELEASE) - tb_gds_oa_byte_offset(0, 0), 4 * (TB_GDS_OA_STRIDE_DWORDS + 3));
     }
 

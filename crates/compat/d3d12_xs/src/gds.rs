@@ -83,6 +83,14 @@ pub fn append_plan(params: &[u8], flags: u32) -> Option<(Vec<u8>, u32)> {
 }
 
 pub unsafe fn patch_root_signature(blob: *const u8, len: usize) -> Option<(Vec<u8>, u32)> {
+    unsafe { patch_root_signature_inner(blob, len, false) }
+}
+
+pub unsafe fn patch_root_signature_with_gws(blob: *const u8, len: usize) -> Option<(Vec<u8>, u32)> {
+    unsafe { patch_root_signature_inner(blob, len, true) }
+}
+
+unsafe fn patch_root_signature_inner(blob: *const u8, len: usize, phased: bool) -> Option<(Vec<u8>, u32)> {
     if blob.is_null() || len == 0 {
         return None;
     }
@@ -104,10 +112,20 @@ pub unsafe fn patch_root_signature(blob: *const u8, len: usize) -> Option<(Vec<u
         let n = u32_at(&vd, 8) as usize;
         let pp = u64::from_le_bytes(vd[16..24].try_into().unwrap()) as *const u8;
         let params = if n == 0 || pp.is_null() { Vec::new() } else { unsafe { core::slice::from_raw_parts(pp, n * PARAM_SIZE) }.to_vec() };
-        match append_plan(&params, u32_at(&vd, 40)) {
-            Some((np, idx)) => {
+        match append_plan(&params, u32_at(&vd, 40)).filter(|(np, _)| !phased || root_cost(np) + 3 <= ROOT_DWORD_LIMIT) {
+            Some((mut np, idx)) => {
+                if phased {
+                    let mut scratch = gds_param();
+                    scratch[8..12].copy_from_slice(&1u32.to_le_bytes()); // u1 in the GDS space
+                    np.extend_from_slice(&scratch);
+                    let mut control = [0u8; PARAM_SIZE];
+                    control[..4].copy_from_slice(&PARAM_CONSTANTS.to_le_bytes());
+                    control[12..16].copy_from_slice(&TB_GDS_SPACE.to_le_bytes());
+                    control[16..20].copy_from_slice(&1u32.to_le_bytes()); // b0, one DWORD
+                    np.extend_from_slice(&control);
+                }
                 let mut nd = vd.clone();
-                nd[8..12].copy_from_slice(&((n + 1) as u32).to_le_bytes());
+                nd[8..12].copy_from_slice(&((np.len() / PARAM_SIZE) as u32).to_le_bytes());
                 nd[16..24].copy_from_slice(&(np.as_ptr() as u64).to_le_bytes());
                 let ser: unsafe extern "system" fn(*const u8, *mut *mut c_void, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(ser) };
                 let (mut b, mut e): (*mut c_void, *mut c_void) = (core::ptr::null_mut(), core::ptr::null_mut());
@@ -127,7 +145,7 @@ pub unsafe fn patch_root_signature(blob: *const u8, len: usize) -> Option<(Vec<u
                 }
             }
             None => {
-                if once(8) {
+                if !phased && once(8) {
                     record("d3d12_xs", "gds", &format!("root signature uses {} DWORDs (or is local); no room for the 2-DWORD GDS root UAV", root_cost(&params)));
                 }
             }
@@ -142,7 +160,7 @@ pub fn note_root_signature(rs: *mut c_void, idx: u32) {
     ROOTS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(rs as usize, idx);
 }
 
-fn root_index(rs: *mut c_void) -> Option<u32> {
+pub(crate) fn root_index(rs: *mut c_void) -> Option<u32> {
     ROOTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&(rs as usize)).copied())
 }
 
@@ -151,36 +169,40 @@ unsafe fn buffer(list: *mut c_void) -> Option<(usize, u64)> {
     if let Some(b) = *g {
         return Some(b);
     }
+    let b = unsafe { create_buffer(list, TB_GDS_BYTES, 1, 4, STATE_COMMON) }?;
+    record("d3d12_xs", "gds", &format!("GDS emulated as a {TB_GDS_BYTES:#x}-byte device UAV buffer {:#x} va={:#x} (u{TB_GDS_REGISTER}, space{TB_GDS_SPACE})", b.0, b.1));
+    *g = Some(b);
+    Some(b)
+}
+
+pub(crate) unsafe fn create_buffer(list: *mut c_void, bytes: u64, heap_type: u32, flags: u32, state: u32) -> Option<(usize, u64)> {
     let get: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(list, 7)) };
     let mut dev: *mut c_void = core::ptr::null_mut();
     if unsafe { get(list, &IID_DEVICE, &mut dev) } < 0 || dev.is_null() {
         return None;
     }
-    let heap: [u32; 5] = [1, 0, 0, 1, 1];
+    let heap: [u32; 5] = [heap_type, 0, 0, 1, 1];
     let mut desc = [0u8; 56];
     desc[0..4].copy_from_slice(&1u32.to_le_bytes());
-    desc[0x10..0x18].copy_from_slice(&TB_GDS_BYTES.to_le_bytes());
+    desc[0x10..0x18].copy_from_slice(&bytes.to_le_bytes());
     desc[0x18..0x1c].copy_from_slice(&1u32.to_le_bytes());
     desc[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes());
     desc[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes());
     desc[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
     desc[0x2c..0x30].copy_from_slice(&1u32.to_le_bytes());
-    desc[0x30..0x34].copy_from_slice(&4u32.to_le_bytes());
+    desc[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
     let create: unsafe extern "system" fn(*mut c_void, *const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(vslot(dev, DEV_CREATE_COMMITTED)) };
     let mut res: *mut c_void = core::ptr::null_mut();
-    let hr = unsafe { create(dev, heap.as_ptr(), 0, desc.as_ptr(), STATE_COMMON, core::ptr::null(), &IID_RESOURCE, &mut res) };
+    let hr = unsafe { create(dev, heap.as_ptr(), 0, desc.as_ptr(), state, core::ptr::null(), &IID_RESOURCE, &mut res) };
     let rel: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(vslot(dev, 2)) };
     unsafe { rel(dev) };
     if hr < 0 || res.is_null() {
-        record("d3d12_xs", "gds", &format!("GDS buffer ({TB_GDS_BYTES:#x} bytes) create FAILED hr={hr:#010x}"));
+        record("d3d12_xs", "gds", &format!("buffer ({bytes:#x} bytes) create FAILED hr={hr:#010x}"));
         return None;
     }
     let va: unsafe extern "system" fn(*mut c_void) -> u64 = unsafe { core::mem::transmute(vslot(res, RES_GET_GPU_VA)) };
-    let b = (res as usize, unsafe { va(res) });
-    record("d3d12_xs", "gds", &format!("GDS emulated as a {TB_GDS_BYTES:#x}-byte device UAV buffer {:#x} va={:#x} (u{TB_GDS_REGISTER}, space{TB_GDS_SPACE})", b.0, b.1));
-    *g = Some(b);
-    Some(b)
+    Some((res as usize, unsafe { va(res) }))
 }
 
 #[cfg(test)]

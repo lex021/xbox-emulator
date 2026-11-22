@@ -302,6 +302,28 @@ pub unsafe fn translate(ptr: *const u8, len: usize) -> Cached {
     translate_for_targets(ptr, len, [0; 8], &no_link())
 }
 
+/// A variant is compiled with the same bindings and numeric options as the normal runtime path.
+pub(crate) fn compile_gws(ex: &tombox_xshader::ShaderExtract, x: u32) -> Result<Vec<u8>, String> {
+    compile_gws_variant(tombox_xshader::hlsl::translate_gws_fused_dispatch(ex, [x, 1, 1])?)
+}
+
+pub(crate) fn compile_phased_gws(ex: &tombox_xshader::ShaderExtract, x: u32) -> Result<(Vec<u8>, [u32; 2]), String> {
+    let plan = tombox_xshader::hlsl::translate_gws_phased_dispatch(ex, [x, 1, 1])?;
+    Ok((compile_gws_variant(plan.shader)?, [plan.scratch_bytes, plan.max_rounds]))
+}
+
+fn compile_gws_variant(t: tombox_xshader::hlsl::Translated) -> Result<Vec<u8>, String> {
+    if crate::cbv_raw::enabled() {
+        return Err("cooperative GWS does not support Xbox One raw CBV bindings".into());
+    }
+    if let Some(why) = crate::mip_bind::Needs::of(&t).refusal().or_else(|| crate::global_bind::refusal(t.needs_global)) {
+        return Err(why);
+    }
+    let hlsl = tombox_xshader::runtime_hlsl::finalize(&t.hlsl, &[0; 8], loop_grad());
+    let profile = tombox_xshader::dxc::profile_for(t.profile);
+    Ok(tombox_xshader::shader_cache::compile_cached(&hlsl, &profile, fma_mode(), &[])?.code)
+}
+
 pub fn retranslate(blob: &Arc<Vec<u8>>, hash: u64, rtfmt: [u8; 8], link: &InputInterp) -> Result<Arc<Vec<u8>>, String> {
     let v = std::panic::catch_unwind(|| translate_uncached(blob, hash, &rtfmt, link)).unwrap_or_else(|_| Err("translator panicked".to_string()))?;
     let v = Arc::new(v);
