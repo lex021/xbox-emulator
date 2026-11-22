@@ -204,12 +204,16 @@ fn rd(p: *const u8, off: usize) -> u32 {
 }
 
 fn finish(name: &str, d: Option<Desc>, pp: *mut *mut c_void) -> i32 {
+    finish_with(name, d, pp, compute)
+}
+
+fn finish_with(name: &str, d: Option<Desc>, pp: *mut *mut c_void, lay: fn(&Desc) -> Option<layout::Layout>) -> i32 {
     static LOG: AtomicU32 = AtomicU32::new(0);
     let Some(d) = d else {
         log_limited(&LOG, 24, name, "descriptor rejected by validation -> E_INVALIDARG");
         return E_INVALIDARG;
     };
-    match compute(&d) {
+    match lay(&d) {
         Some(l) => {
             log_limited(&LOG, 24, name, &format!("dim={} {}x{}x{} mips={} fmt={} mode={} -> size={:#x} align={:#x}", d.dimension, d.width, d.height, d.depth_or_array, l.mips.len(), d.dxgi, d.mode, l.size, l.align));
             unsafe { *pp = computer::create(l) };
@@ -322,6 +326,9 @@ pub extern "system" fn XGCreateTextureComputerWithPitch(desc: *const u8, pitch: 
         return E_INVALIDARG;
     };
     d.pitch = pitch;
+    if rd(desc, 0x30) & 2 != 0 && d.samples > 1 && layout::is_depth_stencil_planar(d.dxgi) {
+        return finish_with("XGCreateTextureComputer", Some(d), pp, layout::compute_depth_msaa);
+    }
     finish("XGCreateTextureComputer", Some(d), pp)
 }
 

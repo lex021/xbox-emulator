@@ -1,6 +1,7 @@
 param(
   [switch]$DryRun,
   [switch]$SkipBuild,
+  [ValidateSet('release', 'dev-fast')][string]$Profile = 'release',
   [switch]$NoD3d12Debug,
   [string[]]$Only = @(),
   [int]$FortniteLobbySeconds = 900,
@@ -10,6 +11,8 @@ param(
   [int]$TerrariaSeconds = 600,
   [int]$MinecraftSeconds = 600,
   [int]$CaptureEvery = 60,
+  [string]$PadScript = '',
+  [string]$MinecraftGameArgs = '',
   [string]$CompatDir = 'D:\TomBox\tools\dev\compat',
   [string]$Root = 'D:\TomBox',
   [string]$Report = 'D:\TomBox\tools\dev\batch_report.md',
@@ -40,13 +43,19 @@ $Titles = @(
     Saved = @('D:\xbox-pc-port\emulator\run\Mount\FortniteGame\Saved') },
   [pscustomobject]@{ Slug = 'trackmania'; Name = 'Trackmania'; Script = 'run_xone.ps1'; Args = @{ Title = 'Trackmania'; Drive = 'T:' };
     LogDir = (Join-Path $env:TEMP 'tombox-trackmania'); Proc = 'GbxGame'; Seconds = $TrackmaniaSeconds; Kind = 'generic'; Xone = $true;
-    Exe = ''; Saved = @('D:\xbox-pc-port\emulator\run-xone\Trackmania') },
+    Exe = ''; Saved = @('D:\xbox-pc-port\emulator\run-xone\Trackmania');
+    PadScreens = @(
+      @{ Name = 'start'; Ref = (Join-Path $PSScriptRoot 'screens\trackmania_start.png'); X = 840; Y = 795; W = 250; H = 60; CapW = 1920; CapH = 1080; Min = 0.8 },
+      @{ Name = 'play'; Ref = (Join-Path $PSScriptRoot 'screens\trackmania_menu_play.png'); X = 250; Y = 262; W = 140; H = 50; CapW = 1920; CapH = 1080; Min = 0.8 },
+      @{ Name = 'solo'; Ref = (Join-Path $PSScriptRoot 'screens\trackmania_solo_training.png'); X = 195; Y = 630; W = 205; H = 42; CapW = 1920; CapH = 1080; Hi = 180; Min = 0.8 });
+    PadScript = "5:connect;#start+2:press a;#play+3:press a;#solo+3:press down;+2:press left;+2:press a;+6:press a;+4:press a;/init challenge 'Training - 01'/+25:press a;+3:press a;+2:down rt+a;+10:stick l 0.5 0 800;+6:stick l -0.5 0 800" },
   [pscustomobject]@{ Slug = 'xdefiant'; Name = 'XDefiant'; Script = 'run_xdefiant.ps1'; Args = @{ Drive = 'Z:' };
     LogDir = (Join-Path $env:TEMP 'tombox-xdefiant'); Proc = 'Rogue_scarlett_rtx'; Seconds = $XDefiantSeconds; Kind = 'generic'; Xone = $false;
     Exe = 'D:\xbox-pc-port\games\XDefiant\extracted\Mount\Rogue_scarlett_rtx.exe'; Saved = @('D:\xbox-pc-port\emulator\run-xdefiant') },
   [pscustomobject]@{ Slug = 'terraria'; Name = 'Terraria'; Script = 'run_xone.ps1'; Args = @{ Title = 'Terraria'; Drive = 'U:' };
     LogDir = (Join-Path $env:TEMP 'tombox-terraria'); Proc = 'Terraria'; Seconds = $TerrariaSeconds; Kind = 'generic'; Xone = $true;
-    Exe = ''; Saved = @('D:\xbox-pc-port\emulator\run-xone\Terraria') },
+    Exe = ''; Saved = @('D:\xbox-pc-port\emulator\run-xone\Terraria');
+    Screens = @(@{ Milestone = 'menu / lobby'; Label = 'menu version line'; Ref = (Join-Path $PSScriptRoot 'screens\terraria_menu_version.png'); X = 12; Y = 1034; W = 256; H = 36; CapW = 1920; CapH = 1080; Min = 0.8 }) },
   [pscustomobject]@{ Slug = 'minecraft'; Name = 'Minecraft Preview'; Script = 'run_minecraft.ps1'; Args = @{ Drive = 'M:' };
     LogDir = (Join-Path $env:TEMP 'tombox-minecraft'); Proc = 'Minecraft.Windows'; Seconds = $MinecraftSeconds; Kind = 'generic'; Xone = $false; DbgArgs = $true;
     Exe = 'D:\xbox-pc-port\games\Microsoft.MinecraftBeta_1.18.3064.0_neutral__8wekyb3d8bbwe_xs-PATCHED\Microsoft.MinecraftBeta_1.18.3064.0_neutral__8wekyb3d8bbwe_xs\Minecraft.Windows.exe'
@@ -338,7 +347,10 @@ function Invoke-FrameCapture($res, [uint32[]]$Pids, [double]$El, [string]$Tag) {
   if ($s.Verdict -eq 'hung') { $png = '' }
   $res.Frames.Add([pscustomobject]@{ T = [int]$El; Png = $png; W = $s.W; H = $s.H; Mean = [Math]::Round($s.Mean, 1); Std = [Math]::Round($s.Std, 1); Distinct = $s.Distinct; Drawn = $s.Drawn; Verdict = $s.Verdict; Method = $s.Method })
   Say ("  +{0:N0}s frame {1}x{2} mean {3:N1} std {4:N1} colours {5}: {6}" -f $El, $s.W, $s.H, $s.Mean, $s.Std, $s.Distinct, $s.Verdict) $(if ($s.Drawn) { 'Green' } else { 'Yellow' })
+  if ($s.Drawn) { Test-FrameScreens $res $png $El }
 }
+
+. (Join-Path $PSScriptRoot 'frame_sig.ps1')
 
 function Get-DumpRoot($t) {
   if (-not $t.Exe) { return '' }
@@ -412,6 +424,9 @@ function Set-BatchEnv {
   Remove-Item Env:TOMBOX_ALLOW_NETWORK, Env:TOMBOX_NET_LOCAL_PORT -ErrorAction SilentlyContinue
   $env:TOMBOX_NET_REDIRECT = '127.0.0.1'
   $env:TOMBOX_NET_BACKEND = 'builtin'
+  $env:TOMBOX_HOST_PAD = '0'
+  $env:TOMBOX_HOST_KBM = '0'
+  $env:TOMBOX_PRELAUNCH_UI = '0'
   $env:TOMBOX_FN_GAMESERVER = '127.0.0.1:7777'
   if ($DbgLayer) {
     $env:TOMBOX_D3D12_DEBUG = '1'
@@ -426,7 +441,9 @@ function Get-ArgList($t, [switch]$Dry) {
   $a = @('-NoProfile', '-File', (Join-Path $Root $t.Script))
   foreach ($k in $t.Args.Keys) { $a += "-$k"; $a += "$($t.Args[$k])" }
   if ($t.Xone) { $a += '-XoneTarget'; $a += (Join-Path $Root 'target\release') }
+  if ($Profile -ne 'release') { $a += '-Profile'; $a += $Profile }
   if (($t.Xone -or $t.DbgArgs) -and $DbgLayer) { $a += '-Agility'; $a += $Agility; $a += '-AgilityVersion'; $a += "$AgilityVersion"; $a += '-D3d12Debug' }
+  if ($t.Slug -eq 'minecraft' -and $MinecraftGameArgs) { $a += '-GameArgs'; $a += ('"' + $MinecraftGameArgs.Trim() + '"') }
   if ($Dry) { $a += '-DryRun' } else { $a += '-Seconds'; $a += "$($t.Seconds + 120)" }
   return $a
 }
@@ -452,7 +469,15 @@ try { $seen = New-Object System.Collections.Generic.List[string]; $r = [TbAudio]
 catch { $pre.Add("audio mute unavailable: $($_.Exception.Message) (titles would be audible; pass aborted)") }
 
 $build = 'skipped (-SkipBuild)'
-if (-not $SkipBuild) {
+if (-not $SkipBuild -and $Profile -eq 'dev-fast') {
+  Say 'quick.ps1 -NoStage (dev-fast incremental build of changed DLL crates)' 'Cyan'
+  $bl = Join-Path $RunRoot 'quick_build.txt'
+  & powershell.exe -NoProfile -File (Join-Path $Root 'tools\dev\quick.ps1') -NoStage *> $bl
+  $bcode = $LASTEXITCODE
+  $btxt = Get-Content $bl
+  $btxt | ForEach-Object { Say "  $_" 'DarkGray' }
+  $build = "dev-fast exit $bcode; " + (($btxt | Where-Object { $_ -match 'quick done|cargo exit|error' }) -join '; ')
+} elseif (-not $SkipBuild) {
   Say 'rebuild_release.ps1 (cargo build --release -j 6)' 'Cyan'
   $bl = Join-Path $RunRoot 'rebuild_release.txt'
   & powershell.exe -NoProfile -File (Join-Path $Root 'tools\dev\rebuild_release.ps1') *> $bl
@@ -511,7 +536,7 @@ foreach ($t in $Titles) {
   }
 
   foreach ($f in Get-SourceFiles $t.LogDir) { if ($f.Src -ne 'launcher') { Remove-Item -LiteralPath $f.Path -Force -ErrorAction SilentlyContinue } }
-  $lock = Join-Path $OutRoot 'GAME_LOCK'
+  $lock = 'D:\TomBox\tools\dev\batch_runs\GAME_LOCK'
   $lockWait = (Get-Date).AddMinutes(30)
   while ($true) {
     try { $fs = [IO.File]::Open($lock, 'CreateNew', 'Write', 'None'); $b = [Text.Encoding]::UTF8.GetBytes("batch_test $($t.Slug) $(Get-Date -Format s)"); $fs.Write($b, 0, $b.Length); $fs.Close(); break } catch {}
@@ -526,6 +551,23 @@ foreach ($t in $Titles) {
   $splashAt = $null
   $splashPresses = 0
   $splashDone = $false
+  $padQueue = New-Object System.Collections.ArrayList
+  $padOrdered = $false
+  $padText = if ($PadScript) { $PadScript } elseif ($t.PSObject.Properties['PadScript']) { $t.PadScript } else { '' }
+  if ($padText -and -not $PadScript) { $res.Notes.Add("PadScript: title default '$padText'") }
+  foreach ($e in ($padText -split ';')) {
+    if ($e -match '^\s*(\d+(?:\.\d+)?)\s*:\s*(.+?)\s*$') { [void]$padQueue.Add([pscustomobject]@{ At = [double]$Matches[1]; Cmd = $Matches[2]; Gate = ''; Rx = $null; Screen = ''; Delay = 0.0 }) }
+    elseif ($e -match '^\s*/(.+?)/\+?(\d+(?:\.\d+)?)\s*:\s*(.+?)\s*$') { $padOrdered = $true; [void]$padQueue.Add([pscustomobject]@{ At = $null; Cmd = $Matches[3]; Gate = "log /$($Matches[1])/"; Rx = [regex]$Matches[1]; Screen = ''; Delay = [double]$Matches[2] }) }
+    elseif ($e -match '^\s*#([a-z0-9_]+)\+?(\d+(?:\.\d+)?)\s*:\s*(.+?)\s*$') { $padOrdered = $true; [void]$padQueue.Add([pscustomobject]@{ At = $null; Cmd = $Matches[3]; Gate = "screen $($Matches[1])"; Rx = $null; Screen = $Matches[1]; Delay = [double]$Matches[2] }) }
+    elseif ($e -match '^\s*\+(\d+(?:\.\d+)?)\s*:\s*(.+?)\s*$') { $padOrdered = $true; [void]$padQueue.Add([pscustomobject]@{ At = $null; Cmd = $Matches[2]; Gate = 'previous step'; Rx = $null; Screen = ''; Delay = [double]$Matches[1] }) }
+    elseif ($e.Trim()) { $res.Notes.Add("PadScript entry ignored (not 'sec:cmd', '/regex/+sec:cmd', '#screen+sec:cmd' or '+sec:cmd'): $e") }
+  }
+  if (-not $padOrdered) { $padQueue = [System.Collections.ArrayList]@($padQueue | Sort-Object At) }
+  $padGatePng = Join-Path $dir 'pad_gate.png'
+  $nextGate = 0.0
+  $padLastFire = 0.0
+  $padLines = New-Object System.Collections.Generic.List[string]
+  $padRx = @($padQueue | Where-Object { $_.Rx }).Count -gt 0
   $launcher = Join-Path $dir 'launcher.txt'
   $start = Get-Date
   $ps = Start-Process -FilePath 'powershell.exe' -ArgumentList $la -RedirectStandardOutput $launcher -RedirectStandardError (Join-Path $dir 'launcher.err.txt') -WindowStyle Hidden -PassThru
@@ -558,6 +600,7 @@ foreach ($t in $Titles) {
           if ($l -match 'Setting user focus to widget Splash_Screen' -and -not $splashAt) { $splashAt = $el }
           if ($l -match 'CloseSplashScreen|Auto-login attempt started') { $splashDone = $true; Say ("  +{0:N0}s splash closed" -f $el) 'Green' }
         }
+        if ($padRx -and $padLines.Count -lt 20000) { [void]$padLines.Add($l) }
         if ($s.Src -eq 'ods') { $u = $UiRx.Match($l); if ($u.Success) { Say ("  +{0:N0}s UI State {1} -> {2}" -f $el, $u.Groups[1].Value, $u.Groups[2].Value) 'Green' } }
         if ($s.Src -eq 'compat') { $fm = $FpsRx.Match($l); if ($fm.Success) { $lastFps = $fm.Groups[1].Value }; if (-not $netOk -and $l -match '\[net_guard\] installed') { $netOk = $true; Say ("  +{0:N0}s network guard installed" -f $el) 'Green' } }
         if ($s.Src -eq 'trace' -and $l -match 'firstChance=0|ACCESS_VIOLATION|EXIT_PROCESS|\[HANG\]|too many exceptions') { Say ("  +{0:N0}s {1}" -f $el, $l.Trim()) 'Yellow' }
@@ -573,6 +616,30 @@ foreach ($t in $Titles) {
       $splashPresses++
       $res.Notes.Add("virtual gamepad: 'press a' queued at +$([int]$el)s to close the splash screen (no mouse or keyboard input)")
       Say ("  +{0:N0}s virtual pad: press A on the splash screen" -f $el) 'DarkGray'
+    }
+    if ($padQueue.Count -gt 0 -and $null -eq $padQueue[0].At -and $padQueue[0].Gate -eq 'previous step') { $padQueue[0].At = $padLastFire + $padQueue[0].Delay }
+    if ($padQueue.Count -gt 0 -and $null -eq $padQueue[0].At -and $padQueue[0].Rx -and $padLines.Count -gt 0) {
+      $hit = -1
+      for ($i = 0; $i -lt $padLines.Count; $i++) { if ($padQueue[0].Rx.IsMatch($padLines[$i])) { $hit = $i; break } }
+      if ($hit -ge 0) { $padLines.RemoveRange(0, $hit + 1); $padQueue[0].At = $el + $padQueue[0].Delay; Say ("  +{0:N0}s pad gate {1} matched" -f $el, $padQueue[0].Gate) 'DarkGray' } else { $padLines.Clear() }
+    }
+    if ($padQueue.Count -gt 0 -and $null -eq $padQueue[0].At -and $padQueue[0].Screen -and $el -ge $nextGate) {
+      $nextGate = $el + 2
+      $sv = Test-PadScreen $t $padQueue[0].Screen ([uint32[]]$pids) $padGatePng
+      $sd = $t.PadScreens | Where-Object { $_.Name -eq $padQueue[0].Screen } | Select-Object -First 1
+      if ($null -ne $sv -and $sd -and $sv -ge $sd.Min) { $padQueue[0].At = $el + $padQueue[0].Delay; Say ("  +{0:N0}s pad gate {1} on screen (score {2:N2})" -f $el, $padQueue[0].Gate, $sv) 'DarkGray' }
+    }
+    while ($padQueue.Count -gt 0 -and $null -ne $padQueue[0].At -and $el -ge $padQueue[0].At) {
+      $pc = $padQueue[0]; $padQueue.RemoveAt(0); $padLastFire = $el
+      if ($padQueue.Count -gt 0 -and $null -eq $padQueue[0].At -and $padQueue[0].Gate -eq 'previous step') { $padQueue[0].At = $el + $padQueue[0].Delay }
+      $gpDir = Join-Path $env:TEMP 'tombox\pad'
+      New-Item -ItemType Directory -Force -Path $gpDir | Out-Null
+      $pn = '{0:D20}_script' -f [DateTime]::UtcNow.Ticks
+      [IO.File]::WriteAllText((Join-Path $gpDir "$pn.tmp"), "$($pc.Cmd)`n", (New-Object Text.UTF8Encoding $false))
+      Move-Item -LiteralPath (Join-Path $gpDir "$pn.tmp") -Destination (Join-Path $gpDir "$pn.cmd")
+      $res.Notes.Add("virtual gamepad: '$($pc.Cmd)' queued at +$([int]$el)s (PadScript$(if ($pc.Gate) { ", after $($pc.Gate)" }))")
+      Say ("  +{0:N0}s virtual pad: {1}" -f $el, $pc.Cmd) 'DarkGray'
+      Invoke-FrameCapture $res ([uint32[]]$pids) $el ('_pre' + ($pc.Cmd -replace '[^a-z0-9]', ''))
     }
     if ($el -ge $nextShot) { Invoke-FrameCapture $res ([uint32[]]$pids) $el ''; $nextShot = if ($nextShot -lt 45) { 45 } else { $nextShot + $CaptureEvery } }
     $ps.Refresh()
@@ -599,6 +666,7 @@ foreach ($t in $Titles) {
   $res.Dumps = @(foreach ($d in $dumpDirs) { if (Test-Path -LiteralPath $d) { Get-ChildItem -LiteralPath $d -Recurse -File -Include *.dmp, *.mdmp -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $start } } })
   foreach ($d in $res.Dumps) { Copy-Item -LiteralPath $d.FullName $dir -Force }
   $res.Analysis = Invoke-Analyze $dir $t.Kind
+  Merge-FrameMilestones $res
   $res.Exit = $res.Analysis.Exit
   $compat = Join-Path $dir 'tombox_compat.log'
   if (Test-Path $compat) { $res.Tail = @(Get-Content $compat -Tail 40) }
@@ -625,7 +693,7 @@ W
 W "- Mode: **$Mode**"
 W "- Started: $($BatchStart.ToString('yyyy-MM-dd HH:mm:ss')), finished: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
 W "- Run folder: ``$RunRoot`` (all copied logs, stage plans, dumps)"
-W "- Release build: $(ConvertTo-MdText $build)"
+W "- Build ($Profile): $(ConvertTo-MdText $build)"
 W "- Network: forced offline/private (TOMBOX_NET_REDIRECT=127.0.0.1, TOMBOX_NET_BACKEND=builtin, TOMBOX_ALLOW_NETWORK removed, Fortnite game server 127.0.0.1:7777); enforced in-process by compat-common net_guard"
 W "- D3D12 debug layer: $(if ($DbgLayer) { "ON via Agility SDK $AgilityVersion ($Agility); FPS is measured with the layer on" } else { 'off (-NoD3d12Debug)' }). DRED: not enabled by any compat crate; only device-removal log lines are captured"
 W "- Audio: each title's WASAPI session is muted from the batch (polled every 0.1 s for the first 2 min, then 0.5 s; each session's prior mute state is restored after the title exits); input: none injected; windows: shown by the title"

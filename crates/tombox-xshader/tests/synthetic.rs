@@ -246,7 +246,7 @@ fn integer_parameter_export_keeps_the_integer() {
 /// texture; declared as float its bits never matched the light's channel mask.)
 #[test]
 fn texel_type_follows_the_use_of_the_loaded_value() {
-    let root = || Some(RootSig { version: 2, flags: 1, params: vec![table(0, 64, 5), table(2, 16, 5)], num_static_samplers: 0 });
+    let root = || Some(RootSig { version: 2, flags: 1, params: vec![table(0, 64, 5), table(2, 16, 5)], num_static_samplers: 0, static_samplers: Vec::new() });
     let program = |use_op: u32| {
         vec![
             0xf40c_0004, // s_load_dwordx8 s0, s8 [off=0]: texture descriptor t0
@@ -328,7 +328,7 @@ fn durango_pixel_shader_resource_binding_fails_before_fix() {
         version: 2,
         flags: 1,
         params: vec![table(0, 64, 5)],
-        num_static_samplers: 0,
+        num_static_samplers: 0, static_samplers: Vec::new(),
     });
     let ex = shader(Stage::Pixel, &words, vec![], vec![sig("SV_Target", 64, 3, 0, 0xf)], root);
     let Err(err) = translate(&ex) else {
@@ -355,7 +355,7 @@ fn cbdyn_mubuf_addressing() {
         version: 2,
         flags: 1,
         params: vec![table(2, 16, 5)], // CBV table range (range_type = 2)
-        num_static_samplers: 0,
+        num_static_samplers: 0, static_samplers: Vec::new(),
     });
 
     // 1. offen = true, idxen = false, imm = 16
@@ -459,7 +459,7 @@ fn atomic_mubuf_addressing() {
         version: 2,
         flags: 1,
         params: vec![table(1, 16, 5)], // UAV table range (range_type = 1)
-        num_static_samplers: 0,
+        num_static_samplers: 0, static_samplers: Vec::new(),
     });
 
     // 1. Typed UAV (Res::TBuf): offen = true, idxen = false, imm = 8
@@ -585,4 +585,31 @@ fn atomic_mubuf_addressing() {
     let ex8 = shader(Stage::Pixel, &words8, vec![], vec![], uav_root);
     let Err(err8) = translate(&ex8) else { panic!("should reject typed buffer atomic with imm != 0"); };
     assert!(err8.contains("unresolved atomic target"), "{err8}");
+}
+
+#[test]
+fn vertex_misc_vector_export_feeds_the_render_target_array_index() {
+    let words = [0xf800_00cf, 0x0403_0200, 0xf800_08df, 0x0200_0101, S_ENDPGM];
+    let ex = shader(
+        Stage::Vertex,
+        &words,
+        vec![sig("SV_VertexID", 6, 1, 0, 1)],
+        vec![sig("SV_Position", 1, 3, 0, 0xf), sig("SV_RenderTargetArrayIndex", 4, 1, 1, 1)],
+        None,
+    );
+    let t = translate(&ex).expect("POS1 misc vector export translates");
+    let line = t.hlsl.lines().find(|l| l.contains("o.o1 =")).unwrap_or_else(|| panic!("no layer write:\n{}", t.hlsl));
+    assert!(line.contains("uint4(") && line.trim_end().ends_with(".z);"), "{line}");
+}
+
+#[test]
+fn pixel_attribute_past_the_interpolants_reads_the_layer_sysval() {
+    let words = [0xc802_0002, 0xf800_1c03, 0x0000_0000, S_ENDPGM];
+    let mut layer = sig("SV_RenderTargetArrayIndex", 4, 1, 1, 1);
+    layer.rw_mask = 1;
+    let mut pos = sig("SV_Position", 1, 3, 0, 0xf);
+    pos.rw_mask = 3;
+    let ex = shader(Stage::Pixel, &words, vec![pos, layer], vec![sig("SV_Target", 64, 3, 0, 1)], None);
+    let t = translate(&ex).expect("v_interp_mov of the layer attribute translates");
+    assert!(t.hlsl.contains("(uint)(i.i1.x)"), "{}", t.hlsl);
 }

@@ -10,8 +10,9 @@ pub const SHADER: usize = 3;
 pub const PSO: usize = 4;
 pub const PWAIT: usize = 5;
 pub const PFLIP: usize = 6;
-const SLOTS: usize = 7;
-const NAMES: [&str; SLOTS] = ["upload", "rtcap", "present_copy", "shader_xlat", "pso_create", "present_wait", "present_flip"];
+pub const OVERLAY: usize = 7;
+const SLOTS: usize = 8;
+const NAMES: [&str; SLOTS] = ["upload", "rtcap", "present_copy", "shader_xlat", "pso_create", "present_wait", "present_flip", "overlay"];
 const RING: usize = 1024;
 const WINDOW_SECONDS: i64 = 5;
 

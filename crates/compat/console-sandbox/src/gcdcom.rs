@@ -220,8 +220,6 @@ fn served(clsid: &Guid, iid: &Guid) -> Option<&'static Holder> {
         Some(&CURSOR)
     } else if *clsid == CLSID_PACKAGE_V7 && *iid == IID_PACKAGE_V7 {
         Some(&PACKAGE_V7)
-    } else if *clsid == CLSID_PACKAGE_AUX && *iid == IID_PACKAGE_AUX {
-        Some(&PACKAGE_AUX)
     } else if *clsid == CLSID_NET_SECURITY {
         Some(&NET_SECURITY)
     } else {
@@ -527,7 +525,7 @@ pub const IID_NET_SECURITY: Guid = Guid { data1: 0x06C45D2E, data2: 0xECC6, data
 pub const IID_NET_SECURITY_RESULT: Guid = Guid { data1: 0x7DC51C93, data2: 0xE1B7, data3: 0x4A12, data4: [0x94, 0x77, 0x77, 0x4F, 0x33, 0xB2, 0x8D, 0xB0] };
 pub const TLS_FLAGS: u32 = 0x0000_0800 | 0x0000_2000;
 pub const PACKAGE_V7_SLOTS: usize = 32;
-pub const PACKAGE_AUX_SLOTS: usize = 11;
+pub const E_ACCESSDENIED: i32 = 0x8007_0005u32 as i32;
 
 #[link(name = "runtimeobject")]
 extern "system" {
@@ -536,7 +534,6 @@ extern "system" {
 }
 
 static PACKAGE_V7_REFS: AtomicU32 = AtomicU32::new(0);
-static PACKAGE_AUX_REFS: AtomicU32 = AtomicU32::new(0);
 static NET_SECURITY_REFS: AtomicU32 = AtomicU32::new(0);
 static NET_RESULT_REFS: AtomicU32 = AtomicU32::new(0);
 
@@ -554,13 +551,11 @@ unserved!(v7_4, "PackageV7", 4);
 unserved!(v7_5, "PackageV7", 5);
 unserved!(v7_6, "PackageV7", 6);
 unserved!(v7_7, "PackageV7", 7);
-unserved!(v7_8, "PackageV7", 8);
 unserved!(v7_9, "PackageV7", 9);
 unserved!(v7_10, "PackageV7", 10);
 unserved!(v7_12, "PackageV7", 12);
 unserved!(v7_13, "PackageV7", 13);
 unserved!(v7_14, "PackageV7", 14);
-unserved!(v7_15, "PackageV7", 15);
 unserved!(v7_16, "PackageV7", 16);
 unserved!(v7_17, "PackageV7", 17);
 unserved!(v7_18, "PackageV7", 18);
@@ -571,18 +566,8 @@ unserved!(v7_22, "PackageV7", 22);
 unserved!(v7_23, "PackageV7", 23);
 unserved!(v7_24, "PackageV7", 24);
 unserved!(v7_25, "PackageV7", 25);
-unserved!(v7_28, "PackageV7", 28);
-unserved!(v7_29, "PackageV7", 29);
 unserved!(v7_30, "PackageV7", 30);
 unserved!(v7_31, "PackageV7", 31);
-unserved!(aux_3, "PackageAux", 3);
-unserved!(aux_4, "PackageAux", 4);
-unserved!(aux_5, "PackageAux", 5);
-unserved!(aux_6, "PackageAux", 6);
-unserved!(aux_7, "PackageAux", 7);
-unserved!(aux_8, "PackageAux", 8);
-unserved!(aux_9, "PackageAux", 9);
-unserved!(aux_10, "PackageAux", 10);
 
 unsafe fn wide_text(p: *const u16) -> Option<String> {
     if p.is_null() {
@@ -624,7 +609,33 @@ unsafe extern "system" fn v7_estimate(_this: *mut c_void, pkg: *const u16, _n: u
     S_OK
 }
 
-unsafe extern "system" fn v7_mount(_this: *mut c_void, pkg: *const u16, _kind: i32, out: *mut *mut c_void) -> i32 {
+unsafe fn put_hstring(out: *mut *mut c_void, text: &[u16]) -> i32 {
+    if text.is_empty() {
+        *out = core::ptr::null_mut();
+        return S_OK;
+    }
+    let mut h = core::ptr::null_mut();
+    let hr = WindowsCreateString(text.as_ptr(), text.len() as u32, &mut h);
+    if hr >= 0 {
+        *out = h;
+    }
+    hr
+}
+
+pub unsafe fn hstring_units(h: *mut c_void) -> Vec<u16> {
+    if h.is_null() {
+        return Vec::new();
+    }
+    let mut n = 0u32;
+    let p = WindowsGetStringRawBuffer(h, &mut n);
+    if p.is_null() { Vec::new() } else { core::slice::from_raw_parts(p, n as usize).to_vec() }
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+unsafe extern "system" fn v7_path(_this: *mut c_void, pkg: *const u16, _kind: i32, out: *mut *mut c_void) -> i32 {
     if out.is_null() {
         return E_POINTER;
     }
@@ -633,37 +644,119 @@ unsafe extern "system" fn v7_mount(_this: *mut c_void, pkg: *const u16, _kind: i
         return compat_common::gdk::E_NOT_FOUND;
     }
     let path = compat_common::gdk::package::mount_path();
-    match hstring(&path) {
-        Ok(h) => {
-            *out = h;
-            compat_common::record_raw("gamecore-host", "PackageV7", &format!("slot 26 mount -> {path}"));
-            S_OK
-        }
-        Err(hr) => hr,
-    }
+    compat_common::record_raw("gamecore-host", "PackageV7", &format!("slot 8 package path -> {path}"));
+    put_hstring(out, &wide(&path))
 }
 
-unsafe extern "system" fn v7_close_mount(_this: *mut c_void, pkg: *const u16) -> i32 {
+unsafe extern "system" fn v7_locale(_this: *mut c_void, _pkg: *const u16, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    *out = core::ptr::null_mut();
+    put_hstring(out, &wide(&compat_common::gdk::package::user_locale()))
+}
+
+pub fn features_record(f: &[compat_common::gdk::package::Feature]) -> Vec<u16> {
+    let mut v = Vec::new();
+    for x in f {
+        for field in [x.id.as_str(), x.display.as_str(), if x.hidden { "T" } else { "" }, x.tags.as_str(), x.store_id.as_str()] {
+            v.extend(field.encode_utf16());
+            v.push(0);
+        }
+    }
+    v
+}
+
+unsafe extern "system" fn v7_features(_this: *mut c_void, pkg: *const u16, _kind: i32, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    *out = core::ptr::null_mut();
     if !package_known(wide_text(pkg)) {
         return compat_common::gdk::E_NOT_FOUND;
     }
+    let f = compat_common::gdk::package::features();
+    compat_common::record_raw("gamecore-host", "PackageV7", &format!("slot 26 features -> {} records", f.len()));
+    put_hstring(out, &features_record(f))
+}
+
+unsafe extern "system" fn v7_uninstall(_this: *mut c_void, pkg: *const u16) -> i32 {
+    if !package_known(wide_text(pkg)) {
+        return compat_common::gdk::E_NOT_FOUND;
+    }
+    compat_common::record_raw("gamecore-host", "PackageV7", "slot 27 uninstall of the running package refused: the installed package is the read-only game dump; E_ACCESSDENIED");
+    E_ACCESSDENIED
+}
+
+#[repr(C)]
+pub struct PkgDetails {
+    pub id: *mut c_void,
+    pub alias: *mut c_void,
+    pub version: [u16; 4],
+    pub kind: i32,
+    pub flags: u32,
+    pub display: *mut c_void,
+    pub description: *mut c_void,
+    pub publisher: *mut c_void,
+    pub store_id: *mut c_void,
+    pub alias4: *mut c_void,
+}
+
+unsafe fn fill_details(d: *mut PkgDetails) -> i32 {
+    let t = compat_common::gdk::title();
+    core::ptr::write_bytes(d as *mut u8, 0, core::mem::size_of::<PkgDetails>());
+    let d = &mut *d;
+    d.version = [t.version[3], t.version[2], t.version[1], t.version[0]];
+    for (slot, text) in [(&mut d.id, compat_common::gdk::package::package_id()), (&mut d.display, t.display.clone()), (&mut d.publisher, t.publisher.clone())] {
+        let hr = put_hstring(slot, &wide(&text));
+        if hr < 0 {
+            return hr;
+        }
+    }
+    S_OK
+}
+
+unsafe extern "system" fn v7_details(_this: *mut c_void, pkg: *const u16, out: *mut PkgDetails) -> i32 {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    if !package_known(wide_text(pkg)) {
+        return compat_common::gdk::E_NOT_FOUND;
+    }
+    fill_details(out)
+}
+
+unsafe extern "system" fn v7_enumerate(_this: *mut c_void, _filter: *const u16, kind: i32, scope: i32, n: *mut u32, arr: *mut *mut PkgDetails) -> i32 {
+    if n.is_null() || arr.is_null() {
+        return E_POINTER;
+    }
+    *n = 0;
+    *arr = core::ptr::null_mut();
+    compat_common::record_raw("gamecore-host", "PackageV7", &format!("slot 28 enumerate kind={kind} scope={scope} -> {}", if kind == 0 { "this title" } else { "none" }));
+    if kind != 0 {
+        return S_OK;
+    }
+    let p = CoTaskMemAlloc(core::mem::size_of::<PkgDetails>()) as *mut PkgDetails;
+    if p.is_null() {
+        return 0x8007_000Eu32 as i32;
+    }
+    let hr = fill_details(p);
+    if hr < 0 {
+        return hr;
+    }
+    *arr = p;
+    *n = 1;
     S_OK
 }
 
 static PACKAGE_V7_VT: Vt<PACKAGE_V7_SLOTS> = Vt([
     qi as *const (), add_ref as *const (), release as *const (),
-    v7_3 as *const (), v7_4 as *const (), v7_5 as *const (), v7_6 as *const (), v7_7 as *const (), v7_8 as *const (), v7_9 as *const (), v7_10 as *const (),
-    v7_estimate as *const (), v7_12 as *const (), v7_13 as *const (), v7_14 as *const (), v7_15 as *const (), v7_16 as *const (), v7_17 as *const (), v7_18 as *const (),
+    v7_3 as *const (), v7_4 as *const (), v7_5 as *const (), v7_6 as *const (), v7_7 as *const (), v7_path as *const (), v7_9 as *const (), v7_10 as *const (),
+    v7_estimate as *const (), v7_12 as *const (), v7_13 as *const (), v7_14 as *const (), v7_locale as *const (), v7_16 as *const (), v7_17 as *const (), v7_18 as *const (),
     v7_19 as *const (), v7_20 as *const (), v7_21 as *const (), v7_22 as *const (), v7_23 as *const (), v7_24 as *const (), v7_25 as *const (),
-    v7_mount as *const (), v7_close_mount as *const (), v7_28 as *const (), v7_29 as *const (), v7_30 as *const (), v7_31 as *const (),
+    v7_features as *const (), v7_uninstall as *const (), v7_enumerate as *const (), v7_details as *const (), v7_30 as *const (), v7_31 as *const (),
 ]);
 static PACKAGE_V7: Holder = Holder(Obj { vt: PACKAGE_V7_VT.0.as_ptr(), refs: &PACKAGE_V7_REFS, iid: IID_PACKAGE_V7 });
-
-static PACKAGE_AUX_VT: Vt<PACKAGE_AUX_SLOTS> = Vt([
-    qi as *const (), add_ref as *const (), release as *const (),
-    aux_3 as *const (), aux_4 as *const (), aux_5 as *const (), aux_6 as *const (), aux_7 as *const (), aux_8 as *const (), aux_9 as *const (), aux_10 as *const (),
-]);
-static PACKAGE_AUX: Holder = Holder(Obj { vt: PACKAGE_AUX_VT.0.as_ptr(), refs: &PACKAGE_AUX_REFS, iid: IID_PACKAGE_AUX });
 
 unsafe extern "system" fn net_query(_this: *mut c_void, url: *mut c_void, _a: u64, _b: u64, out: *mut *mut c_void) -> i32 {
     if out.is_null() {
@@ -709,6 +802,6 @@ static NET_RESULT_VT: Vt<13> = Vt([
 ]);
 static NET_RESULT: Holder = Holder(Obj { vt: NET_RESULT_VT.0.as_ptr(), refs: &NET_RESULT_REFS, iid: IID_NET_SECURITY_RESULT });
 
-pub fn server_refs() -> [u32; 4] {
-    [&PACKAGE_V7_REFS, &PACKAGE_AUX_REFS, &NET_SECURITY_REFS, &NET_RESULT_REFS].map(|r| r.load(Ordering::SeqCst))
+pub fn server_refs() -> [u32; 3] {
+    [&PACKAGE_V7_REFS, &NET_SECURITY_REFS, &NET_RESULT_REFS].map(|r| r.load(Ordering::SeqCst))
 }

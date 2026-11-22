@@ -78,15 +78,6 @@ unsafe fn completed(fence: usize) -> u64 {
     unsafe { f(fence as *mut c_void) }
 }
 
-pub unsafe fn note_title_wait(fence: *mut c_void, value: u64) {
-    if fence.is_null() || !crate::perf::enabled() {
-        return;
-    }
-    let c = unsafe { completed(fence as usize) };
-    let now = crate::frame::qpc();
-    with(|b| b.note(fence as usize, value, c, now));
-}
-
 pub fn poll() {
     let now = crate::frame::qpc();
     with(|b| b.poll(now, |f| unsafe { completed(f) }));

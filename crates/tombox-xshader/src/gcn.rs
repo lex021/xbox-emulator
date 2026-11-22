@@ -299,7 +299,7 @@ fn convert(ins: &Insn) -> Result<Vec<u32>, String> {
         Enc::Vop2 => {
             let op = (w >> 25) & 0x3f;
             let vdst = (w >> 17) & 0xff;
-            let vsrc1 = 256 + ((w >> 9) & 0xff);
+            let vsrc1 = if matches!(op, 0x01 | 0x02) { (w >> 9) & 0xff } else { 256 + ((w >> 9) & 0xff) };
             let src0 = w & 0x1ff;
             match vop2_map(op).map_err(err)? {
                 Vop2Map::Same(n) => {
@@ -381,7 +381,7 @@ fn convert(ins: &Insn) -> Result<Vec<u32>, String> {
         Enc::Vintrp | Enc::Ds | Enc::Exp => ins.words.clone(),
         Enc::Mubuf => {
             if (w >> 15) & 1 != 0 {
-                return Err(err("MUBUF addr64 has no RDNA2 equivalent".into()));
+                return addr64(ins).map_err(err);
             }
             ins.words.clone()
         }
@@ -394,6 +394,58 @@ fn convert(ins: &Insn) -> Result<Vec<u32>, String> {
         Enc::Flat => return Err(err("FLAT is not supported yet".into())),
         Enc::Unknown => return Err(err("unknown gfx7 encoding".into())),
     })
+}
+
+pub const ADDR64_LO: u8 = 254;
+pub const ADDR64_HI: u8 = 255;
+pub const ADDR64_CARRY: u8 = 104;
+
+fn addr64(ins: &Insn) -> Result<Vec<u32>, String> {
+    let (w0, w1) = (ins.words[0], ins.words.get(1).copied().unwrap_or(0));
+    let op = (w0 >> 18) & 0x7f;
+    if (w0 >> 12) & 3 != 0 {
+        return Err(format!("MUBUF addr64 op {op:#x} with offen/idxen set"));
+    }
+    if (w0 >> 16) & 1 != 0 {
+        return Err(format!("MUBUF addr64 op {op:#x} with LDS=1"));
+    }
+    if (w1 >> 23) & 1 != 0 {
+        return Err(format!("MUBUF addr64 op {op:#x} with TFE=1"));
+    }
+    if !matches!(op, 0x08..=0x0f | 0x18 | 0x1a | 0x1c..=0x1f) {
+        return Err(format!("MUBUF addr64 op {op:#x} is not a plain load/store"));
+    }
+    let off = w0 & 0xfff;
+    let glc = (w0 >> 14) & 1;
+    let slc = (w1 >> 22) & 1;
+    let vaddr = w1 & 0xff;
+    let vdata = (w1 >> 8) & 0xff;
+    let rsrc = ((w1 >> 16) & 0x1f) * 4;
+    let soff = (w1 >> 24) & 0xff;
+    let (lo, hi, cy) = (ADDR64_LO as u32, ADDR64_HI as u32, ADDR64_CARRY as u32);
+    let mut v = vec![0x7e00_0000 | hi << 17 | 0x01 << 9 | (rsrc + 1), 0x1b << 25 | hi << 17 | hi << 9 | 0xff, 0xffff];
+    v.extend(vop3b(0x30f, lo, cy, 0, [rsrc, 256 + vaddr, 0], 0, 0));
+    v.extend(vop3b(0x128, hi, cy, 0, [256 + hi, 256 + vaddr + 1, cy], 0, 0));
+    let mut add = |src: u32, lit: Option<u32>| {
+        v.extend(vop3b(0x30f, lo, cy, 0, [src, 256 + lo, 0], 0, 0));
+        if let Some(l) = lit {
+            v.push(l);
+        }
+        v.extend(vop3b(0x128, hi, cy, 0, [0x80, 256 + hi, cy], 0, 0));
+    };
+    if soff != 0x80 {
+        add(soff, None);
+    }
+    let inst_off = if off > 2047 {
+        add(0xff, Some(off));
+        0
+    } else {
+        off
+    };
+    v.push(0b110111 << 26 | op << 18 | slc << 17 | glc << 16 | 2 << 14 | inst_off);
+    let data_or_dst = if op >= 0x18 { vdata << 8 } else { vdata << 24 };
+    v.push(lo | data_or_dst | 0x7f << 16);
+    Ok(v)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -476,6 +528,7 @@ pub fn lower(code: &[u8], data: &[u8]) -> Result<Lowered, String> {
     let mut notes = Vec::new();
     let mut new_at: BTreeMap<usize, usize> = BTreeMap::new();
     let mut pcs = Vec::new();
+    let mut expanded: Vec<std::ops::Range<usize>> = Vec::new();
     let mut pos = 0usize;
     for (k, ins) in insns.iter().enumerate() {
         match sop1_op(ins) {
@@ -491,6 +544,9 @@ pub fn lower(code: &[u8], data: &[u8]) -> Result<Lowered, String> {
         }
         new_at.insert(ins.offset / 4, pos);
         let v = convert(ins)?;
+        if ins.enc == Enc::Mubuf && (ins.words[0] >> 15) & 1 != 0 {
+            expanded.push(pos..pos + v.len());
+        }
         pos += v.len();
         out.push(v);
     }
@@ -531,6 +587,19 @@ pub fn lower(code: &[u8], data: &[u8]) -> Result<Lowered, String> {
         notes.push(format!("getpc at {:#x}: pc+{lit:#x} -> lowered pc+{rel:#x}", g.offset));
     }
     let mut isa: Vec<u8> = out.into_iter().flatten().flat_map(|d| d.to_le_bytes()).collect();
+    if !expanded.is_empty() {
+        use crate::rdna2::Opnd;
+        for i in crate::rdna2::disassemble(&isa[..code_len]) {
+            if expanded.iter().any(|r| r.contains(&(i.offset / 4))) {
+                continue;
+            }
+            let clash = i.src.iter().chain(i.dst.iter()).any(|o| matches!(o, Opnd::Vgpr(ADDR64_LO | ADDR64_HI) | Opnd::Sgpr(ADDR64_CARRY)));
+            if clash {
+                return Err(format!("gfx7 MUBUF addr64 lowering needs v{ADDR64_LO}, v{ADDR64_HI} and s{ADDR64_CARRY}, but {} at lowered {:#x} uses them", i.mnemonic, i.offset));
+            }
+        }
+        notes.push(format!("{} MUBUF addr64 access(es) lowered to GLOBAL through v{ADDR64_LO}:v{ADDR64_HI}", expanded.len()));
+    }
     isa.extend_from_slice(&tail);
     Ok(Lowered { isa, code_len, notes })
 }
@@ -561,6 +630,14 @@ pub fn find_durango(xdat: &[u8]) -> Option<Vec<u8>> {
     all.into_iter().next()
 }
 
+fn thread_group(d: &Durango, stage: crate::Stage) -> [u32; 4] {
+    if stage != crate::Stage::Compute {
+        return [0; 4];
+    }
+    let w = |o: usize| u32_at(&d.prefix, o).unwrap_or(0);
+    [0, w(0x18), w(0x1c), w(0x20)]
+}
+
 pub fn extract_durango(
     dxbc: &[u8],
     container: &crate::Dxbc,
@@ -581,7 +658,7 @@ pub fn extract_durango(
         entry: None,
         isa: lowered.isa[..lowered.code_len].to_vec(),
         isa_offset_in_fssm: d.code_start,
-        isa_preamble: [0; 4],
+        isa_preamble: thread_group(&d, stage),
         isa_data: lowered.isa,
         has_input_sig: container.chunk(b"ISG1").is_some() || container.chunk(b"ISGN").is_some(),
         has_output_sig: container.chunk(b"OSG1").is_some() || container.chunk(b"OSGN").is_some(),
@@ -619,6 +696,42 @@ mod tests {
         }
         v.sort();
         v
+    }
+
+    #[test]
+    fn mubuf_addr64_load_becomes_a_global_load_of_base_plus_vaddr64() {
+        let l = to_rdna2(&bytes(&[0xe0388000, 0x80020402, 0xbf810000])).unwrap();
+        let d = crate::rdna2::disassemble(&l.isa[..l.code_len]);
+        assert_eq!(d.iter().map(|i| i.mnemonic.as_str()).collect::<Vec<_>>(), ["v_mov_b32", "v_and_b32", "v_add_co_u32", "v_add_co_ci_u32", "flat_load_dwordx4", "s_endpgm"]);
+        use crate::rdna2::Opnd;
+        assert_eq!(d[0].src[0], Opnd::Sgpr(9));
+        assert_eq!(d[2].src[..2], [Opnd::Sgpr(8), Opnd::Vgpr(2)]);
+        assert_eq!(d[3].src[1], Opnd::Vgpr(3));
+        let g = &d[4];
+        assert_eq!(g.aux.mask, 2);
+        assert_eq!(g.aux.imm, 0);
+        assert_eq!(g.src[0], Opnd::Vgpr(ADDR64_LO));
+        assert_eq!(g.src[2], Opnd::Null);
+        assert_eq!(g.dst[0], Opnd::Vgpr(4));
+    }
+
+    #[test]
+    fn mubuf_addr64_store_folds_soffset_and_a_large_offset() {
+        let l = to_rdna2(&bytes(&[0xe0708bb8, 0x05030602, 0xbf810000])).unwrap();
+        let d = crate::rdna2::disassemble(&l.isa[..l.code_len]);
+        let m: Vec<&str> = d.iter().map(|i| i.mnemonic.as_str()).collect();
+        assert_eq!(m, ["v_mov_b32", "v_and_b32", "v_add_co_u32", "v_add_co_ci_u32", "v_add_co_u32", "v_add_co_ci_u32", "v_add_co_u32", "v_add_co_ci_u32", "flat_store_dword", "s_endpgm"]);
+        use crate::rdna2::Opnd;
+        assert_eq!(d[4].src[0], Opnd::Sgpr(5));
+        assert_eq!(d[8].aux.imm, 0);
+        assert_eq!(d[8].src[1], Opnd::Vgpr(6));
+        assert!(d[6].raw.contains(&0xbb8), "{:x?}", d[6].raw);
+    }
+
+    #[test]
+    fn mubuf_addr64_refuses_when_the_title_uses_the_temporaries() {
+        let e = to_rdna2(&bytes(&[0x7ffc0280, 0xe0388000, 0x80020402, 0xbf810000])).unwrap_err();
+        assert!(e.contains("v254"), "{e}");
     }
 
     #[test]

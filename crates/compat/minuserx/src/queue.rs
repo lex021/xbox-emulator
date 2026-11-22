@@ -310,9 +310,25 @@ pub unsafe fn peek(out: *mut Msg, hwnd: *mut c_void, lo: u32, hi: u32, flags: u3
             }
             continue;
         }
+        if host_kbm_message(m.message) && host_kbm_hidden() {
+            if flags & PM_REMOVE == 0 {
+                let mut t = Msg::default();
+                PeekMessageW(&mut t, m.hwnd as *mut c_void, m.message, m.message, PM_REMOVE);
+            }
+            continue;
+        }
         *out = m;
         return Ok(true);
     }
+}
+
+pub fn host_kbm_message(msg: u32) -> bool {
+    msg == 0x00FF || (0x0100..=0x0109).contains(&msg) || (0x0200..=0x020E).contains(&msg) || (0x02A0..=0x02A3).contains(&msg)
+}
+
+pub fn host_kbm_hidden() -> bool {
+    static H: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *H.get_or_init(|| matches!(std::env::var("TOMBOX_HOST_KBM").ok().as_deref().map(str::trim), Some("0") | Some("off") | Some("false")))
 }
 
 pub unsafe fn get(out: *mut Msg, hwnd: *mut c_void, lo: u32, hi: u32) -> Result<bool, u32> {

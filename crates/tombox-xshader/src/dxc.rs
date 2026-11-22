@@ -123,9 +123,10 @@ pub fn compile_with(hlsl: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>
     if minor < 2 || extra.contains(&"-denorm") {
         return compile_args(hlsl, profile, &[], extra);
     }
-    let code = compile_args(hlsl, profile, &["-denorm", "preserve"], extra)?;
+    let bf = branch_free_source(hlsl);
+    let code = compile_bf(hlsl, bf.as_deref(), profile, &["-denorm", "preserve"], extra)?;
     if profile.starts_with("cs_") && disassemble(&code).map(|t| has_preserve_unselectable(&t)).unwrap_or(false) {
-        return compile_args(hlsl, profile, &["-denorm", "any"], extra);
+        return compile_bf(hlsl, bf.as_deref(), profile, &["-denorm", "any"], extra);
     }
     Ok(code)
 }
@@ -138,22 +139,52 @@ pub fn fma_defines(fma: crate::shader_cache::Fma, any_mode: bool) -> Vec<&'stati
         d.extend(["-D", "TB_HYBRID_FMA"]);
     }
     if fma.f2h {
-        d.extend(["-D", "TB_FAST_F2H"]);
+        d.extend(["-D", "TB_FAST_F2H", "-enable-16bit-types"]);
     }
     d
 }
 
 pub fn compile_fma(hlsl: &str, profile: &str, fma: crate::shader_cache::Fma, extra: &[&str]) -> Result<Vec<u8>, String> {
-    let with = |any_mode: bool| -> Vec<&str> { extra.iter().copied().chain(fma_defines(fma, any_mode)).collect() };
     let minor = profile.rsplit('_').next().and_then(|m| m.parse::<u32>().ok()).unwrap_or(0);
+    let fma = crate::shader_cache::Fma { f2h: fma.f2h && minor >= 2, ..fma };
+    let with = |any_mode: bool| -> Vec<&str> { extra.iter().copied().chain(fma_defines(fma, any_mode)).collect() };
+    let bf = branch_free_source(hlsl);
     if minor < 2 {
-        return compile_args(hlsl, profile, &[], &with(true));
+        return compile_bf(hlsl, bf.as_deref(), profile, &[], &with(true));
     }
-    let code = compile_args(hlsl, profile, &["-denorm", "preserve"], &with(false))?;
+    let code = compile_bf(hlsl, bf.as_deref(), profile, &["-denorm", "preserve"], &with(false))?;
     if profile.starts_with("cs_") && disassemble(&code).map(|t| has_preserve_unselectable(&t)).unwrap_or(false) {
-        return compile_args(hlsl, profile, &["-denorm", "any"], &with(true));
+        return compile_bf(hlsl, bf.as_deref(), profile, &["-denorm", "any"], &with(true));
     }
     Ok(code)
+}
+
+pub fn branch_free_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TOMBOX_DXC_BRANCH_FREE").map(|v| v != "0").unwrap_or(true))
+}
+
+fn branch_free_source(hlsl: &str) -> Option<String> {
+    if !branch_free_enabled() {
+        return None;
+    }
+    let r = crate::branch_free::rewrite(hlsl);
+    (r.len() != hlsl.len() + crate::branch_free::PRELUDE.len() || r[crate::branch_free::PRELUDE.len()..] != *hlsl).then_some(r)
+}
+
+fn compile_bf(hlsl: &str, bf: Option<&str>, profile: &str, denorm: &[&str], extra: &[&str]) -> Result<Vec<u8>, String> {
+    if let Some(src) = bf {
+        match compile_args(src, profile, denorm, extra) {
+            Ok(c) => return Ok(c),
+            Err(e) => {
+                static WARNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                if WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    eprintln!("dxc: branch-free source failed, compiling the original: {}", e.lines().next().unwrap_or(""));
+                }
+            }
+        }
+    }
+    compile_args(hlsl, profile, denorm, extra)
 }
 
 pub fn compile_denorm(hlsl: &str, profile: &str, denorm: &str, extra: &[&str]) -> Result<Vec<u8>, String> {

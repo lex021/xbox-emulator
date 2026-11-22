@@ -152,6 +152,95 @@ fn fma16_rounds_like_an_exact_fma_then_f16() {
     assert!(n > 2_000_000);
 }
 
+fn fma_rto(a: f32, b: f32, c: f32) -> f32 {
+    let (p, q) = (a as f64 * b as f64, c as f64);
+    let s = p + q;
+    if !(s.abs() < 1.0e300) {
+        return s as f32;
+    }
+    let bb = s - p;
+    let e = (p - (s - bb)) + (q - bb);
+    let f = s as f32;
+    let mut u = f.to_bits();
+    if f as f64 != s {
+        if (f as f64).abs() > s.abs() {
+            u -= 1;
+        }
+        u |= 1;
+    } else if e != 0.0 {
+        if (e > 0.0) != (s > 0.0) {
+            u -= 1;
+        }
+        u |= 1;
+    }
+    f32::from_bits(u)
+}
+
+fn parts(x: f32) -> (i128, i32) {
+    let b = x.to_bits();
+    let e = ((b >> 23) & 0xff) as i32;
+    let m = (b & 0x7f_ffff) as i128;
+    let (m, k) = if e == 0 { (m, -149) } else { (m | 0x80_0000, e - 150) };
+    (if b >> 31 != 0 { -m } else { m }, k)
+}
+
+fn exact_mix16(a: f32, b: f32, c: f32) -> u16 {
+    let ((ma, ka), (mb, kb), (mc, kc)) = (parts(a), parts(b), parts(c));
+    let pm = ma * mb;
+    let k = if mc == 0 { ka + kb } else if pm == 0 { kc } else { (ka + kb).min(kc) };
+    let x = (if pm == 0 { 0 } else { pm << (ka + kb - k) }) + (if mc == 0 { 0 } else { mc << (kc - k) });
+    if x == 0 {
+        let neg_p = a.is_sign_negative() != b.is_sign_negative();
+        return if neg_p && c.is_sign_negative() { 0x8000 } else { 0 };
+    }
+    let sign = if x < 0 { 0x8000u16 } else { 0 };
+    let m = x.abs();
+    let top = 127 - m.leading_zeros() as i32 + k;
+    if top > 16 {
+        return sign | 0x7c00;
+    }
+    let q = top.max(-14) - 10;
+    let n = if q <= k { m << (k - q) } else { round_shift(m, (q - k) as u32) };
+    sign | f2h_soft((n as f64 * 2f64.powi(q)) as f32)
+}
+
+#[test]
+fn fma_rto_then_f16_rounds_once() {
+    let mut s = 0x0bad_5eed_cafe_f00du64;
+    let mut n = 0u64;
+    for i in 0..2_000_000u64 {
+        let r = xs(&mut s);
+        let g = |k: u64, lo: u32| -> f32 { f32::from_bits(((k as u32) & 0x807f_ffff) | ((lo + ((k >> 23) as u32) % 40) << 23)) };
+        let (a, b) = (g(r, 100), g(r >> 20, 107));
+        let mut c = if r % 4 == 0 { f16_to_f32((r >> 40) as u16 & 0x7bff) } else { g(r >> 33, 95) };
+        if i % 3 == 0 {
+            c = f32::from_bits((-(a * b)).to_bits() ^ ((r >> 52) as u32 & 0xff));
+        }
+        if i % 7 == 0 {
+            c = f16_to_f32(f2h_soft(c));
+        }
+        if !c.is_finite() {
+            continue;
+        }
+        assert_eq!(f2h_soft(fma_rto(a, b, c)), exact_mix16(a, b, c), "a={:08x} b={:08x} c={:08x}", a.to_bits(), b.to_bits(), c.to_bits());
+        n += 1;
+    }
+    assert!(n > 1_900_000);
+    let (a, b) = (1.0 + 2f32.powi(-23), 1.0 - 2f32.powi(-24));
+    assert_eq!(f2h_soft(fma_rto(a, b, -1.0)), 0x0001);
+    assert_eq!(f2h_soft(a * b - 1.0), 0);
+    let c = 1.0 + 2f32.powi(-11);
+    assert_eq!(f2h_soft(fma_rto(2f32.powi(-60), 1.0, c)), 0x3c01);
+    assert_eq!(f2h_soft((2f64.powi(-60) + c as f64) as f32), 0x3c00);
+    let (x, y, z) = (f16_to_f32(0x4149), f16_to_f32(0x3e2d), f16_to_f32(0x0563));
+    assert_eq!(f2h_soft(fma_rto(x, y, z)), 0x4415);
+    assert_eq!(f2h_soft(fma16(x, y, z)), 0x4415);
+    assert_eq!(f2h_soft(x * y + z), 0x4414);
+    assert_eq!(fma_rto(f32::INFINITY, 1.0, 1.0), f32::INFINITY);
+    assert!(fma_rto(f32::INFINITY, 0.0, 1.0).is_nan());
+    assert_eq!(f2h_soft(fma_rto(f32::MAX, 2.0, 0.0)), 0x7c00);
+}
+
 #[test]
 fn fma16_signed_zero_and_specials() {
     let z = f16_to_f32(0x0000);
@@ -187,10 +276,10 @@ fn f16_exactness_of_constants() {
 #[test]
 fn defines_follow_the_verified_flags() {
     let f = Fma { preserve: true, any: false, hybrid: true, f2h: true };
-    assert_eq!(crate::dxc::fma_defines(f, false), vec!["-D", "TB_FAST_FMA", "-D", "TB_FAST_F2H"]);
-    assert_eq!(crate::dxc::fma_defines(f, true), vec!["-D", "TB_HYBRID_FMA", "-D", "TB_FAST_F2H"]);
+    assert_eq!(crate::dxc::fma_defines(f, false), vec!["-D", "TB_FAST_FMA", "-D", "TB_FAST_F2H", "-enable-16bit-types"]);
+    assert_eq!(crate::dxc::fma_defines(f, true), vec!["-D", "TB_HYBRID_FMA", "-D", "TB_FAST_F2H", "-enable-16bit-types"]);
     let g = Fma { any: true, ..f };
-    assert_eq!(crate::dxc::fma_defines(g, true), vec!["-D", "TB_FAST_FMA", "-D", "TB_FAST_F2H"]);
+    assert_eq!(crate::dxc::fma_defines(g, true), vec!["-D", "TB_FAST_FMA", "-D", "TB_FAST_F2H", "-enable-16bit-types"]);
     assert!(crate::dxc::fma_defines(Fma::default(), true).is_empty());
     let k = |f: Fma| crate::shader_cache::key("x", "cs_6_2", f, "");
     assert_ne!(k(Fma::default()), k(Fma { f2h: true, ..Fma::default() }));

@@ -52,13 +52,13 @@ const F2H_PER_THREAD: u32 = 4096;
 
 fn f2h_shader(fast: &str, exact: &str) -> String {
     format!(
-        "RWByteAddressBuffer io : register(u0);\n{}\n{}\n[RootSignature(\"UAV(u0)\")]\n[numthreads({GROUP}, 1, 1)]\nvoid main(uint3 g : SV_DispatchThreadID) {{ uint base = g.x * {F2H_PER_THREAD}u; uint bad = 0u; uint first = 0xffffffffu; for (uint k = 0u; k < {F2H_PER_THREAD}u; k++) {{ uint x = base + k; if (tb_f2h_f(asfloat(x)) != tb_f2h_x(asfloat(x))) {{ bad++; first = min(first, x); }} }} if (bad != 0u) {{ uint o; io.InterlockedAdd(0, bad, o); io.InterlockedMin(4, first, o); }} }}\n",
+        "RWByteAddressBuffer io : register(u0);\n{}\n{}\n[RootSignature(\"UAV(u0)\")]\n[numthreads({GROUP}, 1, 1)]\nvoid main(uint3 g : SV_DispatchThreadID) {{ uint base = g.x * {F2H_PER_THREAD}u; uint bad = 0u; uint first = 0xffffffffu; for (uint k = 0u; k < {F2H_PER_THREAD}u; k++) {{ uint x = base + k; if (tb_f2h_f(asfloat(x)) != tb_f2h_x(asfloat(x))) {{ bad++; first = min(first, x); }} }} uint o; if (bad != 0u) {{ io.InterlockedAdd(0, bad, o); io.InterlockedMin(4, first, o); }} io.InterlockedAdd(8, 1u, o); }}\n",
         fast.replacen("uint tb_f2h(", "uint tb_f2h_f(", 1),
         exact.replacen("uint tb_f2h(", "uint tb_f2h_x(", 1)
     )
 }
 
-unsafe fn dispatch_f2h(g: &mut Gpu, code: &[u8]) -> Result<(u32, u32), String> {
+unsafe fn dispatch_f2h(g: &mut Gpu, code: &[u8]) -> Result<(u32, u32, u32), String> {
     let mut rs: *mut c_void = std::ptr::null_mut();
     let hr = vcall!(g.device, 16, fn(u32, *const u8, usize, *const Guid, *mut *mut c_void) -> i32, 0, code.as_ptr(), code.len(), &d3d::IID_ROOTSIG, &mut rs);
     if hr < 0 {
@@ -74,31 +74,36 @@ unsafe fn dispatch_f2h(g: &mut Gpu, code: &[u8]) -> Result<(u32, u32), String> {
         d3d::release(rs);
         return Err(format!("CreateComputePipelineState {:#x}", hr as u32));
     }
-    let buf = g.buffer(8, 1, d3d::COPY_DEST, true)?;
-    let up = g.buffer(8, 2, d3d::GENERIC_READ, false)?;
-    let rb = g.buffer(8, 3, d3d::COPY_DEST, false)?;
+    let buf = g.buffer(12, 1, d3d::COPY_DEST, true)?;
+    let up = g.buffer(12, 2, d3d::GENERIC_READ, false)?;
+    let rb = g.buffer(12, 3, d3d::COPY_DEST, false)?;
     let mut init = 0u32.to_le_bytes().to_vec();
     init.extend(u32::MAX.to_le_bytes());
+    init.extend(0u32.to_le_bytes());
     Gpu::map_write(up, &init);
     g.begin();
     let l = g.list;
-    vcall!(l, 15, fn(*mut c_void, u64, *mut c_void, u64, u64) -> (), buf, 0, up, 0, 8);
+    vcall!(l, 15, fn(*mut c_void, u64, *mut c_void, u64, u64) -> (), buf, 0, up, 0, 12);
     g.barrier(buf, d3d::COPY_DEST, 8);
     vcall!(l, 29, fn(*mut c_void) -> (), rs);
     vcall!(l, 25, fn(*mut c_void) -> (), pso);
     vcall!(l, 41, fn(u32, u64) -> (), 0, Gpu::gpu_va(buf));
-    let groups = ((1u64 << 32) / (F2H_PER_THREAD as u64 * GROUP as u64)) as u32;
-    vcall!(l, 14, fn(u32, u32, u32) -> (), groups, 1, 1);
+    vcall!(l, 14, fn(u32, u32, u32) -> (), f2h_groups(), 1, 1);
     g.barrier(buf, 8, d3d::COPY_SOURCE);
-    vcall!(l, 15, fn(*mut c_void, u64, *mut c_void, u64, u64) -> (), rb, 0, buf, 0, 8);
+    vcall!(l, 15, fn(*mut c_void, u64, *mut c_void, u64, u64) -> (), rb, 0, buf, 0, 12);
     let sub = g.submit();
-    let out = if sub.is_ok() { Gpu::map_read(rb, 8) } else { None };
+    let out = if sub.is_ok() { Gpu::map_read(rb, 12) } else { None };
     for o in [pso, rs, buf, up, rb] {
         d3d::release(o);
     }
     sub?;
     let out = out.ok_or("map readback")?;
-    Ok((u32::from_le_bytes(out[0..4].try_into().unwrap()), u32::from_le_bytes(out[4..8].try_into().unwrap())))
+    let w = |i: usize| u32::from_le_bytes(out[i..i + 4].try_into().unwrap());
+    Ok((w(0), w(4), w(8)))
+}
+
+fn f2h_groups() -> u32 {
+    ((1u64 << 32) / (F2H_PER_THREAD as u64 * GROUP as u64)) as u32
 }
 
 unsafe fn adapter_id() -> String {
@@ -285,10 +290,11 @@ fn run_probe(fast: &str, hybrid: &str, exact: &str, f2h: Option<(&str, &str)>) -
     if let Some((ff, fx)) = f2h {
         let src = f2h_shader(ff, fx);
         for mode in ["preserve", "any"] {
-            let code = crate::dxc::compile_denorm(&src, "cs_6_2", mode, &[])?;
-            let (bad, first) = unsafe { dispatch_f2h(&mut g, &code) }?;
-            f2h_ok &= bad == 0;
-            detail.push_str(&format!(" f2h {mode}: {bad} of 4294967296 inputs differ"));
+            let code = crate::dxc::compile_denorm(&src, "cs_6_2", mode, &["-enable-16bit-types"])?;
+            let (bad, first, ran) = unsafe { dispatch_f2h(&mut g, &code) }?;
+            let all = ran == f2h_groups() * GROUP;
+            f2h_ok &= bad == 0 && all;
+            detail.push_str(&format!(" f2h {mode}: {bad} of 4294967296 inputs differ{}", if all { "" } else { " (not all threads ran)" }));
             if bad != 0 {
                 detail.push_str(&format!(" (first {first:08x})"));
             }
@@ -364,7 +370,7 @@ mod tests {
         assert!(h.contains("mad(") && h.contains("double"));
         assert!(x.contains("double"));
         let (ff, fx) = f2h_lines().expect("tb_f2h block");
-        assert!(ff.contains("f32tof16("));
+        assert!(ff.contains("(float16_t)x"));
         assert!(!fx.contains("f32tof16("));
         assert!(f2h_shader(ff, fx).contains("tb_f2h_f(") && f2h_shader(ff, fx).contains("tb_f2h_x("));
     }

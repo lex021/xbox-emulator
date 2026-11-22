@@ -545,6 +545,21 @@ pub fn is_planar(dxgi: u32) -> bool {
 }
 
 pub fn compute(d: &Desc) -> Option<Layout> {
+    compute_with(d, false)
+}
+
+pub fn is_depth_stencil_planar(dxgi: u32) -> bool {
+    ROWS.get(dxgi as usize).is_some_and(|r| r[4] == 1 && r[6] != 0)
+}
+
+pub fn compute_depth_msaa(d: &Desc) -> Option<Layout> {
+    if d.samples <= 1 || d.dimension != 3 || d.mips != 1 || !is_depth_stencil_planar(d.dxgi) {
+        return None;
+    }
+    compute_with(d, true)
+}
+
+fn compute_with(d: &Desc, msaa_planes: bool) -> Option<Layout> {
     let hw = hw_index();
     if d.pitch != 0 && (d.pitch as u64) < d.width {
         return None;
@@ -561,7 +576,7 @@ pub fn compute(d: &Desc) -> Option<Layout> {
             Some(l)
         }
         Kind::Planar(f4, f8, kind) => {
-            if d.samples > 1 {
+            if d.samples > 1 && !msaa_planes {
                 return None;
             }
             let video = kind != 1 && ROWS[d.dxgi as usize][0] != 0 && d.dimension != 2;

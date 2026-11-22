@@ -689,7 +689,80 @@ unsafe fn dump_failed_gfx_pso(n: usize, desc: &[u8]) {
     let _ = std::fs::write(dir.join(format!("{n}_input.txt")), txt);
 }
 
+const DXGI_XBOX_R10G10B10_SNORM_A2_UNORM: u32 = 189;
+const DXGI_R10G10B10A2_UNORM: u32 = 24;
+
+pub(crate) fn pc_input_format(fmt: u32) -> Option<u32> {
+    match fmt {
+        DXGI_XBOX_R10G10B10_SNORM_A2_UNORM => Some(DXGI_R10G10B10A2_UNORM),
+        _ => None,
+    }
+}
+
+unsafe fn snorm10_semantics(desc: &[u8]) -> Vec<String> {
+    let ptr = u64::from_le_bytes(desc[0x228..0x230].try_into().unwrap()) as *const u8;
+    let n = u32::from_le_bytes(desc[0x230..0x234].try_into().unwrap()) as usize;
+    if ptr.is_null() || n == 0 || n > 64 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for i in 0..n {
+        let e = unsafe { core::slice::from_raw_parts(ptr.add(i * 32), 32) };
+        if u32::from_le_bytes(e[12..16].try_into().unwrap()) != DXGI_XBOX_R10G10B10_SNORM_A2_UNORM {
+            continue;
+        }
+        let np = u64::from_le_bytes(e[0..8].try_into().unwrap()) as *const u8;
+        if np.is_null() {
+            continue;
+        }
+        let mut name = String::new();
+        let mut k = 0;
+        while k < 64 && unsafe { *np.add(k) } != 0 {
+            name.push(unsafe { *np.add(k) } as char);
+            k += 1;
+        }
+        out.push(format!("{name}{}", u32::from_le_bytes(e[8..12].try_into().unwrap())));
+    }
+    out
+}
+
+unsafe fn remap_xbox_input_formats(desc: &mut [u8]) -> Option<Vec<u8>> {
+    let ptr = u64::from_le_bytes(desc[0x228..0x230].try_into().unwrap()) as *const u8;
+    let n = u32::from_le_bytes(desc[0x230..0x234].try_into().unwrap()) as usize;
+    if ptr.is_null() || n == 0 || n > 64 {
+        return None;
+    }
+    let src = unsafe { core::slice::from_raw_parts(ptr, n * 32) };
+    if !(0..n).any(|i| pc_input_format(u32::from_le_bytes(src[i * 32 + 12..i * 32 + 16].try_into().unwrap())).is_some()) {
+        return None;
+    }
+    let mut v = src.to_vec();
+    for i in 0..n {
+        let o = i * 32 + 12;
+        let f = u32::from_le_bytes(v[o..o + 4].try_into().unwrap());
+        if let Some(pc) = pc_input_format(f) {
+            static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                record("d3d12_xs", "CreateGraphicsPSO_X", &format!("input element {i}: Xbox-only DXGI format {f} (R10G10B10_SNORM_A2_UNORM) fetched as {pc} (R10G10B10A2_UNORM): the VS decodes SNORM from the UNORM bits (vs_snorm)"));
+            }
+            v[o..o + 4].copy_from_slice(&pc.to_le_bytes());
+        }
+    }
+    desc[0x228..0x230].copy_from_slice(&(v.as_ptr() as u64).to_le_bytes());
+    Some(v)
+}
+
 unsafe extern "system" fn create_gfx_pso_x(
+    this: *mut DeviceWrapper, pdesc: *const u8, num_ext: u32, pext: *const u8,
+    riid: *const Guid, ppv: *mut *mut c_void,
+) -> i32 {
+    if let Some(hr) = unsafe { crate::pso_async::create_gfx(this, (*this).real, pdesc, num_ext, pext, riid, ppv, create_gfx_pso_sync) } {
+        return hr;
+    }
+    unsafe { create_gfx_pso_sync(this, pdesc, num_ext, pext, riid, ppv) }
+}
+
+unsafe extern "system" fn create_gfx_pso_sync(
     this: *mut DeviceWrapper, pdesc: *const u8, _num_ext: u32, _pext: *const u8,
     riid: *const Guid, ppv: *mut *mut c_void,
 ) -> i32 {
@@ -734,6 +807,9 @@ unsafe extern "system" fn create_gfx_pso_x(
                         (Some(_), Some(o)) => crate::pso_ext::ps::variant(o, crate::pso_ext::ps::depth_stencil_writes(&desc)).unwrap_or(code),
                         _ => code,
                     }
+                } else if stage == "VS" {
+                    let sems = unsafe { snorm10_semantics(&desc) };
+                    unsafe { crate::vs_snorm::variant(p, n, &sems) }.unwrap_or(code)
                 } else {
                     code
                 };
@@ -754,6 +830,7 @@ unsafe extern "system" fn create_gfx_pso_x(
         }
         E_FAIL
     } else {
+        let _il_keep = unsafe { remap_xbox_input_formats(&mut desc) };
         static DUMP1: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
         if DUMP1.fetch_add(1, Ordering::Relaxed) < 2 {
             let ptr = rd(&desc, 0x228) as *const u8;
@@ -855,8 +932,8 @@ unsafe extern "system" fn create_gfx_pso_x(
     if LOGN.fetch_add(1, Ordering::Relaxed) % 32 == 0 {
         let (sok, sfail) = crate::shader_xlat::counts();
         record("d3d12_xs", "CreateGraphicsPSO_X", &format!(
-            "counts: pso_ok={} pso_fail={} untranslatable={} | shaders ok={sok} fail={sfail}",
-            OK.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed), XFAIL.load(Ordering::Relaxed)));
+            "counts: pso_ok={} pso_fail={} untranslatable={} | shaders ok={sok} fail={sfail} | {}",
+            OK.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed), XFAIL.load(Ordering::Relaxed), crate::pso_async::summary()));
     }
     hr
 }
@@ -948,6 +1025,9 @@ pub fn pso_summary(pso: usize) -> Option<(usize, usize, String)> {
 static REAL_ORIG: [core::sync::atomic::AtomicUsize; 32] = [const { core::sync::atomic::AtomicUsize::new(0) }; 32];
 fn real_orig(slot: usize) -> usize {
     REAL_ORIG[slot].load(Ordering::Relaxed)
+}
+pub(crate) fn real_device_orig(slot: usize) -> usize {
+    REAL_ORIG.get(slot).map_or(0, |v| v.load(Ordering::Relaxed))
 }
 unsafe extern "system" fn real_create_root_signature(real: *mut c_void, mask: u32, blob: *const u8, len: usize, riid: *const Guid, ppv: *mut *mut c_void) -> i32 {
     let f: unsafe extern "system" fn(*mut c_void, u32, *const u8, usize, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(real_orig(16)) };
@@ -1072,6 +1152,7 @@ unsafe extern "system" fn create_rtv_traced(this: *mut DeviceWrapper, res: *mut 
     let real = unsafe { (*this).real };
     let inc: unsafe extern "system" fn(*mut c_void, u32) -> u32 = unsafe { core::mem::transmute(*real_vtbl(real).add(15)) };
     crate::rtcap::note_view(dest, res as usize, unsafe { inc(real, 2) } as usize);
+    unsafe { crate::rtcap::register_view_target(res, 4) };
     crate::replay::note_view(dest, 'r', res as usize, if pdesc.is_null() { None } else { Some(unsafe { core::slice::from_raw_parts(pdesc, 24) }) });
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(*real_vtbl(real).add(20)) };
     unsafe { f(real, res, pdesc, dest) };
@@ -1079,6 +1160,7 @@ unsafe extern "system" fn create_rtv_traced(this: *mut DeviceWrapper, res: *mut 
 unsafe extern "system" fn create_dsv_traced(this: *mut DeviceWrapper, res: *mut c_void, pdesc: *const u8, dest: usize) {
     let real = unsafe { (*this).real };
     crate::rtcap::note_view(dest, res as usize, 0);
+    unsafe { crate::rtcap::register_view_target(res, 0x10) };
     crate::replay::note_view(dest, 'd', res as usize, if pdesc.is_null() { None } else { Some(unsafe { core::slice::from_raw_parts(pdesc, 24) }) });
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(*real_vtbl(real).add(21)) };
     unsafe { f(real, res, pdesc, dest) };
@@ -1099,6 +1181,7 @@ unsafe extern "system" fn create_derived_pso_x(
     static OK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     static FAIL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     let real = unsafe { (*this).real };
+    let base = crate::pso_async::wait_real(base);
     let rec = pso_registry().lock().unwrap().get(&(base as usize)).cloned();
     let Some(rec) = rec else {
         if FAIL.fetch_add(1, Ordering::Relaxed) < 6 {
@@ -1282,6 +1365,16 @@ unsafe extern "system" fn create_compute_pso_std(this: *mut DeviceWrapper, pdesc
 }
 
 unsafe extern "system" fn create_compute_pso_x(
+    this: *mut DeviceWrapper, pdesc: *const u8, num_ext: u32, pext: *const u8,
+    riid: *const Guid, ppv: *mut *mut c_void,
+) -> i32 {
+    if let Some(hr) = unsafe { crate::pso_async::create_compute(this, (*this).real, pdesc, num_ext, pext, riid, ppv, create_compute_pso_sync) } {
+        return hr;
+    }
+    unsafe { create_compute_pso_sync(this, pdesc, num_ext, pext, riid, ppv) }
+}
+
+unsafe extern "system" fn create_compute_pso_sync(
     this: *mut DeviceWrapper, pdesc: *const u8, _num_ext: u32, _pext: *const u8,
     riid: *const Guid, ppv: *mut *mut c_void,
 ) -> i32 {
@@ -1662,6 +1755,8 @@ pub(crate) fn vtable() -> *const usize {
         crate::cmdlist_validate::hook_device(&mut v);
         crate::title_heap::hook_device(&mut v);
         crate::console_slots_mesh::install_device(&mut v);
+        crate::ecl_probe::install_device(&mut v);
+        crate::cbv_raw::hook_device(&mut v);
         Box::leak(v.into_boxed_slice()).as_ptr() as usize
     }) as *const usize
 }

@@ -573,7 +573,7 @@ pub fn parse_features(text: &str) -> Vec<Feature> {
     v
 }
 
-fn features() -> &'static Vec<Feature> {
+pub fn features() -> &'static Vec<Feature> {
     static F: OnceLock<Vec<Feature>> = OnceLock::new();
     F.get_or_init(|| {
         let Some(dir) = title().dir.as_deref() else { return Vec::new() };

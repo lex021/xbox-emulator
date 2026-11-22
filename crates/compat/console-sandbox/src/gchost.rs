@@ -100,6 +100,7 @@ pub fn on_bytes(id: u64, data: &[u8]) -> Vec<u8> {
     for (kind, payload) in msgs {
         if kind & 0xffff == AUDIO_HELLO && payload.is_empty() {
             let ack = kind & 0xffff_0000;
+            crate::crossvm::set_hello((kind >> 16) as u16);
             compat_common::record_raw("gamecore-host", "audio", &format!("XVMAudioService hello {kind:#010x}; host ack frame {ack:#010x}"));
             out.extend(frame(st.prev_out, ack, &[]));
             st.prev_out = 0;
