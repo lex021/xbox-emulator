@@ -66,6 +66,12 @@ fn bytecode(stream: &[u8], inner: usize) -> (u64, u64) {
     (p, n)
 }
 
+fn root_signature(stream: &[u8], subs: &[(u32, usize)]) -> u64 {
+    subs.iter()
+        .find(|(ty, _)| *ty == SUB_ROOT_SIGNATURE)
+        .map_or(0, |&(_, offset)| u64::from_le_bytes(stream[offset..offset + 8].try_into().unwrap()))
+}
+
 pub fn validate(stream: &[u8], subs: &[(u32, usize)]) -> Result<(), String> {
     let has = |t: u32| subs.iter().find(|(x, _)| *x == t).map(|(_, o)| bytecode(stream, *o).0 != 0).unwrap_or(false);
     if has(SUB_MS) && has(SUB_VS) {
@@ -85,7 +91,7 @@ pub fn as_root_rule(stream: &[u8], subs: &[(u32, usize)], flags_of: &dyn Fn(u64)
     if code(SUB_MS).is_none() {
         return Ok(());
     }
-    let rs = subs.iter().find(|(t, _)| *t == SUB_ROOT_SIGNATURE).map(|(_, o)| u64::from_le_bytes(stream[*o..*o + 8].try_into().unwrap())).unwrap_or(0);
+    let rs = root_signature(stream, subs);
     let flags = if rs != 0 {
         flags_of(rs).ok_or_else(|| format!("amplification PSO root signature {rs:#x} was not created through the console CreateRootSignature, its flags are unknown"))?
     } else {
@@ -143,12 +149,17 @@ pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], ri
         return E_INVALIDARG;
     }
     let stream = core::slice::from_raw_parts(ptr as *const u8, size as usize);
-    let rule = parse(stream).and_then(|s| as_root_rule(stream, &s, &|rs| crate::console_slots_mesh::root_flags(rs as usize)));
-    if let Err(e) = rule {
-        record("d3d12_xs", "CreatePipelineState", &format!("{e} -> E_INVALIDARG"));
-        return E_INVALIDARG;
-    }
-    let root = parse(stream).ok().and_then(|s| s.iter().find(|(t, _)| *t == 0).map(|&(_, o)| bytecode(stream, o).0)).unwrap_or(0);
+    let subs = match parse(stream).and_then(|subs| {
+        as_root_rule(stream, &subs, &|rs| crate::console_slots_mesh::root_flags(rs as usize))?;
+        Ok(subs)
+    }) {
+        Ok(subs) => subs,
+        Err(e) => {
+            record("d3d12_xs", "CreatePipelineState", &format!("{e} -> E_INVALIDARG"));
+            return E_INVALIDARG;
+        }
+    };
+    let root = root_signature(stream, &subs);
     let xlat = |ty: u32, b: &[u8], (n, f): (u32, [u32; 8])| {
         if ty == SUB_MS && root != 0 && crate::shader_xlat::needs_external_root_data(b) {
             if let Some(data) = crate::console_slots_mesh::root_data(root as *mut c_void) {
@@ -177,7 +188,7 @@ pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], ri
     let f: unsafe extern "system" fn(*mut c_void, *const [u64; 2], *const c_void, *mut *mut c_void) -> i32 = core::mem::transmute(*vt2.add(PC_DEVICE2_CREATE_PIPELINE_STATE));
     let d = [out.len() as u64, out.as_ptr() as u64];
     let hr = f(dev2, &d, riid, ppv);
-    if hr >= 0 && !(*ppv).is_null() && parse(stream).is_ok_and(|s| s.iter().any(|(t, o)| *t == SUB_AS && bytecode(stream, *o).0 != 0)) {
+    if hr >= 0 && !(*ppv).is_null() && subs.iter().any(|(t, o)| *t == SUB_AS && bytecode(stream, *o).0 != 0) {
         crate::console_slots_mesh::note_as_pso(*ppv as usize);
     }
     if hr >= 0 && !(*ppv).is_null() {
@@ -279,6 +290,25 @@ mod tests {
         assert_eq!(unsafe { core::slice::from_raw_parts(p as *const u8, n as usize) }, &[109; 5]);
         assert_eq!(&out[..8], &s[..8]);
         assert_eq!(&out[64..], &s[64..]);
+    }
+
+    #[test]
+    fn create_pipeline_state_accepts_root_signature_at_end_of_stream() {
+        const E_NOINTERFACE: i32 = 0x8000_4002u32 as i32;
+        unsafe extern "system" fn query_device2(_: *mut c_void, _: *const Guid, _: *mut *mut c_void) -> i32 {
+            E_NOINTERFACE
+        }
+
+        let vtable = [query_device2 as *const () as usize];
+        let mut device = vtable.as_ptr();
+        let mut stream = Vec::new();
+        push(&mut stream, SUB_MS, &[0; 16]);
+        push(&mut stream, SUB_ROOT_SIGNATURE, &0x1234u64.to_le_bytes());
+        let desc = [stream.len() as u64, stream.as_ptr() as u64];
+        let mut pipeline = core::ptr::null_mut();
+        let hr = unsafe { create_pipeline_state((&mut device as *mut *const usize).cast(), &desc, core::ptr::null(), &mut pipeline) };
+        assert_eq!(hr, E_NOINTERFACE);
+        assert!(pipeline.is_null());
     }
 
     #[test]
