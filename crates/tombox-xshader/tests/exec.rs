@@ -705,7 +705,7 @@ fn bfe64(a: u64, b: u32, signed: bool) -> u64 {
     if w == 0 {
         return 0;
     }
-    let x = a >> o;
+    let x = if signed { ((a as i64) >> o) as u64 } else { a >> o };
     if w >= 64 {
         return x;
     }
@@ -776,6 +776,18 @@ fn scalar_sop2() {
         let r = if w == 0 { 0 } else { (((1u64 << w) - 1) as u32) << (b & 31) };
         s2(&mut c, "s_bfm_b32", 0x24, a, b, 1, r, 1);
     }
+    // Both results and SCC at zero width, the sign bit, and past the top bit.
+    for (offset, width, unsigned, signed) in [
+        (16, 0, 0, 0),
+        (31, 1, 1, u32::MAX),
+        (28, 8, 8, 0xffff_fff8),
+        (16, 32, 0x8123, 0xffff_8123),
+        (0, 32, 0x8123_4567, 0x8123_4567),
+    ] {
+        let control = (width << 16) | offset;
+        s2(&mut c, "s_bfe_u32", 0x27, 0x8123_4567, control, 1, unsigned, nz(u64::from(unsigned)));
+        s2(&mut c, "s_bfe_i32", 0x28, 0x8123_4567, control, 1, signed, nz(u64::from(signed)));
+    }
     let pairs64: [(u64, u64); 4] = [(0x1234_5678_9abc_def0, 0x0f0f_0f0f_f0f0_f0f0), (0, 0), (u64::MAX, 0), (0x8000_0000_0000_0001, 0xffff_ffff_0000_0000)];
     for &(a, b) in &pairs64 {
         for (m, op, f) in [
@@ -801,6 +813,23 @@ fn scalar_sop2() {
         s2w(&mut c, "s_bfe_i64", 0x2a, a, b as u64, 0, r, nz(r));
     }
     c.run_both("sop2");
+}
+
+#[test]
+fn scalar_bfe64_literal_extension() {
+    let mut cases = Cases::new();
+    let mut pre = pr();
+    pre.sv(12, (32 << 16) | 32);
+    let mut post = pr();
+    post.s2v(0, 20).s2v(1, 21).scc_to_v(2);
+    for (name, op, literal, expected) in [
+        ("s_bfe_i64", 0x2a, 0xffff_fffe, [u32::MAX, u32::MAX, 1]),
+        ("s_bfe_i64", 0x2a, 0x7fff_fffe, [0, 0, 0]),
+        ("s_bfe_u64", 0x29, 0xffff_fffe, [0, 0, 0]),
+    ] {
+        cases.add(name, &pre, &[sop2(op, 20, LIT, 12), literal], &post, &expected);
+    }
+    cases.run_both("s_bfe64_literal_extension");
 }
 
 #[test]

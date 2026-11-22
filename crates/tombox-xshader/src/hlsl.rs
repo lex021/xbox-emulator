@@ -2833,8 +2833,13 @@ impl<'a> Emitter<'a> {
                 let d = d.ok_or("no dst")?;
                 let (a, b) = (r(&s[0])?, r(&s[1])?);
                 if m == "s_bfe_u64" || m == "s_bfe_i64" {
-                    self.touch(&hi(&s[0]));
-                    let ah = r(&hi(&s[0]))?;
+                    // A 32-bit literal is extended according to the type of SRC0.
+                    let upper = match (&s[0], m) {
+                        (Opnd::Literal(v), "s_bfe_i64") if *v & 0x8000_0000 != 0 => Opnd::ConstInt(-1),
+                        (src, _) => hi(src),
+                    };
+                    self.touch(&upper);
+                    let ah = r(&upper)?;
                     let t = self.tmp;
                     self.tmp += 1;
                     self.line(&format!(
