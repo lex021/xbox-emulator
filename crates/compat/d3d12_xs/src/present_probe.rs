@@ -190,7 +190,11 @@ pub fn note_topology(t: u32) {
         }
         if v == u64::MAX && TOPO_VAL[i].compare_exchange(u64::MAX, t as u64, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
             TOPO_ODD[i].fetch_add(1, Ordering::Relaxed);
-            record("d3d12_xs", "PresentX.probe", &format!("title set primitive topology {t}, which is not a PC D3D12 topology; it is forwarded unchanged"));
+            if t == crate::rectlist::RECTLIST {
+                record("d3d12_xs", "PresentX.probe", "title set primitive topology 17 (RECTLIST); it is forwarded as TRIANGLELIST and its draws use a geometry-shader pipeline variant that adds each rect's fourth corner v1 + v2 - v0");
+            } else {
+                record("d3d12_xs", "PresentX.probe", &format!("title set primitive topology {t}, which is not a PC D3D12 topology; it is forwarded unchanged"));
+            }
             return;
         }
     }

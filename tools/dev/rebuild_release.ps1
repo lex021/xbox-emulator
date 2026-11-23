@@ -8,12 +8,15 @@ param(
 $ErrorActionPreference = 'Stop'
 $env:CARGO_TARGET_DIR = $TargetDir
 $sw = [Diagnostics.Stopwatch]::StartNew()
+$freeze = Join-Path $Root 'tools\dev\batch_runs\BUILD_FREEZE'
+Set-Content -LiteralPath $freeze -Value ("release build pid={0} since={1}: no edits to crates until this file is gone" -f $PID, (Get-Date -Format s)) -Encoding utf8
 Push-Location $Root
 try {
   cmd /c "cargo build --release --workspace --keep-going -j $Jobs --message-format=short > `"$Log`" 2>&1"
   $code = $LASTEXITCODE
 } finally {
   Pop-Location
+  Remove-Item -LiteralPath $freeze -Force -ErrorAction SilentlyContinue
 }
 $lines = Get-Content $Log
 $failed = @($lines | Select-String -Pattern 'could not compile `([^`]+)`' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Sort-Object -Unique)

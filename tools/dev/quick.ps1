@@ -143,6 +143,7 @@ if (-not $NoBuild -and -not $DryRun) {
   $env:CARGO_TARGET_DIR = $TargetDir
   if ($Lld) { $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = 'rust-lld.exe' } else { Remove-Item Env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER -ErrorAction SilentlyContinue }
   $pargs = ($build.Keys | ForEach-Object { "-p $_" }) -join ' '
+  if ($build.Contains('d3d12_xs') -and -not $build.Contains('tombox-xshader')) { $pargs += ' -p tombox-xshader' }
   $prof = if ($Profile -eq 'release') { '--release' } else { "--profile $Profile" }
   $bw = [Diagnostics.Stopwatch]::StartNew()
   Push-Location $Root

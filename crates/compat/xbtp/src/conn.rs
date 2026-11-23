@@ -797,7 +797,10 @@ pub unsafe fn tcp_client_connect(name: BSTR, port: u32, timeout: u32) -> Result<
                 break 'run Err(E_COULD_NOT_CONNECT);
             }
             _ => match resolve(name, port) {
-                Ok(a) => a,
+                Ok(mut a) => {
+                    crate::offline::localize_sockaddr(a.addr.as_mut_ptr(), a.size as usize);
+                    a
+                }
                 Err(hr) => break 'run Err(hr),
             },
         };

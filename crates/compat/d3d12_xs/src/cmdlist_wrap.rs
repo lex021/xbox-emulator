@@ -34,11 +34,34 @@ const N: usize = 128;
 static XBOX_VT: [AtomicUsize; N] = [const { AtomicUsize::new(0) }; N];
 static BUILT: AtomicBool = AtomicBool::new(false);
 static mut REAL_VT_PTR: *const usize = core::ptr::null();
+pub(crate) unsafe fn real_list_slot(slot: usize) -> usize {
+    let p = unsafe { REAL_VT_PTR };
+    if p.is_null() { 0 } else { unsafe { *p.add(slot) } }
+}
 static INSERTED_HITS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) const CONSOLE_NULL_SLOT: usize = 66;
 
+pub(crate) unsafe fn real_slot_ptr(slot: usize) -> *mut usize {
+    let p = unsafe { REAL_VT_PTR };
+    if p.is_null() { core::ptr::null_mut() } else { unsafe { p.add(slot) as *mut usize } }
+}
+
 pub(crate) unsafe fn real_method(slot: usize) -> usize {
     unsafe { *REAL_VT_PTR.add(slot) }
+}
+
+#[track_caller]
+pub(crate) unsafe fn pc_method(list: *mut c_void, slot: usize) -> usize {
+    let vt = unsafe { *(list as *const *const usize) };
+    let xbox = XBOX_VT.as_ptr() as *const usize;
+    if vt == xbox && !unsafe { REAL_VT_PTR }.is_null() {
+        if let Some(t) = crate::rootlog::route(slot, core::panic::Location::caller().file()) {
+            return t;
+        }
+        unsafe { *REAL_VT_PTR.add(slot) }
+    } else {
+        unsafe { *vt.add(slot) }
+    }
 }
 
 pub(crate) fn vt_get(i: usize) -> usize {
@@ -247,6 +270,7 @@ unsafe extern "system" fn indirect_traced(this: *mut c_void, sig: *mut c_void, n
 static FLUSH_HITS: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "system" fn flush_texture_cache_x(this: *mut c_void) {
+    let _ij = unsafe { crate::inject::scope(this, crate::inject::BARRIER) };
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let on = *ON.get_or_init(|| std::env::var("TOMBOX_FLUSH_UAV").map(|v| v != "0").unwrap_or(true));
     if FLUSH_HITS.fetch_add(1, Ordering::Relaxed) == 0 {
@@ -403,9 +427,12 @@ pub fn apply(real_list: *mut c_void) {
             crate::cl_console_fix::install_family_tail(&XBOX_VT);
             crate::resolve_x::install(&XBOX_VT);
             crate::dred_marks::install(&XBOX_VT);
+            crate::depth_uav::install_cmdlist(&XBOX_VT);
             crate::pso_async::install(&XBOX_VT);
             crate::gws_dispatch::install(&XBOX_VT);
             crate::cbv_raw::install_draw_check(&XBOX_VT);
+            crate::passcap::install(&XBOX_VT);
+            crate::gpuprof::install_ops(&XBOX_VT);
             XBOX_VT[CONSOLE_NULL_SLOT].store(0, Ordering::Relaxed);
             record("d3d12_xs", "cmdlist.vtable",
                 &format!("built Xbox-layout cmdlist vtable from real {real_vt:p} (+4 shift at PC28)"));
@@ -479,7 +506,6 @@ unsafe fn build_shim_thunks() {
 }
 
 /// Wrap a freshly created real command list in a shim object for the title.
-#[cfg(test)]
 pub fn wrap(real_list: *mut c_void) -> *mut c_void {
     wrap_for_driver(real_list, false)
 }

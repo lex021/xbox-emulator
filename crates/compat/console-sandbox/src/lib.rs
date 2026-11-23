@@ -16,6 +16,8 @@ pub mod modules;
 pub mod power;
 pub mod regnt;
 pub mod rpc;
+pub mod rpcsrv;
+pub mod comreg;
 pub mod wnf;
 pub mod host;
 pub mod notify;
@@ -60,6 +62,8 @@ const SYSINFO: &[&str] = &["api-ms-win-core-sysinfo-", "kernelbase", "kernel32"]
 const THREADS: &[&str] = &["api-ms-win-core-processthreads-", "kernelbase", "kernel32"];
 const SERVICE: &[&str] = &["api-ms-win-service-", "advapi32", "sechost"];
 const RPC: &[&str] = &["rpcrt4"];
+const COM: &[&str] = &["api-ms-win-core-com-", "combase", "ole32"];
+const WINRT: &[&str] = &["api-ms-win-core-winrt-", "combase"];
 const POWER: &[&str] = &["api-ms-win-power-setting-", "powrprof", "umpdc"];
 const DEVCFG: &[&str] = &["api-ms-win-devices-config-", "cfgmgr32"];
 const LOADER: &[&str] = &["api-ms-win-core-libraryloader-", "kernelbase", "kernel32"];
@@ -123,6 +127,31 @@ pub fn hooks() -> Vec<Hook> {
         hook!("RtlAllocateWnfSerializationGroup", NTDLL, wnf::rtl_allocate_wnf_serialization_group),
         hook!("RtlWaitForWnfMetaNotification", NTDLL, wnf::rtl_wait_for_wnf_meta_notification),
         hook!("RpcServerUseProtseqW", RPC, rpc::rpc_server_use_protseq_w),
+        hook!("RpcServerInqDefaultPrincNameW", RPC, rpcsrv::rpc_server_inq_default_princ_name_w),
+        hook!("RpcServerRegisterAuthInfoW", RPC, rpcsrv::rpc_server_register_auth_info_w),
+        hook!("RpcServerRegisterIf", RPC, rpcsrv::rpc_server_register_if),
+        hook!("RpcServerRegisterIfEx", RPC, rpcsrv::rpc_server_register_if_ex),
+        hook!("RpcServerRegisterIf2", RPC, rpcsrv::rpc_server_register_if2),
+        hook!("RpcServerRegisterIf3", RPC, rpcsrv::rpc_server_register_if3),
+        hook!("RpcServerUnregisterIf", RPC, rpcsrv::rpc_server_unregister_if),
+        hook!("RpcServerInqBindings", RPC, rpcsrv::rpc_server_inq_bindings),
+        hook!("RpcBindingVectorFree", RPC, rpcsrv::rpc_binding_vector_free),
+        hook!("RpcBindingToStringBindingW", RPC, rpcsrv::rpc_binding_to_string_binding_w),
+        hook!("RpcStringFreeW", RPC, rpcsrv::rpc_string_free_w),
+        hook!("RpcServerInqCallAttributesW", RPC, rpcsrv::rpc_server_inq_call_attributes_w),
+        hook!("RpcServerTestCancel", RPC, rpcsrv::rpc_server_test_cancel),
+        hook!("RpcServerSubscribeForNotification", RPC, rpcsrv::rpc_server_subscribe_for_notification),
+        hook!("RpcServerUnsubscribeForNotification", RPC, rpcsrv::rpc_server_unsubscribe_for_notification),
+        hook!("RpcAsyncCompleteCall", RPC, rpcsrv::rpc_async_complete_call),
+        hook!("RpcAsyncAbortCall", RPC, rpcsrv::rpc_async_abort_call),
+        hook!("CoRegisterClassObject", COM, comreg::co_register_class_object),
+        hook!("CoRevokeClassObject", COM, comreg::co_revoke_class_object),
+        hook!("CoResumeClassObjects", COM, comreg::co_resume_class_objects),
+        hook!("CoGetClassObject", COM, comreg::co_get_class_object),
+        hook!("CoCreateInstance", COM, comreg::co_create_instance),
+        hook!("RoRegisterActivationFactories", WINRT, comreg::ro_register_activation_factories),
+        hook!("RoRevokeActivationFactories", WINRT, comreg::ro_revoke_activation_factories),
+        hook!("RoGetActivationFactory", WINRT, comreg::ro_get_activation_factory),
         hook!("RpcServerUseProtseqEpW", RPC, rpc::rpc_server_use_protseq_ep_w),
         hook!("RpcEpRegisterW", RPC, rpc::rpc_ep_register_w),
         hook!("RpcEpRegisterNoReplaceW", RPC, rpc::rpc_ep_register_no_replace_w),

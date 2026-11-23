@@ -103,6 +103,7 @@ fn main() {
     // Run-time limit in seconds (env MDBG_LIMIT, default 70).
     let limit = std::time::Duration::from_secs(std::env::var("MDBG_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(70));
     let mut exc_count = 0u32;
+    let mut gate = ExcGate::default();
     let mut av_captured = false;
     let exit_code;
     let mut exe_base = 0u64;
@@ -324,8 +325,25 @@ fn main() {
                 } else {
                     exc_count += 1;
                     let m = modules.range(..=addr).next_back().map(|(b,n)| format!("{} +0x{:x}", n, addr-b)).unwrap_or_else(|| "?".into());
-                    eprintln!("[EXC] code=0x{:08X} addr=0x{:x} ({}) firstChance={} {}",
-                        ecode, addr, m, first, exc_name(ecode));
+                    let nparams = rd_u32(&evt.u, 24) as usize;
+                    let info = |k: usize| if k < nparams.min(15) { rd_u64(&evt.u, 32 + 8 * k) } else { 0 };
+                    let raised = m.to_ascii_lowercase().starts_with("kernelbase.dll");
+                    let caller = if raised { raise_caller(hproc, evt.tid, &modules) } else { None };
+                    let cpp = ecode == 0xE06D7363 && nparams >= 4 && info(3) != 0;
+                    let ty = if cpp { cpp_type_name(|a, n| read_until_fault(hproc, a, n), info(2), info(3)) } else { None };
+                    let thrower = if cpp { modules.get(&info(3)).cloned() } else { None };
+                    let site = caller.clone().unwrap_or_else(|| m.clone());
+                    let v = gate.note(ecode, addr, first != 0, &site, ty.as_deref().unwrap_or(""));
+                    if v.log {
+                        let mut extra = String::new();
+                        if let Some(c) = &caller { extra.push_str(&format!(" caller={c}")); }
+                        if let Some(t) = &thrower { extra.push_str(&format!(" thrower_image={t}")); }
+                        if let Some(t) = &ty { extra.push_str(&format!(" type={t}")); }
+                        eprintln!("[EXC] code=0x{:08X} addr=0x{:x} ({}) firstChance={} {}{} n={} t_ms={}",
+                            ecode, addr, m, first, exc_name(ecode), extra, v.nth, start.elapsed().as_millis());
+                    } else if v.nth == SITE_LOG_N + 1 {
+                        eprintln!("[EXC] code=0x{:08X} site={} type={} repeats; further ones go to the summary only", ecode, site, ty.as_deref().unwrap_or("-"));
+                    }
                     if ecode == 0xC0000005 && !av_captured {
                         av_captured = true;
                         let op = rd_u64(&evt.u, 32); // ExceptionInformation[0]: 0=read 1=write 8=exec
@@ -341,7 +359,10 @@ fn main() {
                         capture_exit(hproc, evt.tid, exe_base, exe_size, &modules);
                     }
                     status = DBG_EXCEPTION_NOT_HANDLED; // let the app's handler run
-                    if exc_count > 400 { eprintln!("[trace] too many exceptions, terminating"); unsafe { TerminateProcess(hproc,1);} }
+                    if v.terminate {
+                        eprintln!("[trace] too many exceptions, terminating ({} strikes: {} unhandled, rest repeated faults at one address)", gate.strikes, gate.second);
+                        unsafe { TerminateProcess(hproc,1);}
+                    }
                 }
             }
             5 => { // EXIT_PROCESS: dwExitCode(0)
@@ -356,7 +377,117 @@ fn main() {
         unsafe { ContinueDebugEvent(evt.pid, evt.tid, status); }
     }
     unsafe { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
-    eprintln!("[trace] done. exceptions={} exit={:?}", exc_count, exit_code);
+    for l in gate.summary() { eprintln!("{l}"); }
+    eprintln!("[trace] done. exceptions={} strikes={} exit={:?}", exc_count, gate.strikes, exit_code);
+}
+
+const EXC_STRIKE_CAP: u32 = 400;
+const SITE_LOG_N: u32 = 5;
+
+fn informational(code: u32) -> bool {
+    code >> 30 == 1 || code & 0x2000_0000 != 0 || code < 0x1_0000
+}
+
+#[derive(Default)]
+struct ExcGate {
+    strikes: u32,
+    second: u32,
+    rips: BTreeMap<(u32, u64), u32>,
+    sites: BTreeMap<(u32, String, String), (u32, u32)>,
+}
+
+#[derive(Debug, PartialEq)]
+struct ExcVerdict { log: bool, nth: u32, strike: bool, terminate: bool }
+
+impl ExcGate {
+    fn note(&mut self, code: u32, rip: u64, first_chance: bool, site: &str, ty: &str) -> ExcVerdict {
+        let e = self.sites.entry((code, site.to_string(), ty.to_string())).or_insert((0, 0));
+        e.0 += 1;
+        if !first_chance { e.1 += 1; }
+        let nth = e.0;
+        let strike = if !first_chance {
+            self.second += 1;
+            true
+        } else if informational(code) {
+            false
+        } else {
+            let r = self.rips.entry((code, rip)).or_insert(0);
+            *r += 1;
+            *r > 1
+        };
+        if strike { self.strikes += 1; }
+        ExcVerdict { log: nth <= SITE_LOG_N || !first_chance, nth, strike, terminate: strike && self.strikes > EXC_STRIKE_CAP }
+    }
+
+    fn summary(&self) -> Vec<String> {
+        let mut v: Vec<_> = self.sites.iter().collect();
+        v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        let total: u32 = v.iter().map(|x| x.1 .0).sum();
+        let mut out = vec![format!("[EXC] summary: {} exceptions at {} sites, {} unhandled, {} strikes (cap {})", total, v.len(), self.second, self.strikes, EXC_STRIKE_CAP)];
+        for ((code, site, ty), (n, sec)) in v {
+            out.push(format!("[EXC]   n={:<5} code=0x{:08X} {} site={} type={}{}", n, code, exc_name(*code), site, if ty.is_empty() { "-" } else { ty }, if *sec > 0 { format!(" unhandled={sec}") } else { String::new() }));
+        }
+        out
+    }
+}
+
+fn is_runtime_module(n: &str) -> bool {
+    let n = n.to_ascii_lowercase();
+    ["ntdll", "kernelbase", "kernel32", "vcruntime", "ucrtbase", "msvcp", "msvcrt", "concrt"].iter().any(|p| n.starts_with(p))
+}
+
+fn first_caller(stack: &[u8], modules: &BTreeMap<u64, String>) -> Option<String> {
+    let mut i = 0;
+    while i + 8 <= stack.len() {
+        let v = rd_u64(stack, i);
+        if let Some((b, n)) = modules.range(..=v).next_back() {
+            if v > 0x10000 && v - b < 0x6000000 && v != *b && !is_runtime_module(n) {
+                return Some(format!("{} +0x{:x}", n, v - b));
+            }
+        }
+        i += 8;
+    }
+    None
+}
+
+fn raise_caller(hproc: HANDLE, tid: u32, modules: &BTreeMap<u64, String>) -> Option<String> {
+    let hthread = unsafe { OpenThread(0x0008 | 0x0040, 0, tid) };
+    if hthread == 0 { return None; }
+    let mut ctx = Ctx([0u8; 1256]);
+    ctx.0[0x30..0x34].copy_from_slice(&0x0010_0003u32.to_le_bytes());
+    let ok = unsafe { GetThreadContext(hthread, ctx.0.as_mut_ptr()) };
+    unsafe { CloseHandle(hthread); }
+    if ok == 0 { return None; }
+    let rsp = rd_u64(&ctx.0, 0x98);
+    first_caller(&read_until_fault(hproc, rsp, 0x1000), modules)
+}
+
+fn rd_i32_at(read: &impl Fn(u64, usize) -> Vec<u8>, a: u64) -> Option<i32> {
+    let b = read(a, 4);
+    if b.len() < 4 { None } else { Some(i32::from_le_bytes([b[0], b[1], b[2], b[3]])) }
+}
+
+fn cpp_type_name(read: impl Fn(u64, usize) -> Vec<u8>, throw_info: u64, image: u64) -> Option<String> {
+    if throw_info == 0 { return None; }
+    let cta = image.wrapping_add(rd_i32_at(&read, throw_info + 12)? as u32 as u64);
+    if rd_i32_at(&read, cta)? < 1 { return None; }
+    let ct = image.wrapping_add(rd_i32_at(&read, cta + 4)? as u32 as u64);
+    let td = image.wrapping_add(rd_i32_at(&read, ct + 4)? as u32 as u64);
+    let raw = read(td + 16, 256);
+    let n = raw.iter().position(|&c| c == 0)?;
+    let name = String::from_utf8_lossy(&raw[..n]).into_owned();
+    if name.is_empty() { None } else { Some(undecorate_type(&name)) }
+}
+
+fn undecorate_type(d: &str) -> String {
+    let body = d.strip_prefix(".?AV").or_else(|| d.strip_prefix(".?AU")).or_else(|| d.strip_prefix(".?AW4"));
+    match body {
+        Some(b) if b.ends_with("@@") && !b.contains('?') && !b.contains('$') => {
+            let parts: Vec<&str> = b.trim_end_matches('@').split('@').filter(|p| !p.is_empty()).collect();
+            parts.iter().rev().cloned().collect::<Vec<_>>().join("::")
+        }
+        _ => d.to_string(),
+    }
 }
 
 fn wr_u64(ctx: &mut [u8], o: usize, v: u64) { ctx[o..o+8].copy_from_slice(&v.to_le_bytes()); }
@@ -818,6 +949,88 @@ fn exc_name(c: u32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_chance_cpp_throws_never_count_but_second_chance_does() {
+        let mut g = ExcGate::default();
+        for _ in 0..1000 {
+            let v = g.note(0xE06D7363, 0x7ff9_ebe9_569a, true, "dxcompiler.dll +0x1234", "hlsl::Exception");
+            assert!(!v.strike && !v.terminate);
+        }
+        for c in [0x406D1388u32, 0x40080201, 0xE0000001, 0x000006BA] {
+            for _ in 0..500 { assert!(!g.note(c, 0x7ff9_ebe9_569a, true, "x.dll +0x10", "").strike); }
+        }
+        assert_eq!(g.strikes, 0);
+        let v = g.note(0xE06D7363, 0x7ff9_ebe9_569a, false, "GbxGame.exe +0x99", "std::bad_alloc");
+        assert!(v.strike && v.log);
+        assert_eq!((g.strikes, g.second), (1, 1));
+    }
+
+    #[test]
+    fn repeated_hardware_faults_at_one_rip_strike_and_hit_the_cap() {
+        let mut g = ExcGate::default();
+        assert!(!g.note(0xC0000005, 0x1000, true, "a.exe +0x1", "").strike);
+        assert!(!g.note(0xC0000005, 0x2000, true, "a.exe +0x2", "").strike);
+        let mut last = None;
+        for _ in 0..EXC_STRIKE_CAP { last = Some(g.note(0xC0000005, 0x1000, true, "a.exe +0x1", "")); }
+        assert!(last.unwrap().strike);
+        assert_eq!(g.strikes, EXC_STRIKE_CAP);
+        assert!(g.note(0xC0000005, 0x1000, true, "a.exe +0x1", "").terminate);
+    }
+
+    #[test]
+    fn each_site_logs_its_first_five_and_the_summary_counts_all() {
+        let mut g = ExcGate::default();
+        let logs: Vec<bool> = (0..8).map(|_| g.note(0xE06D7363, 1, true, "d.dll +0x5", "T").log).collect();
+        assert_eq!(logs, vec![true, true, true, true, true, false, false, false]);
+        assert!(g.note(0xE06D7363, 1, true, "e.dll +0x6", "T").log);
+        let s = g.summary();
+        assert!(s[0].contains("9 exceptions at 2 sites"));
+        assert!(s[1].contains("n=8") && s[1].contains("site=d.dll +0x5") && s[1].contains("type=T"));
+    }
+
+    #[test]
+    fn type_names_come_from_the_throw_info_chain() {
+        let image = 0x1_4000_0000u64;
+        let mut mem: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        let ti = image + 0x100;
+        let mut tib = vec![0u8; 16];
+        tib[12..16].copy_from_slice(&0x200i32.to_le_bytes());
+        mem.insert(ti, tib);
+        let mut cta = Vec::new();
+        cta.extend_from_slice(&2i32.to_le_bytes());
+        cta.extend_from_slice(&0x300i32.to_le_bytes());
+        mem.insert(image + 0x200, cta);
+        let mut ct = vec![0u8; 8];
+        ct[4..8].copy_from_slice(&0x400i32.to_le_bytes());
+        mem.insert(image + 0x300, ct);
+        let mut td = vec![0u8; 16];
+        td.extend_from_slice(b".?AVbad_alloc@std@@\0");
+        mem.insert(image + 0x400, td);
+        let read = |a: u64, n: usize| -> Vec<u8> {
+            for (b, v) in &mem {
+                if a >= *b && a < *b + v.len() as u64 {
+                    let o = (a - b) as usize;
+                    return v[o..(o + n).min(v.len())].to_vec();
+                }
+            }
+            Vec::new()
+        };
+        assert_eq!(cpp_type_name(read, ti, image).as_deref(), Some("std::bad_alloc"));
+        assert_eq!(undecorate_type(".?AUFoo@@"), "Foo");
+        assert_eq!(undecorate_type(".?AV?$basic@D@std@@"), ".?AV?$basic@D@std@@");
+    }
+
+    #[test]
+    fn raise_caller_skips_runtime_frames() {
+        let mut m = BTreeMap::new();
+        m.insert(0x7ff9_e000_0000u64, "KERNELBASE.dll".to_string());
+        m.insert(0x7ff9_d000_0000u64, "VCRUNTIME140.dll".to_string());
+        m.insert(0x7ff9_0000_0000u64, "dxcompiler.dll".to_string());
+        let vals = [0x7ff9_e000_1000u64, 0x42, 0x7ff9_d000_2000, 0x7ff9_0000_3456];
+        let stack: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(first_caller(&stack, &m).as_deref(), Some("dxcompiler.dll +0x3456"));
+    }
 
     fn mods() -> BTreeMap<u64, String> {
         let mut m = BTreeMap::new();

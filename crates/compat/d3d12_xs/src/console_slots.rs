@@ -123,6 +123,7 @@ pub fn copy_plan(dst_state: u32, src_state: u32, dst_upload: bool) -> Option<(Op
 }
 
 unsafe extern "system" fn cl_copy_memory(this: *mut c_void, dst: u64, src: u64, size: u64, flags: u32) {
+    let _ij = unsafe { crate::inject::scope(this, crate::inject::COPY) };
     if size == 0 || size % 4 != 0 {
         if once(&COPY_LOG, 8) {
             record("d3d12_xs", "console_slots", &format!("CopyMemoryToMemoryX: size {size:#x} must be a non-zero multiple of 4 (console validation)"));
@@ -303,6 +304,7 @@ pub fn wbi_params(va: u64, words: &[u32]) -> Vec<WbiParam> {
 static WBI_LOG: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) unsafe fn write_immediate(list: *mut c_void, va: u64, words: &[u32], mode: u32, what: &str) {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::COPY) };
     let align = 4 * words.len() as u64;
     if va == 0 || va & GRAPHICS_VA_HIGH_MASK != 0 || va % align != 0 {
         if once(&WBI_LOG, 8) {

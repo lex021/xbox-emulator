@@ -31,7 +31,17 @@ pub fn add_aliases(body: &[u8]) -> Result<Option<Vec<u8>>, String> {
         let (nr, ro) = (rd(body, payload)? as usize, rd(body, payload + 4)? as usize);
         let mut ranges: Vec<Vec<u8>> = Vec::with_capacity(nr);
         let mut extra: Vec<Vec<u8>> = Vec::new();
+        let mut have: Vec<(u32, u32, u32)> = Vec::with_capacity(nr);
         let mut next = 0u32;
+        for r in 0..nr {
+            let ra = ro + r * rs;
+            let d = body.get(ra..ra + rs).ok_or("RTS0 range out of bounds")?;
+            let (ty, num, space, off) = (rd(d, 0)?, rd(d, 4)?, rd(d, 12)?, rd(d, rs - 4)?);
+            let start = if off == u32::MAX { next } else { off };
+            next = start.saturating_add(num);
+            have.push((ty, space, start));
+        }
+        next = 0;
         for r in 0..nr {
             let ra = ro + r * rs;
             let d = body.get(ra..ra + rs).ok_or("RTS0 range out of bounds")?.to_vec();
@@ -40,6 +50,9 @@ pub fn add_aliases(body: &[u8]) -> Result<Option<Vec<u8>>, String> {
             next = start.saturating_add(num);
             if (ty == RANGE_SRV || ty == RANGE_UAV) && space < 100_000 && start != u32::MAX {
                 for k in 1..=BL_ALIASES {
+                    if have.contains(&(ty, bl_alias_space(k, space), start)) {
+                        continue;
+                    }
                     let mut a = d.clone();
                     wr(&mut a, 12, bl_alias_space(k, space));
                     wr(&mut a, rs - 4, start);
@@ -131,6 +144,29 @@ mod tests {
         w(&mut no, 44, 2);
         w(&mut no, 44 + rs, 3);
         assert!(add_aliases(&no).unwrap().is_none());
+    }
+
+    #[test]
+    fn aliasing_an_already_aliased_root_signature_changes_nothing() {
+        let rs = 24;
+        let mut b = vec![0u8; 24 + 12 + 8 + 2 * rs];
+        let w = |b: &mut Vec<u8>, o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        w(&mut b, 0, 2);
+        w(&mut b, 4, 1);
+        w(&mut b, 8, 24);
+        w(&mut b, 32, 36);
+        w(&mut b, 36, 2);
+        w(&mut b, 40, 44);
+        for (k, r) in [[1u32, 4, 0, 0, 0, 0], [0, u32::MAX, 0, 5, 0, u32::MAX]].iter().enumerate() {
+            for (i, v) in r.iter().enumerate() {
+                w(&mut b, 44 + k * rs + i * 4, *v);
+            }
+        }
+        let once = add_aliases(&b).unwrap().unwrap();
+        assert!(add_aliases(&once).unwrap().is_none(), "a second pass must not add duplicate alias ranges");
+        let p = tombox_xshader::meta::parse_rts0(&once).unwrap();
+        let tombox_xshader::meta::RootParamKind::Table(r) = &p.params[0].kind else { panic!() };
+        assert_eq!(r.len(), 2 + 2 * BL_ALIASES as usize);
     }
 
     #[test]

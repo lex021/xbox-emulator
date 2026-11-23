@@ -769,6 +769,11 @@ fn host_serves_audio_cursor_and_hdr_classes() {
         assert_ne!(created, 0, "the new object id sits at env+0x1c");
         let mut env = vec![0u8; AUDIO_ENVELOPE as usize];
         env[8..12].copy_from_slice(&0x64u32.to_le_bytes());
+        env[0xc..0x10].copy_from_slice(&created.to_le_bytes());
+        assert_eq!(call(a, AUDIO_ENVELOPE, env.as_mut_ptr()), S_OK);
+        assert_eq!(i32::from_le_bytes(env[4..8].try_into().unwrap()), E_INVALIDARG, "0x64 on an object that is not a 0x61 MediaManager is refused");
+        let mut env = vec![0u8; AUDIO_ENVELOPE as usize];
+        env[8..12].copy_from_slice(&0xfffu32.to_le_bytes());
         assert_eq!(call(a, AUDIO_ENVELOPE, env.as_mut_ptr()), S_OK);
         assert_eq!(i32::from_le_bytes(env[4..8].try_into().unwrap()), E_NOTIMPL, "ids with no decoded layout report E_NOTIMPL in the envelope");
         let mut env = vec![0u8; AUDIO_ENVELOPE as usize];
@@ -939,6 +944,10 @@ fn host_serves_package_v7_and_net_security_classes() {
         let t = compat_common::gdk::title();
         assert_eq!(d.version, [t.version[3], t.version[2], t.version[1], t.version[0]], "PkgDetails +0x10 is rev, build, minor, major");
         assert_eq!(String::from_utf16_lossy(&hstring_units(d.display)), t.display);
+        let sid = String::from_utf16_lossy(&hstring_units(d.store_id));
+        assert_eq!(sid, compat_common::gdk::store::game_store_id(), "PkgDetails +0x38 carries the MicrosoftGame.config StoreId");
+        assert_eq!(alias_identity(0, &sid), Some(compat_common::gdk::package::package_id()), "the kind-0 alias the client learns from +0x38 resolves back through slot 7/16");
+        assert!(d.alias.is_null() && d.alias4.is_null(), "kind-1 and kind-4 aliases have no source in any dump");
         let enumerate: unsafe extern "system" fn(*mut c_void, *const u16, i32, i32, *mut u32, *mut *mut PkgDetails) -> i32 = core::mem::transmute(slot(v7, 28));
         let (mut n, mut arr) = (9u32, core::ptr::null_mut());
         assert_eq!(enumerate(v7, core::ptr::null(), 0, 0, &mut n, &mut arr), S_OK);
@@ -946,8 +955,28 @@ fn host_serves_package_v7_and_net_security_classes() {
         assert_eq!(String::from_utf16_lossy(&hstring_units((*arr).id)), compat_common::gdk::package::package_id());
         assert_eq!(enumerate(v7, core::ptr::null(), 1, 0, &mut n, &mut arr), S_OK);
         assert_eq!((n, arr.is_null()), (0, true), "no content packages are installed");
-        let undecoded: unsafe extern "system" fn(*mut c_void) -> i32 = core::mem::transmute(slot(v7, 7));
-        assert_eq!(undecoded(v7), E_NOTIMPL, "undecoded slots fail per call, never with a retryable RPC code");
+        let alias: unsafe extern "system" fn(*mut c_void, i32, *const u16, *mut *mut c_void) -> i32 = core::mem::transmute(slot(v7, 7));
+        let store_id: Vec<u16> = compat_common::gdk::store::game_store_id().encode_utf16().chain(Some(0)).collect();
+        let mut ah = 1usize as *mut c_void;
+        assert_eq!(alias(v7, 0, store_id.as_ptr(), &mut ah), S_OK);
+        assert_eq!(String::from_utf16_lossy(&hstring_units(ah)), compat_common::gdk::package::package_id(), "a kind 0 store id alias resolves to the package identifier");
+        for (kind, id) in [(0, other.as_ptr()), (1, store_id.as_ptr()), (2, store_id.as_ptr()), (1, pkg.as_ptr()), (0, core::ptr::null())] {
+            let mut ah = 1usize as *mut c_void;
+            assert_eq!(alias(v7, kind, id, &mut ah), compat_common::gdk::E_NOT_FOUND, "kind {kind}: the client moves on to the next alias kind only on E_NOT_FOUND");
+            assert!(ah.is_null());
+        }
+        assert_eq!(alias(v7, 0, store_id.as_ptr(), core::ptr::null_mut()), E_POINTER);
+        let legacy: unsafe extern "system" fn(*mut c_void, *const u16, *mut *mut c_void) -> i32 = core::mem::transmute(slot(v7, 19));
+        let mut fh = 1usize as *mut c_void;
+        assert_eq!(legacy(v7, pkg.as_ptr(), &mut fh), S_OK);
+        assert_eq!(hstring_units(fh), features_record(compat_common::gdk::package::features()), "slot 19 returns the slot 26 feature records");
+        assert_eq!(legacy(v7, other.as_ptr(), &mut fh), compat_common::gdk::E_NOT_FOUND);
+        assert!(fh.is_null());
+        assert_eq!(legacy(v7, pkg.as_ptr(), core::ptr::null_mut()), E_POINTER);
+        for s in [17usize, 18, 24, 25] {
+            let undecoded: unsafe extern "system" fn(*mut c_void) -> i32 = core::mem::transmute(slot(v7, s));
+            assert_eq!(undecoded(v7), E_NOTIMPL, "slot {s} has no console caller; it fails per call, never with a retryable RPC code");
+        }
         let state: unsafe extern "system" fn(*mut c_void, *const u16, *mut StateRec) -> i32 = core::mem::transmute(slot(v7, 3));
         let mut st = StateRec { a: 9, b: 9, selection: 1usize as *mut c_void };
         assert_eq!(state(v7, pkg.as_ptr(), &mut st), S_OK);

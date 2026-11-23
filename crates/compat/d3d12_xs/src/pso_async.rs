@@ -40,6 +40,19 @@ struct Slot {
     cv: Condvar,
     real: AtomicUsize,
     kind: Kind,
+    retry: Mutex<Option<Retry>>,
+    aliased: AtomicBool,
+    job: Mutex<Option<Job>>,
+    refused: AtomicBool,
+    bad_key: Option<u128>,
+}
+
+struct Retry {
+    owned: Owned,
+    sync: CreateFn,
+    dev: usize,
+    num_ext: u32,
+    riid: Guid,
 }
 
 struct Owned {
@@ -67,6 +80,10 @@ static INLINE_N: AtomicUsize = AtomicUsize::new(0);
 static PENDING_BINDS: AtomicU64 = AtomicU64::new(0);
 static SWAPPED_BINDS: AtomicU64 = AtomicU64::new(0);
 static LATE_FAIL: AtomicUsize = AtomicUsize::new(0);
+static RETRY_OK: AtomicUsize = AtomicUsize::new(0);
+static FINAL_FAIL: AtomicUsize = AtomicUsize::new(0);
+static REFUSED_BINDS: AtomicU64 = AtomicU64::new(0);
+static SYNC_AFTER_FAIL: AtomicUsize = AtomicUsize::new(0);
 static COMPUTE_WAIT_US: AtomicU64 = AtomicU64::new(0);
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PREV_SET: AtomicUsize = AtomicUsize::new(0);
@@ -74,9 +91,36 @@ static PREV_RESET: AtomicUsize = AtomicUsize::new(0);
 static PREV_CLEAR: AtomicUsize = AtomicUsize::new(0);
 static HOOKED: AtomicBool = AtomicBool::new(false);
 
+fn bad_descs() -> &'static Mutex<std::collections::HashSet<u128>> {
+    static B: OnceLock<Mutex<std::collections::HashSet<u128>>> = OnceLock::new();
+    B.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn note_bad(k: Option<u128>) {
+    if let Some(k) = k {
+        bad_descs().lock().unwrap_or_else(|e| e.into_inner()).insert(k);
+    }
+}
+
+fn known_bad(k: Option<u128>, kind: Kind) -> bool {
+    let Some(k) = k else { return false };
+    if !bad_descs().lock().unwrap_or_else(|e| e.into_inner()).contains(&k) {
+        return false;
+    }
+    let n = SYNC_AFTER_FAIL.fetch_add(1, Ordering::Relaxed);
+    if n < 20 {
+        record("d3d12_xs", "pso_async", &format!("{kind:?} PSO desc {k:032x} already failed after an async S_OK; this creation runs synchronously so the title receives the real HRESULT (#{})", n + 1));
+    }
+    true
+}
+
 fn map() -> &'static Mutex<HashMap<usize, Arc<Slot>>> {
     static M: OnceLock<Mutex<HashMap<usize, Arc<Slot>>>> = OnceLock::new();
     M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn real_of(placeholder: usize) -> usize {
+    map().lock().ok().and_then(|m| m.get(&placeholder).map(|s| s.real.load(Ordering::Acquire))).unwrap_or(0)
 }
 
 pub fn enabled() -> bool {
@@ -84,7 +128,7 @@ pub fn enabled() -> bool {
     *E.get_or_init(|| {
         let on = std::env::var("TOMBOX_PSO_ASYNC").map(|v| v != "0").unwrap_or(true);
         record("d3d12_xs", "pso_async", if on {
-            "graphics and compute PSOs not ready within the budget are built on worker threads; the title gets a placeholder PSO (graphics: draws nothing until the real one is ready; compute: its first bind waits for the real one, so no dispatch is skipped) (TOMBOX_PSO_ASYNC=0 creates them on the title thread)"
+            "graphics and compute PSOs not ready within the budget keep building on worker threads; the title gets a handle that never reaches the GPU: every SetPipelineState/Reset/ClearState with it waits for the real PSO and binds that, and a background failure is retried on the title thread at bind (TOMBOX_PSO_ASYNC=0 creates them on the title thread)"
         } else {
             "disabled (TOMBOX_PSO_ASYNC=0): PSOs are created on the title thread"
         });
@@ -95,19 +139,6 @@ pub fn enabled() -> bool {
 fn budget() -> std::time::Duration {
     static B: OnceLock<u64> = OnceLock::new();
     std::time::Duration::from_micros(*B.get_or_init(|| std::env::var("TOMBOX_PSO_ASYNC_MS").ok().and_then(|v| v.parse::<f64>().ok()).map(|ms| (ms * 1000.0) as u64).unwrap_or(12_000)))
-}
-
-fn bind_wait() -> bool {
-    static B: OnceLock<bool> = OnceLock::new();
-    *B.get_or_init(|| {
-        let on = std::env::var("TOMBOX_PSO_BIND_WAIT").map(|v| v != "0").unwrap_or(true);
-        record("d3d12_xs", "pso_async", if on {
-            "bind wait on (default): a graphics placeholder's first bind waits for its real PSO like compute does, so no draw is skipped (TOMBOX_PSO_BIND_WAIT=0 restores draw-nothing graphics placeholders)"
-        } else {
-            "bind wait off (TOMBOX_PSO_BIND_WAIT=0): graphics placeholders draw nothing until their real PSO is ready"
-        });
-        on
-    })
 }
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -167,6 +198,36 @@ fn eligible(d: &[u8]) -> bool {
     let no_so = rd64(d, 0x58) == 0 || rd32(d, 0x60) == 0;
     let topo = rd32(d, 0x23c);
     no_tess_gs && no_so && (1..=3).contains(&topo) && rd64(d, 0x08) != 0 && rd64(d, 0x10) != 0 && rd64(d, 0) != 0
+}
+
+pub unsafe fn sync_reason(pdesc: *const u8, riid: *const Guid, compute: bool) -> &'static str {
+    if !enabled() {
+        return "TOMBOX_PSO_ASYNC=0";
+    }
+    if !HOOKED.load(Ordering::Acquire) {
+        return "async PSO hooks not installed yet";
+    }
+    if pdesc.is_null() || riid.is_null() || unsafe { *riid != IID_PSO } {
+        return "riid is not ID3D12PipelineState";
+    }
+    if compute {
+        let d = unsafe { core::slice::from_raw_parts(pdesc, CS_DESC_SIZE) };
+        return if rd64(d, 0) == 0 { "null root signature" } else if rd64(d, 8) == 0 || rd64(d, 16) == 0 { "no compute shader" } else { "shader over 4 MB" };
+    }
+    let d = unsafe { core::slice::from_raw_parts(pdesc, DESC_SIZE) };
+    if ![0x28usize, 0x38, 0x48].iter().all(|&o| rd64(d, o) == 0 || rd64(d, o + 8) == 0) {
+        "has a hull, domain or geometry shader"
+    } else if rd64(d, 0x58) != 0 && rd32(d, 0x60) != 0 {
+        "stream output"
+    } else if !(1..=3).contains(&rd32(d, 0x23c)) {
+        "topology type is not point, line or triangle"
+    } else if rd64(d, 0x08) == 0 || rd64(d, 0x10) == 0 {
+        "no vertex shader"
+    } else if rd64(d, 0) == 0 {
+        "null root signature"
+    } else {
+        "snapshot refused (shader over 4 MB or more than 64 input elements)"
+    }
 }
 
 unsafe fn snapshot(pdesc: *const u8, num_ext: u32, pext: *const u8) -> Option<Owned> {
@@ -364,20 +425,29 @@ pub unsafe fn create_gfx(this: *mut DeviceWrapper, real_dev: *mut c_void, pdesc:
     if !eligible(head) || !HOOKED.load(Ordering::Acquire) {
         return None;
     }
+    let key = unsafe { crate::pso_lib::gfx_key(head, rd64(head, 0), "pso_async") };
+    if known_bad(key, Kind::Graphics) {
+        return None;
+    }
     let owned = unsafe { snapshot(pdesc, num_ext, pext) }?;
     let rd = real_dev as usize;
     let ph_head = head.to_vec();
-    unsafe { launch(this, owned, num_ext, riid, ppv, sync, Kind::Graphics, &mut || unsafe { create_placeholder(rd as *mut c_void, &ph_head, &IID_PSO) }) }
+    unsafe { launch(this, owned, num_ext, riid, ppv, sync, Kind::Graphics, key, &mut || create_placeholder(rd as *mut c_void, &ph_head, &IID_PSO)) }
 }
 
 pub unsafe fn create_compute(this: *mut DeviceWrapper, real_dev: *mut c_void, pdesc: *const u8, num_ext: u32, pext: *const u8, riid: *const Guid, ppv: *mut *mut c_void, sync: CreateFn) -> Option<i32> {
     if !enabled() || pdesc.is_null() || ppv.is_null() || riid.is_null() || unsafe { *riid != IID_PSO } || !HOOKED.load(Ordering::Acquire) {
         return None;
     }
+    let head = unsafe { core::slice::from_raw_parts(pdesc, CS_DESC_SIZE) };
+    let key = unsafe { crate::pso_lib::compute_key(head, rd64(head, 0), "pso_async") };
+    if known_bad(key, Kind::Compute) {
+        return None;
+    }
     let owned = unsafe { snapshot_compute(pdesc, num_ext, pext) }?;
     let rd = real_dev as usize;
     let root = owned.root;
-    unsafe { launch(this, owned, num_ext, riid, ppv, sync, Kind::Compute, &mut || unsafe { create_compute_placeholder(rd as *mut c_void, root as *mut c_void) }) }
+    unsafe { launch(this, owned, num_ext, riid, ppv, sync, Kind::Compute, key, &mut || create_compute_placeholder(rd as *mut c_void, root as *mut c_void)) }
 }
 
 unsafe fn snapshot_compute(pdesc: *const u8, num_ext: u32, pext: *const u8) -> Option<Owned> {
@@ -403,7 +473,7 @@ unsafe fn snapshot_compute(pdesc: *const u8, num_ext: u32, pext: *const u8) -> O
     Some(Owned { desc, _blobs: vec![blob], _layout: Vec::new(), _names: Vec::new(), _cached: cached, ext, root })
 }
 
-unsafe fn launch(this: *mut DeviceWrapper, owned: Owned, num_ext: u32, riid: *const Guid, ppv: *mut *mut c_void, sync: CreateFn, kind: Kind, placeholder: &mut dyn FnMut() -> Result<*mut c_void, i32>) -> Option<i32> {
+unsafe fn launch(this: *mut DeviceWrapper, owned: Owned, num_ext: u32, riid: *const Guid, ppv: *mut *mut c_void, sync: CreateFn, kind: Kind, bad_key: Option<u128>, placeholder: &mut dyn FnMut() -> Result<*mut c_void, i32>) -> Option<i32> {
     let marks = if !crate::dred_marks::enabled() {
         crate::dred_marks::Hashes::default()
     } else if kind == Kind::Graphics {
@@ -411,7 +481,7 @@ unsafe fn launch(this: *mut DeviceWrapper, owned: Owned, num_ext: u32, riid: *co
     } else {
         unsafe { crate::dred_marks::compute_hashes(owned.desc.as_ptr()) }
     };
-    let slot = Arc::new(Slot { st: Mutex::new(Done { started: Some(std::time::Instant::now()), ..Default::default() }), cv: Condvar::new(), real: AtomicUsize::new(0), kind });
+    let slot = Arc::new(Slot { st: Mutex::new(Done { started: Some(std::time::Instant::now()), ..Default::default() }), cv: Condvar::new(), real: AtomicUsize::new(0), kind, retry: Mutex::new(None), aliased: AtomicBool::new(false), job: Mutex::new(None), refused: AtomicBool::new(false), bad_key });
     let riid_v: Guid = unsafe { core::ptr::read(riid) };
     let (dev, ws) = (this as usize, slot.clone());
     let job: Job = Box::new(move || {
@@ -419,8 +489,12 @@ unsafe fn launch(this: *mut DeviceWrapper, owned: Owned, num_ext: u32, riid: *co
         let mut out: *mut c_void = core::ptr::null_mut();
         let ext = if owned.ext.is_empty() { core::ptr::null() } else { owned.ext.as_ptr() };
         let hr = unsafe { sync(dev as *mut DeviceWrapper, owned.desc.as_ptr(), num_ext, ext, &riid_v, &mut out) };
-        drop(owned);
         let real = if hr >= 0 { out as usize } else { 0 };
+        if real == 0 {
+            *ws.retry.lock().unwrap_or_else(|e| e.into_inner()) = Some(Retry { owned, sync, dev, num_ext, riid: riid_v });
+        } else {
+            drop(owned);
+        }
         let mut g = ws.st.lock().unwrap_or_else(|e| e.into_inner());
         g.finished = true;
         g.hr = hr;
@@ -436,9 +510,10 @@ unsafe fn launch(this: *mut DeviceWrapper, owned: Owned, num_ext: u32, riid: *co
                 ws.real.store(real, Ordering::Release);
             }
             if hr < 0 {
+                note_bad(ws.bad_key);
                 let n = LATE_FAIL.fetch_add(1, Ordering::Relaxed);
                 if n < 40 {
-                    record("d3d12_xs", "pso_async", &format!("background {:?} PSO creation FAILED hr={hr:#010x} after {ms:.0} ms; the title holds a placeholder PSO, so its work with it produces nothing (failure #{})", ws.kind, n + 1));
+                    record("d3d12_xs", "pso_async", &format!("background {:?} PSO creation FAILED hr={hr:#010x} after {ms:.0} ms after S_OK went to the title; its first bind retries the creation synchronously on the title thread once, and identical descs are created synchronously from now on (failure #{})", ws.kind, n + 1));
                 }
             } else {
                 static R: AtomicUsize = AtomicUsize::new(0);
@@ -449,7 +524,13 @@ unsafe fn launch(this: *mut DeviceWrapper, owned: Owned, num_ext: u32, riid: *co
         }
         ws.cv.notify_all();
     });
-    if pool().lock().unwrap_or_else(|e| e.into_inner()).send(job).is_err() {
+    *slot.job.lock().unwrap_or_else(|e| e.into_inner()) = Some(job);
+    let queued = slot.clone();
+    let run: Job = Box::new(move || {
+        run_queued(&queued);
+    });
+    if pool().lock().unwrap_or_else(|e| e.into_inner()).send(run).is_err() {
+        drop(slot.job.lock().unwrap_or_else(|e| e.into_inner()).take());
         return None;
     }
     let deadline = std::time::Instant::now() + budget();
@@ -504,12 +585,34 @@ unsafe fn launch(this: *mut DeviceWrapper, owned: Owned, num_ext: u32, riid: *co
     }
     let n = ASYNC_N.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 40 || n % 100 == 0 {
-        record("d3d12_xs", "pso_async", &format!("{kind:?} PSO #{n} not ready after {:.0} ms: placeholder {ph:p} returned, real PSO keeps building in the background (inline {})", budget().as_secs_f64() * 1000.0, INLINE_N.load(Ordering::Relaxed)));
+        record("d3d12_xs", "pso_async", &format!("{kind:?} PSO #{n} not ready after {:.0} ms: handle {ph:p} returned (never bound itself: every bind waits for and binds the real PSO), real PSO keeps building in the background (inline {})", budget().as_secs_f64() * 1000.0, INLINE_N.load(Ordering::Relaxed)));
     }
     crate::frame_ev::mark_async();
     unsafe { *ppv = ph };
     Some(0)
 }
+
+fn run_queued(slot: &Slot) -> bool {
+    let job = slot.job.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match job {
+        Some(j) => {
+            j();
+            true
+        }
+        None => false,
+    }
+}
+
+fn take_if_queued(slot: &Slot) {
+    if run_queued(slot) {
+        let n = STOLEN.fetch_add(1, Ordering::Relaxed);
+        if n < 20 {
+            record("d3d12_xs", "pso_async", &format!("a bind found its {:?} PSO still queued behind other builds and built it on the binding thread instead of waiting (#{})", slot.kind, n + 1));
+        }
+    }
+}
+
+static STOLEN: AtomicUsize = AtomicUsize::new(0);
 
 pub fn swap(p: *mut c_void) -> *mut c_void {
     if p.is_null() || LIVE.load(Ordering::Relaxed) == 0 {
@@ -519,31 +622,94 @@ pub fn swap(p: *mut c_void) -> *mut c_void {
     let Some(slot) = slot else { return p };
     let r = slot.real.load(Ordering::Acquire);
     if r != 0 {
-        SWAPPED_BINDS.fetch_add(1, Ordering::Relaxed);
-        return r as *mut c_void;
+        return bound(&slot, p, r);
     }
-    if slot.kind == Kind::Compute || bind_wait() {
-        let _ev = crate::frame_ev::begin(crate::frame_ev::PSO_BIND);
-        let t0 = std::time::Instant::now();
-        let mut g = slot.st.lock().unwrap_or_else(|e| e.into_inner());
-        while !g.finished {
-            g = slot.cv.wait(g).unwrap_or_else(|e| e.into_inner());
-        }
-        let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        COMPUTE_WAIT_US.fetch_add((ms * 1000.0) as u64, Ordering::Relaxed);
-        if ms > 5.0 {
-            static W: AtomicUsize = AtomicUsize::new(0);
-            if W.fetch_add(1, Ordering::Relaxed) < 20 {
-                record("d3d12_xs", "pso_async", &format!("first bind of a {:?} PSO waited {ms:.0} ms for its background build (draws and dispatches are never skipped)", slot.kind));
-            }
-        }
-        if g.real != 0 {
-            SWAPPED_BINDS.fetch_add(1, Ordering::Relaxed);
-            return g.real as *mut c_void;
+    let _ev = crate::frame_ev::begin(crate::frame_ev::PSO_BIND);
+    let t0 = std::time::Instant::now();
+    take_if_queued(&slot);
+    let mut g = slot.st.lock().unwrap_or_else(|e| e.into_inner());
+    while !g.finished {
+        g = slot.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+    let real = g.real;
+    drop(g);
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    COMPUTE_WAIT_US.fetch_add((ms * 1000.0) as u64, Ordering::Relaxed);
+    if ms > 5.0 {
+        static W: AtomicUsize = AtomicUsize::new(0);
+        if W.fetch_add(1, Ordering::Relaxed) < 20 {
+            record("d3d12_xs", "pso_async", &format!("first bind of a {:?} PSO waited {ms:.0} ms for its background build (draws and dispatches are never skipped)", slot.kind));
         }
     }
-    PENDING_BINDS.fetch_add(1, Ordering::Relaxed);
+    if real != 0 {
+        return bound(&slot, p, real);
+    }
+    match retry_on_title_thread(&slot) {
+        Ok(real) => bound(&slot, p, real),
+        Err(hr) => refuse(&slot, p, hr),
+    }
+}
+
+fn refuse(slot: &Slot, p: *mut c_void, hr: i32) -> *mut c_void {
+    note_bad(slot.bad_key);
+    let binds = REFUSED_BINDS.fetch_add(1, Ordering::Relaxed) + 1;
+    if !slot.refused.swap(true, Ordering::AcqRel) {
+        let n = FINAL_FAIL.fetch_add(1, Ordering::Relaxed);
+        record("d3d12_xs", "pso_async", &format!("ERROR: REFUSED {:?} PSO handle {p:p}: the background build and the synchronous title-thread retry both failed (hr={hr:#010x}) after the creation had returned S_OK; every bind of this handle binds the placeholder, whose work draws and dispatches nothing (unrecoverable PSO #{}, refused binds so far {binds}); identical descs now create synchronously and return the real HRESULT; see BLOCKERS.md 'async PSO failure after S_OK'", slot.kind, n + 1));
+        crate::dred::on_failure(hr, "deferred PSO creation");
+    }
     p
+}
+
+fn bound(slot: &Slot, handle: *mut c_void, real: usize) -> *mut c_void {
+    SWAPPED_BINDS.fetch_add(1, Ordering::Relaxed);
+    if !slot.aliased.swap(true, Ordering::AcqRel) {
+        crate::cbv_copy::alias_pso(handle as usize, real);
+    }
+    real as *mut c_void
+}
+
+fn retry_on_title_thread(slot: &Slot) -> Result<usize, i32> {
+    let mut rg = slot.retry.lock().unwrap_or_else(|e| e.into_inner());
+    let r = slot.real.load(Ordering::Acquire);
+    if r != 0 {
+        return Ok(r);
+    }
+    {
+        let g = slot.st.lock().unwrap_or_else(|e| e.into_inner());
+        if g.real != 0 {
+            return Ok(g.real);
+        }
+    }
+    let Some(rt) = rg.take() else {
+        let hr = slot.st.lock().unwrap_or_else(|e| e.into_inner()).hr;
+        return Err(if hr < 0 { hr } else { 0x8000_4005u32 as i32 });
+    };
+    let mut out: *mut c_void = core::ptr::null_mut();
+    let ext = if rt.owned.ext.is_empty() { core::ptr::null() } else { rt.owned.ext.as_ptr() };
+    let hr = unsafe { (rt.sync)(rt.dev as *mut DeviceWrapper, rt.owned.desc.as_ptr(), rt.num_ext, ext, &rt.riid, &mut out) };
+    if hr < 0 || out.is_null() {
+        let hr = if hr < 0 { hr } else { 0x8000_4005u32 as i32 };
+        slot.st.lock().unwrap_or_else(|e| e.into_inner()).hr = hr;
+        record("d3d12_xs", "pso_async", &format!("{:?} PSO: synchronous title-thread retry at its first bind failed hr={hr:#010x}", slot.kind));
+        return Err(hr);
+    }
+    let real = out as usize;
+    let mut g = slot.st.lock().unwrap_or_else(|e| e.into_inner());
+    g.hr = hr;
+    if g.orphan {
+        drop(g);
+        unsafe { com_release(out) };
+        return Err(0x8000_4005u32 as i32);
+    }
+    g.real = real;
+    slot.real.store(real, Ordering::Release);
+    drop(g);
+    let n = RETRY_OK.fetch_add(1, Ordering::Relaxed);
+    if n < 40 {
+        record("d3d12_xs", "pso_async", &format!("{:?} PSO background build had failed; the title-thread retry at its first bind succeeded, so the draw uses the real PSO (retry #{})", slot.kind, n + 1));
+    }
+    Ok(real)
 }
 
 pub fn wait_real(p: *mut c_void) -> *mut c_void {
@@ -554,6 +720,7 @@ pub fn wait_real(p: *mut c_void) -> *mut c_void {
     let Some(slot) = slot else { return p };
     let _ev = crate::frame_ev::begin(crate::frame_ev::PSO_BIND);
     let t0 = std::time::Instant::now();
+    take_if_queued(&slot);
     let mut g = slot.st.lock().unwrap_or_else(|e| e.into_inner());
     while !g.finished {
         g = slot.cv.wait(g).unwrap_or_else(|e| e.into_inner());
@@ -565,11 +732,19 @@ pub fn wait_real(p: *mut c_void) -> *mut c_void {
             record("d3d12_xs", "pso_async", &format!("derived PSO waited {ms:.0} ms for its base PSO"));
         }
     }
-    if g.real != 0 { g.real as *mut c_void } else { p }
+    let real = g.real;
+    drop(g);
+    if real != 0 {
+        return real as *mut c_void;
+    }
+    match retry_on_title_thread(&slot) {
+        Ok(r) => r as *mut c_void,
+        Err(hr) => refuse(&slot, p, hr),
+    }
 }
 
 pub fn summary() -> String {
-    format!("async {} inline {} live {} pending binds {} swapped binds {} late failures {} first-bind wait {:.0} ms", ASYNC_N.load(Ordering::Relaxed), INLINE_N.load(Ordering::Relaxed), LIVE.load(Ordering::Relaxed), PENDING_BINDS.load(Ordering::Relaxed), SWAPPED_BINDS.load(Ordering::Relaxed), LATE_FAIL.load(Ordering::Relaxed), COMPUTE_WAIT_US.load(Ordering::Relaxed) as f64 / 1000.0)
+    format!("async {} inline {} live {} pending binds {} swapped binds {} late failures {} (title-thread retries ok {}, unrecoverable {}, refused binds {}, sync after a failed desc {}) first-bind wait {:.0} ms, builds taken over by their bind {}", ASYNC_N.load(Ordering::Relaxed), INLINE_N.load(Ordering::Relaxed), LIVE.load(Ordering::Relaxed), PENDING_BINDS.load(Ordering::Relaxed), SWAPPED_BINDS.load(Ordering::Relaxed), LATE_FAIL.load(Ordering::Relaxed), RETRY_OK.load(Ordering::Relaxed), FINAL_FAIL.load(Ordering::Relaxed), REFUSED_BINDS.load(Ordering::Relaxed), SYNC_AFTER_FAIL.load(Ordering::Relaxed), COMPUTE_WAIT_US.load(Ordering::Relaxed) as f64 / 1000.0, STOLEN.load(Ordering::Relaxed))
 }
 
 unsafe extern "system" fn set_pso(list: *mut c_void, pso: *mut c_void) {
@@ -637,12 +812,268 @@ mod tests {
         assert!(!eligible(&d));
     }
 
+    fn slot_with_job(ran: Arc<AtomicUsize>) -> Arc<Slot> {
+        let slot = Arc::new(Slot { st: Mutex::new(Done::default()), cv: Condvar::new(), real: AtomicUsize::new(0), kind: Kind::Graphics, retry: Mutex::new(None), aliased: AtomicBool::new(false), job: Mutex::new(None), refused: AtomicBool::new(false), bad_key: None });
+        let ws = slot.clone();
+        *slot.job.lock().unwrap() = Some(Box::new(move || {
+            ran.fetch_add(1, Ordering::SeqCst);
+            let mut g = ws.st.lock().unwrap();
+            g.finished = true;
+            g.real = 0x1234;
+            ws.cv.notify_all();
+        }));
+        slot
+    }
+
+    #[test]
+    fn a_queued_build_runs_exactly_once_on_whichever_thread_reaches_it_first() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let slot = slot_with_job(ran.clone());
+        take_if_queued(&slot);
+        assert!(slot.st.lock().unwrap().finished);
+        assert_eq!(slot.st.lock().unwrap().real, 0x1234);
+        assert!(!run_queued(&slot));
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let slot = slot_with_job(ran.clone());
+        let threads: Vec<_> = (0..8).map(|_| {
+            let s = slot.clone();
+            std::thread::spawn(move || run_queued(&s))
+        }).collect();
+        let took = threads.into_iter().map(|t| t.join().unwrap()).filter(|&b| b).count();
+        assert_eq!(took, 1);
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_desc_that_failed_after_s_ok_is_created_synchronously_next_time() {
+        let k = Some(0x5eed_0000_0000_0000_0000_0000_0000_0001u128);
+        assert!(!known_bad(k, Kind::Graphics));
+        note_bad(k);
+        assert!(known_bad(k, Kind::Graphics));
+        assert!(!known_bad(None, Kind::Graphics));
+        assert!(!known_bad(Some(0x5eed_0000_0000_0000_0000_0000_0000_0002), Kind::Compute));
+    }
+
     #[test]
     fn unknown_pointers_pass_through_unchanged() {
         let p = 0x1234usize as *mut c_void;
         assert_eq!(swap(p), p);
         assert_eq!(wait_real(p), p);
         assert!(swap(core::ptr::null_mut()).is_null());
+    }
+
+    #[repr(C)]
+    struct FakeVt {
+        qi: unsafe extern "system" fn(*mut Fake, *const Guid, *mut *mut c_void) -> i32,
+        add: unsafe extern "system" fn(*mut Fake) -> u32,
+        rel: unsafe extern "system" fn(*mut Fake) -> u32,
+        s3: usize,
+        s4: usize,
+        spdi: unsafe extern "system" fn(*mut Fake, *const Guid, *mut c_void) -> i32,
+    }
+
+    #[repr(C)]
+    struct Fake {
+        vt: &'static FakeVt,
+        refs: AtomicU32,
+    }
+
+    unsafe extern "system" fn f_qi(_: *mut Fake, _: *const Guid, ppv: *mut *mut c_void) -> i32 {
+        if !ppv.is_null() {
+            unsafe { *ppv = core::ptr::null_mut() };
+        }
+        0x8000_4002u32 as i32
+    }
+
+    unsafe extern "system" fn f_add(t: *mut Fake) -> u32 {
+        unsafe { (*t).refs.fetch_add(1, Ordering::AcqRel) + 1 }
+    }
+
+    unsafe extern "system" fn f_rel(t: *mut Fake) -> u32 {
+        unsafe { (*t).refs.fetch_sub(1, Ordering::AcqRel) - 1 }
+    }
+
+    unsafe extern "system" fn f_spdi(_: *mut Fake, _: *const Guid, iface: *mut c_void) -> i32 {
+        if !iface.is_null() {
+            unsafe { com_addref(iface) };
+        }
+        0
+    }
+
+    static FAKE_VT: FakeVt = FakeVt { qi: f_qi, add: f_add, rel: f_rel, s3: 0, s4: 0, spdi: f_spdi };
+
+    fn fake() -> *mut c_void {
+        Box::into_raw(Box::new(Fake { vt: &FAKE_VT, refs: AtomicU32::new(1) })) as *mut c_void
+    }
+
+    fn refs(p: *mut c_void) -> u32 {
+        unsafe { (*(p as *mut Fake)).refs.load(Ordering::Acquire) }
+    }
+
+    const CTRL_AT: usize = 0x100;
+
+    struct Ctrl {
+        gate: Mutex<bool>,
+        cv: Condvar,
+        calls: AtomicU32,
+        results: Vec<(i32, usize)>,
+        threads: Mutex<Vec<std::thread::ThreadId>>,
+    }
+
+    impl Ctrl {
+        fn new(results: Vec<(i32, usize)>) -> &'static Ctrl {
+            Box::leak(Box::new(Ctrl { gate: Mutex::new(false), cv: Condvar::new(), calls: AtomicU32::new(0), results, threads: Mutex::new(Vec::new()) }))
+        }
+
+        fn open(&self) {
+            *self.gate.lock().unwrap() = true;
+            self.cv.notify_all();
+        }
+    }
+
+    unsafe extern "system" fn gated_create(_: *mut DeviceWrapper, desc: *const u8, _: u32, _: *const u8, _: *const Guid, ppv: *mut *mut c_void) -> i32 {
+        let ctrl = unsafe { &*(core::ptr::read_unaligned(desc.add(CTRL_AT) as *const usize) as *const Ctrl) };
+        let n = ctrl.calls.fetch_add(1, Ordering::AcqRel) as usize;
+        ctrl.threads.lock().unwrap().push(std::thread::current().id());
+        if n == 0 {
+            let mut g = ctrl.gate.lock().unwrap();
+            while !*g {
+                g = ctrl.cv.wait(g).unwrap();
+            }
+        }
+        let (hr, real) = ctrl.results[n.min(ctrl.results.len() - 1)];
+        unsafe { *ppv = real as *mut c_void };
+        hr
+    }
+
+    fn launch_gated(ctrl: &'static Ctrl) -> (*mut c_void, *mut c_void, i32) {
+        let root = fake();
+        let mut desc = vec![0u8; DESC_SIZE];
+        wr64(&mut desc, 0, root as u64);
+        wr64(&mut desc, CTRL_AT, ctrl as *const Ctrl as u64);
+        let owned = Owned { desc, _blobs: Vec::new(), _layout: Vec::new(), _names: Vec::new(), _cached: Vec::new(), ext: Vec::new(), root: root as usize };
+        unsafe { com_addref(root) };
+        let handle = fake();
+        let mut out: *mut c_void = core::ptr::null_mut();
+        let key = Some(ctrl as *const Ctrl as u128 | 0xc7_0000_0000_0000_0000_0000_0000_0000);
+        let hr = unsafe { launch(core::ptr::null_mut(), owned, 0, &IID_PSO, &mut out, gated_create, Kind::Graphics, key, &mut || Ok(handle)) }.unwrap();
+        (out, handle, hr)
+    }
+
+    fn ctrl_key(ctrl: &'static Ctrl) -> Option<u128> {
+        Some(ctrl as *const Ctrl as u128 | 0xc7_0000_0000_0000_0000_0000_0000_0000)
+    }
+
+    fn open_later(ctrl: &'static Ctrl, ms: u64) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            ctrl.open();
+        })
+    }
+
+    #[test]
+    fn bind_of_a_not_ready_pso_waits_and_binds_the_real_one() {
+        let real = fake();
+        let ctrl = Ctrl::new(vec![(0, real as usize)]);
+        let (out, handle, hr) = launch_gated(ctrl);
+        assert_eq!(hr, 0);
+        assert_eq!(out, handle, "budget passed, the title holds the handle");
+        let opener = open_later(ctrl, 80);
+        let t0 = std::time::Instant::now();
+        let bound = swap(out);
+        let waited = t0.elapsed();
+        opener.join().unwrap();
+        assert_eq!(bound, real, "the draw must use the real PSO, never the handle");
+        assert!(waited >= std::time::Duration::from_millis(40), "bind returned before the real PSO existed ({waited:?})");
+        assert_eq!(swap(out), real);
+        assert_eq!(wait_real(out), real);
+        assert_eq!(ctrl.calls.load(Ordering::Acquire), 1);
+        assert_eq!(real_of(out as usize), real as usize);
+        unsafe { com_release(handle) };
+    }
+
+    #[test]
+    fn failed_background_build_is_retried_on_the_binding_thread() {
+        let real = fake();
+        let ctrl = Ctrl::new(vec![(0x8000_4005u32 as i32, 0), (0, real as usize)]);
+        let (out, handle, _) = launch_gated(ctrl);
+        assert_eq!(out, handle);
+        ctrl.open();
+        let bound = swap(out);
+        assert_eq!(bound, real, "a retry that succeeds must be the PSO that gets bound");
+        assert_eq!(ctrl.calls.load(Ordering::Acquire), 2);
+        let th = ctrl.threads.lock().unwrap().clone();
+        assert_eq!(th[1], std::thread::current().id(), "the retry runs on the binding thread");
+        assert_eq!(swap(out), real);
+        assert_eq!(ctrl.calls.load(Ordering::Acquire), 2, "a resolved slot is never rebuilt");
+        unsafe { com_release(handle) };
+    }
+
+    #[test]
+    fn unrecoverable_pso_is_reported_not_silently_bound() {
+        let ctrl = Ctrl::new(vec![(0x8000_4005u32 as i32, 0), (0x8007_000Eu32 as i32, 0)]);
+        let (out, handle, _) = launch_gated(ctrl);
+        assert_eq!(out, handle);
+        ctrl.open();
+        let before = FINAL_FAIL.load(Ordering::Acquire);
+        let bound = swap(out);
+        assert_eq!(ctrl.calls.load(Ordering::Acquire), 2, "the failure was retried once");
+        assert!(FINAL_FAIL.load(Ordering::Acquire) > before, "an unrecoverable bind is counted and reported");
+        assert_eq!(bound, handle);
+        let _ = swap(out);
+        assert_eq!(ctrl.calls.load(Ordering::Acquire), 2);
+        assert!(summary().contains("unrecoverable"));
+        unsafe { com_release(handle) };
+    }
+
+    #[test]
+    fn invalid_arg_after_s_ok_is_retried_once_then_refused_visibly() {
+        let e_invalidarg = 0x8007_0057u32 as i32;
+        let ctrl = Ctrl::new(vec![(e_invalidarg, 0), (e_invalidarg, 0)]);
+        let (out, handle, hr) = launch_gated(ctrl);
+        assert_eq!(hr, 0);
+        assert_eq!(out, handle);
+        ctrl.open();
+        let refused_before = REFUSED_BINDS.load(Ordering::Acquire);
+        let bound = swap(out);
+        assert_eq!(ctrl.calls.load(Ordering::Acquire), 2, "E_INVALIDARG after S_OK gets one synchronous retry at the first bind");
+        let th = ctrl.threads.lock().unwrap().clone();
+        assert_eq!(th[1], std::thread::current().id(), "the retry runs on the binding thread");
+        assert_eq!(bound, handle);
+        let slot = crate::frame_ev::lock(map()).get(&(out as usize)).cloned().unwrap();
+        assert!(slot.refused.load(Ordering::Acquire), "the handle is marked refused");
+        let _ = swap(out);
+        let _ = wait_real(out);
+        assert_eq!(ctrl.calls.load(Ordering::Acquire), 2, "a refused handle is never rebuilt per bind");
+        assert!(REFUSED_BINDS.load(Ordering::Acquire) >= refused_before + 3);
+        assert!(bad_descs().lock().unwrap().contains(&ctrl_key(ctrl).unwrap()), "the desc is remembered so the next identical creation is synchronous");
+        assert!(summary().contains("refused binds"));
+        unsafe { com_release(handle) };
+    }
+
+    #[test]
+    fn invalid_arg_after_s_ok_that_succeeds_on_retry_binds_the_real_pso() {
+        let real = fake();
+        let ctrl = Ctrl::new(vec![(0x8007_0057u32 as i32, 0), (0, real as usize)]);
+        let (out, handle, _) = launch_gated(ctrl);
+        ctrl.open();
+        assert_eq!(swap(out), real);
+        assert_eq!(ctrl.calls.load(Ordering::Acquire), 2);
+        unsafe { com_release(handle) };
+    }
+
+    #[test]
+    fn destroying_the_handle_releases_the_real_pso() {
+        let real = fake();
+        let ctrl = Ctrl::new(vec![(0, real as usize)]);
+        let (out, handle, _) = launch_gated(ctrl);
+        ctrl.open();
+        assert_eq!(swap(out), real);
+        assert_eq!(refs(real), 1);
+        placeholder_destroyed(handle as usize);
+        assert_eq!(refs(real), 0);
+        assert_eq!(swap(out), out);
     }
 
     #[test]

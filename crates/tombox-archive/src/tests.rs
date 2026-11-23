@@ -170,6 +170,24 @@ fn warns_on_bomb_ratio() {
 }
 
 #[test]
+fn warns_when_a_large_entry_claims_zero_compressed_bytes() {
+    let h = cd_header("bomb0.bin", 0, 20 * 1024 * 1024, 0, 0, &[]);
+    let inv = inspect(&assemble(&[h]), "bomb0");
+    let r = validate(&inv, 100.0);
+    assert!(r.findings.iter().any(|f| f.severity == Severity::Warn && f.entry == "bomb0.bin"));
+    assert!(r.is_safe_to_extract());
+}
+
+#[test]
+fn small_or_empty_entries_with_zero_compressed_bytes_are_not_flagged() {
+    let empty = cd_header("empty.txt", 0, 0, 0, 0, &[]);
+    let small = cd_header("small.bin", 0, 1024, 0, 0, &[]);
+    let inv = inspect(&assemble(&[empty, small]), "zero_small");
+    let r = validate(&inv, 100.0);
+    assert!(r.findings.is_empty());
+}
+
+#[test]
 fn resolves_zip64_extra_sizes() {
     // Build a zip64 extra with uncompressed + compressed 64-bit values, base
     // fields set to the 0xFFFFFFFF sentinel.

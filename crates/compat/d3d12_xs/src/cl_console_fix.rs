@@ -85,6 +85,7 @@ pub fn flush_records(list_type: u32) -> bool {
 }
 
 unsafe extern "system" fn flush_pipeline_x(this: *mut c_void, flags: u32, start: u64, size: u64) {
+    let _ij = unsafe { crate::inject::scope(this, crate::inject::BARRIER) };
     let ty = unsafe { crate::fill::list_type(this) };
     if let Some(e) = flush_error(flags, start, size, ty) {
         if once(16) {
@@ -175,6 +176,7 @@ unsafe fn scratch_for(list: *mut c_void, need: u64) -> Option<usize> {
 }
 
 unsafe fn copy_within(list: *mut c_void, res: usize, dst_off: u64, src_off: u64, len: u64) -> Result<(), &'static str> {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::COPY) };
     let state = crate::gpu_va::state(res);
     let Some(plan) = within_plan(state) else { return Err("the buffer is in an upload heap, which the GPU cannot write on PC") };
     let ty = unsafe { crate::fill::list_type(list) };

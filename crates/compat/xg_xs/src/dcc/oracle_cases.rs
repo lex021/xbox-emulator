@@ -1197,12 +1197,15 @@ pub(super) struct Build {
     pub(super) dec_chk: usize,
     pub(super) dconv: usize,
     pub(super) drelays: [usize; 3],
+    pub(super) unmodeled: &'static [u64],
+    pub(super) unmodeled_n: usize,
 }
 
+
 pub(super) const BUILDS: [Build; 3] = [
-    Build { name: "22000 XDefiant/Terraria", enc: 0xa960, enc_chk: 0xa97a, relays: [0x262e8, 0x26366, 0x263d0], relay: 0x4ac90, convs: 0x28c58, conv: 0x4adc0, dec_chk: 0xacfe, dconv: 0x232be, drelays: [0x2334e, 0x233cd, 0x2351d] },
-    Build { name: "22621 Trackmania", enc: 0xb7e0, enc_chk: 0xb7fa, relays: [0x29958, 0x299d6, 0x29a40], relay: 0x3e240, convs: 0x2c278, conv: 0x3e370, dec_chk: 0xbb7e, dconv: 0x2f9b6, drelays: [0x2fa46, 0x2fac4, 0x2fc13] },
-    Build { name: "19041 Fortnite", enc: 0x70a0, enc_chk: 0x70ba, relays: [0x2bfa9, 0x2c011, 0x2c065], relay: 0x4b440, convs: 0x2e8ba, conv: 0x4b570, dec_chk: 0x740f, dconv: 0x28c9b, drelays: [0x28d15, 0x28d7d, 0x28ec4] },
+    Build { name: "22000 XDefiant/Terraria", enc: 0xa960, enc_chk: 0xa97a, relays: [0x262e8, 0x26366, 0x263d0], relay: 0x4ac90, convs: 0x28c58, conv: 0x4adc0, dec_chk: 0xacfe, dconv: 0x232be, drelays: [0x2334e, 0x233cd, 0x2351d], unmodeled: &[], unmodeled_n: 0 },
+    Build { name: "22621 Trackmania", enc: 0xb7e0, enc_chk: 0xb7fa, relays: [0x29958, 0x299d6, 0x29a40], relay: 0x3e240, convs: 0x2c278, conv: 0x3e370, dec_chk: 0xbb7e, dconv: 0x2f9b6, drelays: [0x2fa46, 0x2fac4, 0x2fc13], unmodeled: &[], unmodeled_n: 0 },
+    Build { name: "19041 Fortnite", enc: 0x70a0, enc_chk: 0x70ba, relays: [0x2bfa9, 0x2c011, 0x2c065], relay: 0x4b440, convs: 0x2e8ba, conv: 0x4b570, dec_chk: 0x740f, dconv: 0x28c9b, drelays: [0x28d15, 0x28d7d, 0x28ec4], unmodeled: &[], unmodeled_n: 276 },
 ];
 
 pub(super) fn build_of(o: &crate::oracle::Oracle) -> &'static Build {

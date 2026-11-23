@@ -129,6 +129,13 @@ pub fn inherit(new: *mut c_void, base: *mut c_void) {
     }
 }
 
+pub fn hashes(pso: usize) -> Option<Hashes> {
+    if !enabled() {
+        return None;
+    }
+    table().lock().unwrap_or_else(|e| e.into_inner()).get(&pso).map(|e| e.0)
+}
+
 pub fn forget(pso: usize) {
     if !enabled() {
         return;
@@ -173,7 +180,7 @@ pub unsafe fn mark(list: *mut c_void, pso: *mut c_void) {
     let t = text(pso as usize, entry);
     let w: Vec<u16> = t.encode_utf16().chain(Some(0)).collect();
     note_marker(list as usize, t);
-    let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, u32) = unsafe { core::mem::transmute(vslot(list, PC_SET_MARKER)) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, u32) = unsafe { core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_MARKER)) };
     unsafe { f(list, 0, w.as_ptr() as *const c_void, (w.len() * 2) as u32) };
     MARKS.fetch_add(1, Ordering::Relaxed);
 }

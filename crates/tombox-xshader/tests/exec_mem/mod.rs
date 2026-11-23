@@ -3,17 +3,27 @@ use tombox_xshader::hlsl::{TB_GMEM_SPACE, TB_MIP_SPACE};
 use tombox_xshader::meta::{RootParam, RootParamKind, RootRange, RootSig};
 
 mod bvh;
+mod branch;
+mod cfg_fuzz;
 mod ds;
 mod gds;
 mod exp;
 mod flat;
 mod global;
 mod mimg;
+mod mimg_rdna2;
 mod mtbuf;
 mod mtbuf_hw;
+mod trans16;
+mod trans32;
 mod rootmem;
+mod smem_nr;
+mod user_data;
 
 pub const R32G32B32A32_FLOAT: u32 = 2;
+pub const R32G32B32A32_UINT: u32 = 3;
+pub const R32G32B32A32_SINT: u32 = 4;
+pub const R32G32_UINT: u32 = 17;
 pub const R32_FLOAT: u32 = 41;
 pub const R32_UINT: u32 = 42;
 
@@ -29,7 +39,11 @@ pub struct Img {
 
 impl Img {
     fn bpp(&self) -> usize {
-        if self.fmt == R32_FLOAT || self.fmt == R32_UINT { 4 } else { 16 }
+        match self.fmt {
+            R32_FLOAT | R32_UINT => 4,
+            R32G32_UINT => 8,
+            _ => 16,
+        }
     }
     fn tex_desc(&self, uav: bool) -> [u8; 0x38] {
         let mut td = [0u8; 0x38];
@@ -407,7 +421,43 @@ pub struct MCase<'a> {
     pub tol: f32,
 }
 
+pub fn atomic_int64_on_typed_resource_supported() -> bool {
+    static SUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUP.get_or_init(|| {
+        let m = CTX.get_or_init(|| Mutex::new(unsafe { ctx_new() }));
+        let c = m.lock().unwrap_or_else(|e| e.into_inner());
+        let mut o9 = [0u32; 6];
+        let hr = unsafe { vcall!(c.gpu.device, 13, fn(u32, *mut u32, u32) -> i32, 37, o9.as_mut_ptr(), 24) };
+        hr >= 0 && o9[2] != 0
+    })
+}
+
+fn max_shader_model() -> u32 {
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        let m = CTX.get_or_init(|| Mutex::new(unsafe { ctx_new() }));
+        let c = m.lock().unwrap_or_else(|e| e.into_inner());
+        for sm in (0x60u32..=0x68).rev() {
+            let mut v = [sm];
+            let hr = unsafe { vcall!(c.gpu.device, 13, fn(u32, *mut u32, u32) -> i32, 7, v.as_mut_ptr(), 4) };
+            if hr >= 0 {
+                return v[0];
+            }
+        }
+        0x60
+    })
+}
+
+fn profile_shader_model(profile: &str) -> u32 {
+    let mut parts = profile.split('_').skip(1);
+    match (parts.next(), parts.next().and_then(|m| m.parse::<u32>().ok())) {
+        (Some("6"), Some(minor)) => 0x60 + minor,
+        _ => 0x60,
+    }
+}
+
 pub fn run_mem_cases(group: &str, cs: &[MCase]) {
+    let mut skipped = 0;
     let mut fails = Vec::new();
     let mut all: std::collections::BTreeSet<&str> = Default::default();
     let mut bad: std::collections::BTreeSet<&str> = Default::default();
@@ -446,13 +496,20 @@ pub fn run_mem_cases(group: &str, cs: &[MCase]) {
                 }
             }
             Err(e) => {
+                let need = translate(&extract_code(words, env.pos, c.env.code)).ok().map_or(0, |t| profile_shader_model(t.profile));
+                if need > max_shader_model() && e.contains("hr=0x80070057") {
+                    println!("SKIP #{i} {}{tag}: needs shader model {need:#x}, this D3D12 runtime supports up to {:#x}", c.m, max_shader_model());
+                    skipped += 1;
+                    bad.insert(c.m);
+                    continue;
+                }
                 fails.push(format!("#{i} {}{tag}: {}", c.m, e.lines().take(4).collect::<Vec<_>>().join(" | ")));
                 bad.insert(c.m);
             }
         }
     }
     let ok = verified(group, &all, &bad);
-    println!("{group}: {} mnemonics verified, {} failing, {} cases, {runtime} rerun with runtime inputs", ok.len(), bad.len(), cs.len());
+    println!("{group}: {} mnemonics verified, {} failing or skipped, {} cases, {runtime} rerun with runtime inputs, {skipped} cases skipped for the runtime's shader model", ok.len(), bad.len(), cs.len());
     assert!(fails.is_empty(), "{group}: {} failing\n{}", fails.len(), fails.join("\n\n"));
 }
 
@@ -467,7 +524,9 @@ fn mem_device_features() {
         let hr14 = vcall!(c.gpu.device, 13, fn(u32, *mut u32, u32) -> i32, 43, o14.as_mut_ptr(), 12);
         let mut o1 = [0u32; 6];
         let hr1 = vcall!(c.gpu.device, 13, fn(u32, *mut u32, u32) -> i32, 8, o1.as_mut_ptr(), 24);
-        println!("shader model {:#x} (hr {hr:#x}); options14 {o14:?} (hr {hr14:#x}); options1 {o1:?} (hr {hr1:#x})", sm[0]);
+        let mut o9 = [0u32; 6];
+        let hr9 = vcall!(c.gpu.device, 13, fn(u32, *mut u32, u32) -> i32, 37, o9.as_mut_ptr(), 24);
+        println!("shader model {:#x} (hr {hr:#x}); options14 {o14:?} (hr {hr14:#x}); options1 {o1:?} (hr {hr1:#x}); options9 {o9:?} (hr {hr9:#x})", sm[0]);
     }
 }
 

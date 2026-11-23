@@ -541,52 +541,70 @@ pub struct Wpp {
 
 pub static WPP: Wpp = Wpp { registration: AtomicU64::new(0), logger: AtomicU64::new(0), flags: AtomicU32::new(0), level: AtomicU32::new(0), registrations: AtomicUsize::new(0) };
 
-unsafe extern "system" fn wpp_control(code: u32, _ctx: *mut c_void, _size: *mut u32, buffer: *mut c_void) -> u32 {
+pub static WPP_STATE: Wpp = Wpp { registration: AtomicU64::new(0), logger: AtomicU64::new(0), flags: AtomicU32::new(0), level: AtomicU32::new(0), registrations: AtomicUsize::new(0) };
+
+pub const STATE_CONTROL_GUID: GUID = STATE_PROVIDERS[0].guid;
+
+unsafe extern "system" fn wpp_control(code: u32, ctx: *mut c_void, _size: *mut u32, buffer: *mut c_void) -> u32 {
+    let block: &Wpp = if ctx.is_null() { &WPP } else { &*(ctx as *const Wpp) };
     match code {
         WMI_ENABLE_EVENTS => {
             let logger = GetTraceLoggerHandle(buffer);
             let level = GetTraceEnableLevel(logger);
             let flags = GetTraceEnableFlags(logger);
-            WPP.level.store(level as u32, Ordering::Release);
-            WPP.flags.store(flags, Ordering::Release);
-            WPP.logger.store(logger, Ordering::Release);
+            block.level.store(level as u32, Ordering::Release);
+            block.flags.store(flags, Ordering::Release);
+            block.logger.store(logger, Ordering::Release);
         }
         WMI_DISABLE_EVENTS => {
-            WPP.logger.store(0, Ordering::Release);
-            WPP.flags.store(0, Ordering::Release);
-            WPP.level.store(0, Ordering::Release);
+            block.logger.store(0, Ordering::Release);
+            block.flags.store(0, Ordering::Release);
+            block.level.store(0, Ordering::Release);
         }
         _ => {}
     }
     0
 }
 
-pub unsafe fn wpp_init() -> u32 {
-    if WPP.registration.load(Ordering::Acquire) != 0 {
+unsafe fn wpp_register(block: &'static Wpp, guid: &'static GUID) -> u32 {
+    if block.registration.load(Ordering::Acquire) != 0 {
         return 0;
     }
-    let mut reg = TraceGuidRegistration { guid: &WPP_CONTROL_GUID, handle: null_mut() };
+    let mut reg = TraceGuidRegistration { guid, handle: null_mut() };
     let mut h = 0u64;
-    let r = RegisterTraceGuidsW(wpp_control, null_mut(), &WPP_CONTROL_GUID, 1, &mut reg, null(), null(), &mut h);
+    let r = RegisterTraceGuidsW(wpp_control, block as *const Wpp as *mut c_void, guid, 1, &mut reg, null(), null(), &mut h);
     if r == 0 {
-        WPP.registration.store(h, Ordering::Release);
-        WPP.registrations.fetch_add(1, Ordering::AcqRel);
+        block.registration.store(h, Ordering::Release);
+        block.registrations.fetch_add(1, Ordering::AcqRel);
     }
     r
 }
 
-pub unsafe fn wpp_cleanup() {
-    let h = WPP.registration.swap(0, Ordering::AcqRel);
+unsafe fn wpp_unregister(block: &Wpp) {
+    let h = block.registration.swap(0, Ordering::AcqRel);
     if h != 0 {
         UnregisterTraceGuids(h);
     }
-    WPP.logger.store(0, Ordering::Release);
-    WPP.flags.store(0, Ordering::Release);
+    block.logger.store(0, Ordering::Release);
+    block.flags.store(0, Ordering::Release);
+}
+
+pub unsafe fn wpp_init() -> u32 {
+    let r = wpp_register(&WPP, &WPP_CONTROL_GUID);
+    if r != 0 {
+        return r;
+    }
+    wpp_register(&WPP_STATE, &STATE_CONTROL_GUID)
+}
+
+pub unsafe fn wpp_cleanup() {
+    wpp_unregister(&WPP);
+    wpp_unregister(&WPP_STATE);
 }
 
 pub unsafe fn wpp_message(guid: &GUID, number: u16, value: u64) -> bool {
-    let logger = WPP.logger.load(Ordering::Acquire);
-    if logger == 0 || WPP.flags.load(Ordering::Acquire) & WPP_STATE_FLAG == 0 {
+    let logger = WPP_STATE.logger.load(Ordering::Acquire);
+    if logger == 0 || WPP_STATE.flags.load(Ordering::Acquire) & WPP_STATE_FLAG == 0 {
         return false;
     }
     let v = value;
@@ -760,21 +778,6 @@ pub unsafe fn stop_trace_session(out: Option<&mut [u8; 0x78]>) {
     stop_etw_trace(&[], &TRACE_SESSION_GUID, TRACE_SESSION_NAME, out);
 }
 
-pub unsafe fn log_state_sections() {
-    let sections: [(&GUID, &[u16], &[u8]); 5] = [
-        (&ADAPTERS_GUID, &[0x92, 0x97], b"Couldn't do IP config adapters and routes display (err 0x%08x)!  Continuing.\0"),
-        (&TEREDO_GUID, &[0x12, 0x16], b"Couldn't do Teredo display (err 0x%08x)!  Continuing.\0"),
-        (&PROCESSES_GUID, &[0x1e], b"Couldn't do processes display (err 0x%08x)!  Continuing.\0"),
-        (&PORTS_GUID, &[0x3b, 0x3e, 0x40, 0x42, 0x3c], b"Couldn't do TCP/UDP port display (err 0x%08x)!  Continuing.\0"),
-        (&WFP_GUID, &[0xa6], b"Couldn't perform WFP enumeration (err 0x%08x)!  Continuing.\0"),
-    ];
-    for (g, ids, _msg) in sections.iter() {
-        for id in ids.iter() {
-            wpp_message(g, *id, 0);
-        }
-    }
-}
-
 pub unsafe fn xbox_net_api_diag_log_state(file: &[u16]) -> HRESULT {
     let hr = start_etw_trace(file, &STATE_PROVIDERS, 0x400, 4, 0, &STATE_SESSION_GUID, STATE_SESSION_NAME);
     if hr != 0 {
@@ -784,7 +787,7 @@ pub unsafe fn xbox_net_api_diag_log_state(file: &[u16]) -> HRESULT {
     }
     Sleep(0x10);
     wpp_message(&STATE_HEADER_GUID, 0xe, 0);
-    log_state_sections();
+    crate::netstate::log_state_sections();
     stop_etw_trace(file, &STATE_SESSION_GUID, STATE_SESSION_NAME, None);
     S_OK
 }

@@ -55,6 +55,12 @@ unsafe fn desc(res: *mut c_void) -> Option<[u8; 0x38]> {
 }
 
 unsafe extern "system" fn resolve_subresource_x(list: *mut c_void, dst: *mut c_void, dst_sub: u32, src: *mut c_void, src_sub: u32, format: u32) {
+    unsafe { crate::gpuprof::pass_begin(list, crate::gpuprof::TAG_RESOLVE) };
+    unsafe { resolve_inner(list, dst, dst_sub, src, src_sub, format) };
+    unsafe { crate::gpuprof::pass_end(list) };
+}
+
+unsafe fn resolve_inner(list: *mut c_void, dst: *mut c_void, dst_sub: u32, src: *mut c_void, src_sub: u32, format: u32) {
     let rect = match unsafe { (desc(dst), desc(src)) } {
         (Some(d), Some(s)) => overlap_rect(extent_of(&d), dst_sub, extent_of(&s), src_sub),
         _ => None,
@@ -65,6 +71,7 @@ unsafe extern "system" fn resolve_subresource_x(list: *mut c_void, dst: *mut c_v
         }
         let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut c_void, u32, *const [i32; 4], u32, u32) =
             unsafe { core::mem::transmute(*(*(list as *const *const usize)).add(PC_SLOT_RESOLVE_REGION)) };
+        let _ij = crate::inject::mark(crate::inject::RESOLVE);
         unsafe { f(list, dst, dst_sub, 0, 0, src, src_sub, &r, format, RESOLVE_MODE_AVERAGE) };
         return;
     }

@@ -121,9 +121,10 @@ $Titles = @(
     Exe = ''; Saved = @('D:\xbox-pc-port\emulator\run-xone\Trackmania');
     PadScreens = @(
       @{ Name = 'start'; Ref = (Join-Path $PSScriptRoot 'screens\trackmania_start.png'); X = 840; Y = 795; W = 250; H = 60; CapW = 1920; CapH = 1080; Min = 0.8 },
+      @{ Name = 'offline'; Ref = (Join-Path $PSScriptRoot 'screens\trackmania_play_offline.png'); X = 760; Y = 828; W = 400; H = 50; CapW = 1920; CapH = 1080; Min = 0.8 },
       @{ Name = 'play'; Ref = (Join-Path $PSScriptRoot 'screens\trackmania_menu_play.png'); X = 250; Y = 262; W = 140; H = 50; CapW = 1920; CapH = 1080; Min = 0.8 },
       @{ Name = 'solo'; Ref = (Join-Path $PSScriptRoot 'screens\trackmania_solo_training.png'); X = 195; Y = 630; W = 205; H = 42; CapW = 1920; CapH = 1080; Hi = 180; Min = 0.8 });
-    PadScript = "5:connect;#start+2:press a;#play+3:press a;#solo+3:press down;+2:press left;+2:press a;+6:press a;+4:press a;/init challenge 'Training - 01'/+25:press a;+3:press a;+2:down rt+a;+10:stick l 0.5 0 800;+6:stick l -0.5 0 800" },
+    PadScript = "5:connect;#start+2:press a;?#offline+1:press a;#play+3:press a;#solo+3:press down;+2:press left;+2:press a;+6:press a;+4:press a;/init challenge 'Training - 01'/+25:press a;+3:press a;+2:down rt+a;+10:stick l 0.5 0 800;+6:stick l -0.5 0 800" },
   [pscustomobject]@{ Slug = 'xdefiant'; Name = 'XDefiant'; Script = 'run_xdefiant.ps1'; Args = @{ Drive = 'Z:' };
     LogDir = (Join-Path $env:TEMP 'tombox-xdefiant'); Proc = 'Rogue_scarlett_rtx'; Seconds = $XDefiantSeconds; Kind = 'generic'; Xone = $false;
     Exe = 'D:\xbox-pc-port\games\XDefiant\extracted\Mount\Rogue_scarlett_rtx.exe'; Saved = @('D:\xbox-pc-port\emulator\run-xdefiant') },
@@ -141,7 +142,7 @@ if ($TrackmaniaTestBoot) {
     $t.Args['TestBoot'] = $TrackmaniaTestBoot
     $t.Saved = @('D:\xbox-pc-port\emulator\run-xone-test\Trackmania')
     $t.Name = "Trackmania (test boot $TrackmaniaTestBoot)"
-    $t.PadScript = "5:connect;#start+2:press a;/init challenge 'Training - 01'/+25:press a;+3:press a;+2:down rt+a;+10:stick l 0.5 0 800;+6:stick l -0.5 0 800"
+    $t.PadScript = "5:connect;#start+2:press a;?#offline+1:press a;#play+3:press a;#solo+3:press down;+2:press left;+2:press a;+6:press a;+4:press a;/init challenge 'Training - 01'/+25:press a;+3:press a;+2:down rt+a;+10:stick l 0.5 0 800;+6:stick l -0.5 0 800"
   }
 }
 if ($Only.Count) { $Titles = @($Titles | Where-Object { $Only -contains $_.Slug }) }
@@ -568,7 +569,7 @@ function Set-BatchEnv {
   $env:TOMBOX_NET_BACKEND = 'builtin'
   $env:TOMBOX_HOST_PAD = '0'
   $env:TOMBOX_TEST_RUN = '1'
-  if ($Visible) { Remove-Item Env:TOMBOX_HEADLESS -ErrorAction SilentlyContinue } else { $env:TOMBOX_HEADLESS = '1' }
+  if (-not $Visible) { $env:TOMBOX_HEADLESS = '1' } else { Remove-Item Env:TOMBOX_HEADLESS -ErrorAction SilentlyContinue }
   $env:TOMBOX_HOST_KBM = '0'
   $env:TOMBOX_PRELAUNCH_UI = '0'
   $env:TOMBOX_FN_GAMESERVER = '127.0.0.1:7777'
@@ -722,9 +723,9 @@ foreach ($t in $Titles) {
   foreach ($e in ($padText -split ';')) {
     if ($e -match '^\s*(\d+(?:\.\d+)?)\s*:\s*(.+?)\s*$') { [void]$padQueue.Add([pscustomobject]@{ At = [double]$Matches[1]; Cmd = $Matches[2]; Gate = ''; Rx = $null; Screen = ''; Delay = 0.0 }) }
     elseif ($e -match '^\s*/(.+?)/\+?(\d+(?:\.\d+)?)\s*:\s*(.+?)\s*$') { $padOrdered = $true; [void]$padQueue.Add([pscustomobject]@{ At = $null; Cmd = $Matches[3]; Gate = "log /$($Matches[1])/"; Rx = [regex]$Matches[1]; Screen = ''; Delay = [double]$Matches[2] }) }
-    elseif ($e -match '^\s*#([a-z0-9_]+)\+?(\d+(?:\.\d+)?)\s*:\s*(.+?)\s*$') { $padOrdered = $true; [void]$padQueue.Add([pscustomobject]@{ At = $null; Cmd = $Matches[3]; Gate = "screen $($Matches[1])"; Rx = $null; Screen = $Matches[1]; Delay = [double]$Matches[2] }) }
+    elseif ($e -match '^\s*(\?)?#([a-z0-9_]+)\+?(\d+(?:\.\d+)?)\s*:\s*(.+?)\s*$') { $padOrdered = $true; [void]$padQueue.Add([pscustomobject]@{ At = $null; Cmd = $Matches[4]; Gate = "screen $($Matches[2])$(if ($Matches[1]) { ' (optional)' })"; Rx = $null; Screen = $Matches[2]; Delay = [double]$Matches[3]; Optional = [bool]$Matches[1]; Since = $null }) }
     elseif ($e -match '^\s*\+(\d+(?:\.\d+)?)\s*:\s*(.+?)\s*$') { $padOrdered = $true; [void]$padQueue.Add([pscustomobject]@{ At = $null; Cmd = $Matches[2]; Gate = 'previous step'; Rx = $null; Screen = ''; Delay = [double]$Matches[1] }) }
-    elseif ($e.Trim()) { $res.Notes.Add("PadScript entry ignored (not 'sec:cmd', '/regex/+sec:cmd', '#screen+sec:cmd' or '+sec:cmd'): $e") }
+    elseif ($e.Trim()) { $res.Notes.Add("PadScript entry ignored (not 'sec:cmd', '/regex/+sec:cmd', '#screen+sec:cmd', '?#screen+sec:cmd' or '+sec:cmd'): $e") }
   }
   if (-not $padOrdered) { $padQueue = [System.Collections.ArrayList]@($padQueue | Sort-Object At) }
   $padGatePng = Join-Path $dir 'pad_gate.png'
@@ -815,6 +816,13 @@ foreach ($t in $Titles) {
       $sv = Test-PadScreen $t $padQueue[0].Screen ([uint32[]]$pids) $padGatePng
       $sd = $t.PadScreens | Where-Object { $_.Name -eq $padQueue[0].Screen } | Select-Object -First 1
       if ($null -ne $sv -and $sd -and $sv -ge $sd.Min) { $padQueue[0].At = $el + $padQueue[0].Delay; Say ("  +{0:N0}s pad gate {1} on screen (score {2:N2})" -f $el, $padQueue[0].Gate, $sv) 'DarkGray' }
+      elseif ($padQueue[0].Optional) {
+        if ($null -eq $padQueue[0].Since) { $padQueue[0].Since = $el }
+        $nx = if ($padQueue.Count -gt 1) { $padQueue[1] } else { $null }
+        $nv = if ($nx -and $nx.Screen) { Test-PadScreen $t $nx.Screen ([uint32[]]$pids) $padGatePng } else { $null }
+        $nd = if ($nx -and $nx.Screen) { $t.PadScreens | Where-Object { $_.Name -eq $nx.Screen } | Select-Object -First 1 } else { $null }
+        if (($null -ne $nv -and $nd -and $nv -ge $nd.Min) -or ($el - $padQueue[0].Since) -ge 25) { Say ("  +{0:N0}s pad gate {1} skipped (not shown)" -f $el, $padQueue[0].Gate) 'DarkGray'; $padQueue.RemoveAt(0) }
+      }
     }
     while ($padQueue.Count -gt 0 -and $null -ne $padQueue[0].At -and $el -ge $padQueue[0].At) {
       $pc = $padQueue[0]; $padQueue.RemoveAt(0); $padLastFire = $el

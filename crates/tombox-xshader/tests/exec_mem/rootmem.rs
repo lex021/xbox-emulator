@@ -30,10 +30,16 @@ fn rootmem_root() -> RootSig {
 }
 
 fn prog() -> Vec<u32> {
+    prog_with(&[], &[])
+}
+
+fn prog_with(extra_load: &[u32], after_wait: &[u32]) -> Vec<u32> {
     let mut p = Prog::new();
     p.raw(&[sop2(0x0e, 3, 1, LIT), 0xff, sop1(3, 2, 0)]);
     p.raw(&smem(1, 8, 2, 0x00, SNULL)).raw(&smem(2, 12, 2, 0x08, SNULL)).raw(&smem(0, 16, 2, 0x18, SNULL)).raw(&smem(1, 10, 2, 0x1c, SNULL));
+    p.raw(extra_load);
     p.raw(&[0xbf8c_c07f]);
+    p.raw(after_wait);
     p.raw(&[sop1(3, 0, LIT), 0x1101_4fac]);
     p.raw(&[sop1(3, 20, 8), sop2(0x10, 21, 9, LIT), 0x4_0000, sop1(3, 22, ic(-1)), sop1(3, 23, 0)]);
     p.raw(&[sop1(3, 24, 10), sop2(0x10, 25, 11, LIT), 0x4_0000, sop1(3, 26, ic(-1)), sop1(3, 27, 0)]);
@@ -156,6 +162,38 @@ fn rootmem_refuses_unresolvable() {
     match translate(&extract_rm(&prog(), short)) {
         Ok(t) => panic!("translated a root-memory read outside the root signature\n{}", t.hlsl),
         Err(e) => assert!(e.contains("outside the root signature"), "{e}"),
+    }
+}
+
+#[test]
+fn rootmem_overread_into_dead_sgprs_runs_on_warp() {
+    let words = prog_with(&smem(2, 28, 2, 0x1c, SNULL), &[sop1(3, 30, 0), sop1(3, 31, 0)]);
+    let t = translate(&extract_rm(&words, rootmem_root())).unwrap_or_else(|e| panic!("translate: {e}"));
+    let code = dxc::compile(&t.hlsl, &dxc::profile_for(t.profile)).unwrap_or_else(|e| panic!("dxc: {e}\n{}", t.hlsl));
+    let m = CTX.get_or_init(|| Mutex::new(unsafe { ctx_new() }));
+    let mut c = m.lock().unwrap_or_else(|e| e.into_inner());
+    let out = unsafe { run(&mut c, &code) }.unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    let wrong: Vec<String> = (0..T * GROUPS).filter(|&i| out[i as usize] != want(i)).map(|i| format!("[{i}] {:08x} want {:08x}", out[i as usize], want(i))).collect();
+    assert!(wrong.is_empty(), "{}\n{}", wrong.join(", "), t.hlsl);
+}
+
+#[test]
+fn rootmem_overread_dead_on_every_branch_path_translates() {
+    let words = prog_with(&smem(2, 28, 2, 0x1c, SNULL), &[0xbf85_0001, sop1(3, 30, 0), sop1(3, 31, 0)]);
+    translate(&extract_rm(&words, rootmem_root())).unwrap_or_else(|e| panic!("translate: {e}"));
+}
+
+#[test]
+fn rootmem_overread_that_is_read_is_refused() {
+    let words = prog_with(&smem(2, 28, 2, 0x1c, SNULL), &[sop1(3, 29, 30)]);
+    match translate(&extract_rm(&words, rootmem_root())) {
+        Ok(t) => panic!("translated a live read of root memory past the root signature\n{}", t.hlsl),
+        Err(e) => assert!(e.contains("outside the root signature") && e.contains("s30 is read"), "{e}"),
+    }
+    let branchy = prog_with(&smem(2, 28, 2, 0x1c, SNULL), &[0xbf85_0001, sop1(3, 30, 0), sop1(3, 29, 30)]);
+    match translate(&extract_rm(&branchy, rootmem_root())) {
+        Ok(t) => panic!("translated a root-memory over-read that one branch path reads\n{}", t.hlsl),
+        Err(e) => assert!(e.contains("s30 is read"), "{e}"),
     }
 }
 

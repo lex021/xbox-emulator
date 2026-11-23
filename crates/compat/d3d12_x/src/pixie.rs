@@ -423,7 +423,10 @@ mod tests {
         let (mut a, mut b, mut c) = (0u64, 0u64, 0u32);
         unsafe {
             assert_eq!(read_u32(h, &mut c), not_supported);
-            assert_eq!(read_pair(h, &mut a, &mut b), not_supported);
+            let t0 = core::arch::x86_64::_rdtsc();
+            assert_eq!(read_pair(h, &mut a, &mut b), 0);
+            assert!(a >= t0 && a <= core::arch::x86_64::_rdtsc());
+            assert!(b != 0);
             assert_eq!(query_fresh(0, 0, &mut a, null_mut()), not_supported);
             assert_eq!(c20b(buf.as_ptr().cast()), STATUS_UNSUCCESSFUL);
             assert_eq!(c207(1, 2), STATUS_UNSUCCESSFUL);

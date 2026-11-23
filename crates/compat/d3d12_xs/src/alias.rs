@@ -362,6 +362,44 @@ unsafe fn allocation_info(real: *mut c_void, desc: &[u8; 0x38]) -> (u64, u64) {
     (r[0], r[1])
 }
 
+fn heap_properties(desc: &[u64; 6]) -> [u32; 5] {
+    let b: Vec<u8> = desc.iter().flat_map(|w| w.to_le_bytes()).collect();
+    core::array::from_fn(|i| u32::from_le_bytes(b[8 + i * 4..12 + i * 4].try_into().unwrap()))
+}
+
+pub(crate) unsafe fn committed_when_too_big(
+    real: *mut c_void,
+    heap: *mut c_void,
+    offset: u64,
+    desc: &[u8; 0x38],
+    init_state: u32,
+    pclear: *const c_void,
+    ppv: *mut *mut c_void,
+) -> Option<i32> {
+    if heap.is_null() || ppv.is_null() || u32::from_le_bytes(desc[0..4].try_into().unwrap()) < 2 {
+        return None;
+    }
+    let (pc_size, _) = unsafe { allocation_info(real, desc) };
+    let mut hd = [0u64; 6];
+    unsafe { vcall!(heap, 8, fn(*mut u64) -> *mut u64, hd.as_mut_ptr()) };
+    let heap_bytes = hd[0];
+    if pc_size == u64::MAX || pc_size == 0 || offset.saturating_add(pc_size) <= heap_bytes {
+        return None;
+    }
+    let props = heap_properties(&hd);
+    let hr = unsafe {
+        vcall!(real, 27, fn(*const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32,
+            props.as_ptr(), 0, desc.as_ptr(), init_state, pclear, &IID_RESOURCE, ppv)
+    };
+    static N: AtomicUsize = AtomicUsize::new(0);
+    if hr < 0 || N.fetch_add(1, Ordering::Relaxed) < 8 {
+        record("d3d12_xs", "CreatePlacedResource", &format!(
+            "texture needs {pc_size:#x} bytes on PC but the title heap has {heap_bytes:#x} at offset {offset:#x} (console size); created committed on heap type {} instead, not aliased with the title heap -> hr={hr:#010x}",
+            props[0]));
+    }
+    Some(hr)
+}
+
 unsafe fn open_title_heap(real: *mut c_void, base: u64) -> Option<(*mut c_void, u64)> {
     let d3 = unsafe { device3(real) };
     if d3.is_null() {
@@ -506,6 +544,7 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
     let sp = g.get_or_insert_with(Spans::default);
     housekeeping(sp);
     let mut chosen: Option<((u64, usize), u64, bool)> = None;
+    let mut msaa_align = 0u64;
     if dim == 1 && va % PLACEMENT_ALIGN == 0 && title_buffers_enabled() {
         let width = u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap());
         let flags = u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap());
@@ -566,11 +605,12 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
         if size != 0 && size != u64::MAX && align != 0 && align <= crate::msaa_place::max_align(samples) && va % align.min(PLACEMENT_ALIGN) == 0 {
             let resource_class = if dim == 1 { HEAP_ONLY_BUFFERS } else if flags & 0x3 != 0 { HEAP_ONLY_RT_DS_TEXTURES } else { HEAP_ONLY_NON_RT_DS_TEXTURES };
             let mixed_heap = unsafe { mixed_heap_supported(real) };
-            if mixed_heap && samples <= 1 {
+            let tiles = samples > 1 && crate::msaa_place::tiles_usable();
+            if mixed_heap && (samples <= 1 || tiles) {
                 unsafe { migrate_shadow(real, sp, va, size) };
             }
             let private = if dim >= 2 { oversize_span(va, size, xbox_size) } else { None };
-            let key = match (private, sp.find_local(va, size, align, resource_class, msaa)) {
+            let key = match (private, sp.find_local(va, size, if tiles { crate::msaa_place::span_align(samples, align) } else { align }, resource_class, msaa)) {
                 (Some((lo, hi)), _) => unsafe { create_local_heap(real, size, msaa, if mixed_heap { 0 } else { resource_class }) }.map(|h| {
                     STATS.heaps.fetch_add(1, Ordering::Relaxed);
                     static N: AtomicUsize = AtomicUsize::new(0);
@@ -584,7 +624,7 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
                     let (lo, hi) = local_span(va, size.max(xbox_size), reservation(va));
                     // A host offset is relative to the heap, so anchor a new
                     // MSAA span at the required residue of the title address.
-                    let start = crate::msaa_place::span_start(samples, va, lo, align);
+                    let start = if tiles { lo } else { crate::msaa_place::span_start(samples, va, lo, align) };
                     // Shifted heaps cannot share the original span's layout.
                     // They must not replace an existing heap with a different alignment.
                     let shifted_msaa_alignment = (start != lo).then_some(align);
@@ -597,6 +637,7 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
             };
             if let Some((k, fresh)) = key {
                 chosen = Some((k, va - k.0, fresh));
+                msaa_align = align;
             }
         }
     }
@@ -605,8 +646,15 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
         return None;
     };
     let (heap, kind) = { let s = sp.get(key); (s.heap, s.kind) };
+    let tiled = kind == Kind::Local && crate::msaa_place::needs_tiles(samples, offset, msaa_align, crate::msaa_place::capable(heap));
     let hr = if kind == Kind::Shadow {
         unsafe { crate::title_shadow::place_reserved(real, heap, offset, &desc, init_state, ppv) }
+    } else if tiled {
+        let hr = unsafe { crate::title_shadow::place_tiled(real, heap, offset, &desc, init_state, pclear, ppv) };
+        if hr < 0 && hr != 0x8007_000eu32 as i32 {
+            crate::msaa_place::note_tiles_refused(hr);
+        }
+        hr
     } else {
         unsafe {
             vcall!(real, 29, fn(*mut c_void, u64, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32,
@@ -807,6 +855,47 @@ mod tests {
         d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
         d[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
         d
+    }
+
+    #[test]
+    fn placed_texture_that_outgrows_its_heap_becomes_committed() {
+        const BC1_UNORM: u32 = 71;
+        const HEAP_ALLOW_ONLY_NON_RT_DS_TEXTURES: u32 = 0x44;
+        unsafe {
+            let dev = device();
+            let desc = tex_desc(4096, 4096, BC1_UNORM, 0);
+            let (pc_size, _) = allocation_info(dev, &desc);
+            assert!(pc_size > PLACEMENT_ALIGN && pc_size != u64::MAX);
+            let mk_heap = |size: u64| {
+                let mut hd = [0u8; 48];
+                hd[0..8].copy_from_slice(&size.to_le_bytes());
+                hd[8..12].copy_from_slice(&1u32.to_le_bytes());
+                hd[40..44].copy_from_slice(&HEAP_ALLOW_ONLY_NON_RT_DS_TEXTURES.to_le_bytes());
+                let mut h: *mut c_void = core::ptr::null_mut();
+                let hr = vcall!(dev, 28, fn(*const u8, *const Guid, *mut *mut c_void) -> i32, hd.as_ptr(), &IID_HEAP, &mut h);
+                assert!(hr >= 0 && !h.is_null(), "CreateHeap hr={hr:#010x}");
+                h
+            };
+            let release = |o: *mut c_void| {
+                vcall!(o, 2, fn() -> u32);
+            };
+
+            let small = mk_heap(pc_size - PLACEMENT_ALIGN);
+            let mut res: *mut c_void = core::ptr::null_mut();
+            let hr = committed_when_too_big(dev, small, 0, &desc, 0, core::ptr::null(), &mut res).expect("texture does not fit");
+            assert!(hr >= 0 && !res.is_null(), "committed fallback hr={hr:#010x}");
+            release(res);
+
+            let big = mk_heap(pc_size);
+            let mut none: *mut c_void = core::ptr::null_mut();
+            assert!(committed_when_too_big(dev, big, 0, &desc, 0, core::ptr::null(), &mut none).is_none());
+            assert!(none.is_null());
+
+            assert!(committed_when_too_big(dev, small, 0, &buf_desc(0x1000, 0), 0, core::ptr::null(), &mut none).is_none());
+            release(small);
+            release(big);
+            release(dev);
+        }
     }
 
     struct Gpu {

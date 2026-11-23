@@ -58,6 +58,17 @@ pub extern "system" fn XMemVirtualAlloc(
     let gran = page_granularity(alloc_type);
     let (base, len) = round_range(address as usize, size, gran);
     let wt = win_alloc_type(alloc_type);
+    if wt & MEM_COMMIT == 0 {
+        return virtual_alloc_inner(address, size, alloc_type, attributes, protect);
+    }
+    let range = if base == 0 { None } else { Some((base, base + len)) };
+    crate::title_acct::track_commit(range, || virtual_alloc_inner(address, size, alloc_type, attributes, protect) as usize) as *mut c_void
+}
+
+fn virtual_alloc_inner(address: *mut c_void, size: usize, alloc_type: u32, attributes: u64, protect: u32) -> *mut c_void {
+    let gran = page_granularity(alloc_type);
+    let (base, len) = round_range(address as usize, size, gran);
+    let wt = win_alloc_type(alloc_type);
     let wp = win_protect(protect);
     if base != 0 && wt & MEM_COMMIT != 0 {
         if let Some(r) = crate::phys::commit_owned(base, len, wp) {
@@ -66,8 +77,9 @@ pub extern "system" fn XMemVirtualAlloc(
         }
     }
     let p = crate::phys::serialized(|| {
-        if base == 0 && wt & MEM_RESERVE != 0 && gran > 0x1_0000 {
-            reserve_aligned(len, gran, wt, wp)
+        if wt & MEM_RESERVE != 0 {
+            let align = if base == 0 && gran > 0x1_0000 { gran } else { 0 };
+            crate::write_watch::reserve_at(base, len, align, wt, wp)
         } else {
             unsafe { VirtualAlloc(base as *mut c_void, len, wt, wp) }
         }
@@ -294,11 +306,13 @@ mod tests {
         assert_eq!(info.alloc_base, p as usize);
         assert_eq!(info.state, MEM_COMMIT);
         assert_eq!(info.region_size, 0x40_0000);
-        unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+        let vfree: unsafe extern "system" fn(usize, usize, u32) -> i32 = unsafe { core::mem::transmute(crate::hooks::vfree_wrapper()) };
+        unsafe { vfree(p as usize, 0, MEM_RELEASE) };
     }
 
     #[test]
     fn physical_pages_map_and_unmap() {
+        let _g = crate::phys::map_test_guard();
         let va = XMemVirtualAlloc(core::ptr::null_mut(), 4 * XMEM_PAGE, MEM_RESERVE | XMEM_64K_PAGES, 0, PAGE_READWRITE);
         assert!(!va.is_null());
         let mut n = 4usize;
@@ -318,11 +332,14 @@ mod tests {
         assert_eq!(unsafe { XMemFreePhysicalPages(4, pfns.as_mut_ptr()) }, 1);
         let mut odd = 3usize;
         assert_eq!(unsafe { XMemAllocatePhysicalPages(XMEM_LARGE_PAGES as u64, &mut odd, pfns.as_mut_ptr()) }, 0);
-        assert_eq!(unsafe { VirtualFree(va, 0, MEM_RELEASE) }, 1);
+        let vfree: unsafe extern "system" fn(usize, usize, u32) -> i32 = unsafe { core::mem::transmute(crate::hooks::vfree_wrapper()) };
+        assert_eq!(unsafe { vfree(va as usize, 0, MEM_RELEASE) }, 1);
+        assert_eq!(crate::phys::owned_extent(va as usize), None);
     }
 
     #[test]
     fn owned_region_mixes_commit_and_physical_pages() {
+        let _g = crate::phys::map_test_guard();
         let va = XMemVirtualAlloc(core::ptr::null_mut(), 4 * XMEM_PAGE, MEM_RESERVE | XMEM_64K_PAGES, 0, PAGE_READWRITE) as usize;
         let mut n = 1usize;
         let mut p = [0u64; 1];
@@ -330,7 +347,7 @@ mod tests {
         assert_eq!(unsafe { XMemMapPhysicalPages(va as *mut c_void, 1, p.as_mut_ptr()) } as usize, va);
         let valloc: unsafe extern "system" fn(usize, usize, u32, u32) -> usize = unsafe { core::mem::transmute(crate::hooks::valloc_wrapper()) };
         let vfree: unsafe extern "system" fn(usize, usize, u32) -> i32 = unsafe { core::mem::transmute(crate::hooks::vfree_wrapper()) };
-        assert_eq!(unsafe { valloc(va + XMEM_PAGE + 0x1234, 0x1_8000, MEM_COMMIT, PAGE_READWRITE) }, va + XMEM_PAGE + 0x1000);
+        assert_eq!(unsafe { valloc(va + XMEM_PAGE + 0x1234, 0x1_8000, MEM_COMMIT, PAGE_READWRITE) }, va + XMEM_PAGE + 0x1000, "{}", crate::phys::LAST_COMMIT_FAIL.lock().unwrap().clone());
         unsafe {
             *((va + XMEM_PAGE + 0x1000) as *mut u32) = 3;
             *((va + 2 * XMEM_PAGE + 0x9000) as *mut u32) = 4;
@@ -350,8 +367,7 @@ mod tests {
         assert_eq!(unsafe { *((va + 2 * XMEM_PAGE) as *const u32) }, 9);
         assert_eq!(unsafe { vfree(va, 0, MEM_RELEASE) }, 1);
         for i in 0..4 {
-            unsafe { XMemVirtualQuery(GetCurrentProcess(), (va + i * XMEM_PAGE) as *const c_void, &mut info) };
-            assert_eq!(info.state, 0x1_0000);
+            assert_eq!(crate::phys::released(va + i * XMEM_PAGE), Ok(()));
         }
         assert_eq!(unsafe { XMemFreePhysicalPages(1, p.as_mut_ptr()) }, 1);
     }
@@ -375,6 +391,7 @@ mod tests {
 
     #[test]
     fn physical_pages_alias_and_persist() {
+        let _g = crate::phys::map_test_guard();
         let va = XMemVirtualAlloc(core::ptr::null_mut(), 4 * XMEM_PAGE, MEM_RESERVE | XMEM_64K_PAGES, 0, PAGE_READWRITE) as usize;
         let vb = XMemVirtualAlloc(core::ptr::null_mut(), 2 * XMEM_PAGE, MEM_RESERVE | XMEM_64K_PAGES, 0, PAGE_READWRITE) as usize;
         assert!(va != 0 && vb != 0);
@@ -408,13 +425,12 @@ mod tests {
         let vfree: unsafe extern "system" fn(usize, usize, u32) -> i32 = unsafe { core::mem::transmute(crate::hooks::vfree_wrapper()) };
         assert_eq!(unsafe { vfree(vb, 0, MEM_RELEASE) }, 1);
         for i in 0..2 {
-            unsafe { XMemVirtualQuery(GetCurrentProcess(), (vb + i * XMEM_PAGE) as *const c_void, &mut info) };
-            assert_eq!(info.state, 0x1_0000);
+            assert_eq!(crate::phys::released(vb + i * XMEM_PAGE), Ok(()));
         }
-        assert_eq!(unsafe { VirtualFree(va as *mut c_void, 0, MEM_RELEASE) }, 1);
+        assert_eq!(unsafe { vfree(va, 0, MEM_RELEASE) }, 1);
+        assert_eq!(crate::phys::owned_extent(va), None);
         for i in 0..4 {
-            unsafe { XMemVirtualQuery(GetCurrentProcess(), (va + i * XMEM_PAGE) as *const c_void, &mut info) };
-            assert_eq!(info.state, 0x1_0000);
+            assert_eq!(crate::phys::released(va + i * XMEM_PAGE), Ok(()));
         }
     }
 
@@ -433,6 +449,7 @@ mod tests {
         assert_eq!(unsafe { XMemResetWriteWatch(p, 0x4000) }, ERROR_CAN_NOT_COMPLETE);
         assert_eq!(XMemResumeWriteWatch(), 1);
         assert_eq!(unsafe { XMemResetWriteWatch(p, 0x4000) }, 0);
-        unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+        let vfree: unsafe extern "system" fn(usize, usize, u32) -> i32 = unsafe { core::mem::transmute(crate::hooks::vfree_wrapper()) };
+        unsafe { vfree(p as usize, 0, MEM_RELEASE) };
     }
 }

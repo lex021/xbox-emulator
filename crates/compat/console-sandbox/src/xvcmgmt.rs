@@ -14,6 +14,7 @@ pub const IOCTL_ACCEPT: u32 = 0x1500a4;
 pub const IOCTL_SEND: u32 = 0x1500a8;
 pub const IOCTL_RECEIVE: u32 = 0x1500ac;
 pub const IOCTL_CLOSE: u32 = 0x1500b0;
+pub const IOCTL_PHYSICAL_MEMORY_LAYOUT: u32 = 0x1500d4;
 pub const IOCTL_SHUTDOWN: u32 = 0x1500f4;
 
 pub const STATUS_SUCCESS: i32 = 0;
@@ -472,6 +473,13 @@ pub unsafe fn ioctl(io: *mut usize, event: usize, apc: usize, ctx: usize, code: 
     }
     let irp = Irp::new(io, event, apc, ctx, outb, outl);
     match code {
+        IOCTL_PHYSICAL_MEMORY_LAYOUT if compat_common::os_host::routes::current_build() == 19041 => {
+            if outl < 16 || outb.is_null() {
+                return finish(irp, STATUS_BUFFER_TOO_SMALL, 0);
+            }
+            outb.cast::<[u64; 2]>().write_unaligned(compat_common::physical_pages::TITLE_LAYOUT_19041);
+            finish(irp, STATUS_SUCCESS, 16)
+        }
         IOCTL_CREATE => {
             if inl < 0x20 || outl < 8 || inb.is_null() || outb.is_null() {
                 return finish(irp, STATUS_INVALID_PARAMETER, 0);

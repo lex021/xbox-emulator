@@ -9,6 +9,7 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 
 pub fn serve(title: Box<dyn TitleService>) -> std::io::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    crate::netview::sockets::report_std(&listener);
     let port = listener.local_addr()?.port();
     let title: Arc<dyn TitleService> = Arc::from(title);
     std::thread::Builder::new().name("tombox-online-accept".into()).spawn(move || {

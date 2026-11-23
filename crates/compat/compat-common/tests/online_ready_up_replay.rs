@@ -1,3 +1,5 @@
+#![cfg(tombox_backend_data)]
+
 use compat_common::online::fortnite::party::captured;
 use compat_common::os_host::fortnite_match as fm;
 use serde_json::{json, Value};

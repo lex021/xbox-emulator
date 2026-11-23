@@ -1,3 +1,4 @@
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
@@ -41,6 +42,28 @@ pub fn span_start(samples: u32, va: u64, lo: u64, align: u64) -> u64 {
     }
 }
 
+pub const TILE: u64 = 0x1_0000;
+
+static TILES_REFUSED: AtomicBool = AtomicBool::new(false);
+
+pub fn tiles_usable() -> bool {
+    !TILES_REFUSED.load(Ordering::Acquire)
+}
+
+pub fn note_tiles_refused(hr: i32) {
+    if !TILES_REFUSED.swap(true, Ordering::AcqRel) {
+        compat_common::record("d3d12_xs", "msaa_place", &format!("reserved MSAA texture refused hr={hr:#010x}: MSAA placements off a 4 MB step fall back to committed resources from now on"));
+    }
+}
+
+pub fn needs_tiles(samples: u32, offset: u64, align: u64, heap_capable: bool) -> bool {
+    samples > 1 && align > TILE && (offset % align != 0 || !heap_capable)
+}
+
+pub fn span_align(samples: u32, align: u64) -> u64 {
+    if samples > 1 && tiles_usable() { align.min(TILE) } else { align }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,5 +83,12 @@ mod tests {
         assert!(capable(0x1234) && !capable(0x5678));
         forget_heap(0x1234);
         assert!(!capable(0x1234));
+        assert!(needs_tiles(4, 0x31_0000, MSAA_ALIGN, true));
+        assert!(!needs_tiles(4, 0x40_0000, MSAA_ALIGN, true));
+        assert!(needs_tiles(4, 0x40_0000, MSAA_ALIGN, false), "a heap that is not 4 MB aligned cannot place MSAA directly at any offset");
+        assert!(!needs_tiles(1, 0x31_0000, 0x1_0000, false));
+        assert!(!needs_tiles(4, 0x31_0000, 0x1_0000, false), "small MSAA with 64 KB alignment places directly");
+        assert_eq!(span_align(1, 0x1_0000), 0x1_0000);
+        assert_eq!(span_align(4, MSAA_ALIGN), if tiles_usable() { TILE } else { MSAA_ALIGN });
     }
 }

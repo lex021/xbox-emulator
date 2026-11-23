@@ -210,6 +210,16 @@ pub const HEAP_FLAG_XBOX_CPU_ATTR: u32 = 0x2;
 const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
 const PC_HEAP_MIN: u64 = 0x10000;
 const PC_HEAP_ALIGN_MSAA: u64 = 0x40_0000;
+pub const HEAP_DENY_CATEGORIES: u32 = 0x4 | 0x40 | 0x80;
+
+pub fn pc_heap_deny_flags(flags: u32) -> u32 {
+    let deny = flags & HEAP_DENY_CATEGORIES;
+    if deny.count_ones() == 1 {
+        flags & !HEAP_DENY_CATEGORIES
+    } else {
+        flags
+    }
+}
 
 pub fn heap_desc_for_pc(x: &[u8]) -> Result<[u8; HEAP_DESC_SIZE], i32> {
     let mut d: [u8; HEAP_DESC_SIZE] = x[..HEAP_DESC_SIZE].try_into().unwrap();
@@ -217,7 +227,7 @@ pub fn heap_desc_for_pc(x: &[u8]) -> Result<[u8; HEAP_DESC_SIZE], i32> {
     if flags & HEAP_FLAG_ALLOW_DISPLAY != 0 {
         return Err(E_INVALIDARG);
     }
-    d[0x28..0x2c].copy_from_slice(&(flags & !HEAP_FLAG_XBOX_CPU_ATTR).to_le_bytes());
+    d[0x28..0x2c].copy_from_slice(&pc_heap_deny_flags(flags & !HEAP_FLAG_XBOX_CPU_ATTR).to_le_bytes());
     pc_heap_words_at(&mut d, 8);
     let size = u64::from_le_bytes(d[0..8].try_into().unwrap());
     let size = ((size + 0xff) & !0xff).max(PC_HEAP_MIN);
@@ -559,13 +569,21 @@ mod tests {
         let d = heap_desc_for_pc(&heap(0x12345, 1, 0x100, 0x2 | 0x4)).unwrap();
         assert_eq!(u64::from_le_bytes(d[0..8].try_into().unwrap()), 0x12400);
         assert_eq!(u64::from_le_bytes(d[0x20..0x28].try_into().unwrap()), 0);
-        assert_eq!(xs_u32(&d, 0x28), 0x4);
+        assert_eq!(xs_u32(&d, 0x28), 0);
         assert_eq!(xs_u32(&d, 8), 1);
         let z = heap_desc_for_pc(&heap(0, 2, 0x20_0000, 0)).unwrap();
         assert_eq!(u64::from_le_bytes(z[0..8].try_into().unwrap()), PC_HEAP_MIN);
         assert_eq!(u64::from_le_bytes(z[0x20..0x28].try_into().unwrap()), PC_HEAP_ALIGN_MSAA);
         let big = heap_desc_for_pc(&heap(1 << 24, 1, 1 << 23, 0)).unwrap();
         assert_eq!(u64::from_le_bytes(big[0x20..0x28].try_into().unwrap()), 1 << 23);
+    }
+
+    #[test]
+    fn single_category_deny_heaps_become_valid_pc_heaps() {
+        for (x, pc) in [(0u32, 0u32), (0x4, 0), (0x40, 0), (0x80, 0), (0x44, 0x44), (0x84, 0x84), (0xc0, 0xc0), (0x4 | 0x1, 0x1), (0x40 | 0x100, 0x100), (0x44 | 0x1, 0x45)] {
+            assert_eq!(pc_heap_deny_flags(x), pc, "flags {x:#x}");
+            assert_eq!(xs_u32(&heap_desc_for_pc(&heap(0x10000, 1, 0, x)).unwrap(), 0x28), pc, "flags {x:#x}");
+        }
     }
 
     #[test]

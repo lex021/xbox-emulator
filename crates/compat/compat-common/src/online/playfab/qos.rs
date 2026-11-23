@@ -30,6 +30,7 @@ pub fn ensure_started() -> Option<u16> {
         let port = std::env::var("TOMBOX_PLAYFAB_QOS_PORT").ok().or_else(|| crate::cfg("playfab_qos_port")).and_then(|p| p.trim().parse().ok()).unwrap_or(QOS_PORT);
         match UdpSocket::bind(("127.0.0.1", port)) {
             Ok(sock) => {
+                crate::netview::sockets::report_std(&sock);
                 let bound = sock.local_addr().map(|a| a.port()).unwrap_or(port);
                 std::thread::Builder::new().name("tombox-playfab-qos".into()).spawn(move || {
                     let mut buf = [0u8; 2048];

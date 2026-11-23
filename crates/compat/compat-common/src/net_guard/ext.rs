@@ -150,18 +150,38 @@ fn sm_wrapper(i: usize) -> usize {
     [sm0 as *const () as usize, sm1 as *const () as usize, sm2 as *const () as usize, sm3 as *const () as usize][i]
 }
 
+#[cfg(test)]
+pub(crate) fn guarded_inner(p: usize) -> Option<usize> {
+    (0..4).find_map(|i| {
+        if cx_wrapper(i) == p {
+            Some(CX_REAL[i].load(Ordering::Acquire))
+        } else if sm_wrapper(i) == p {
+            Some(SM_REAL[i].load(Ordering::Acquire))
+        } else {
+            None
+        }
+    })
+}
+
 pub unsafe extern "system" fn h_wsaioctl(
     s: usize, code: u32, inb: *const u8, inlen: u32, outb: *mut u8, outlen: u32, ret: *mut u32, ov: *mut c_void, routine: *const c_void,
 ) -> i32 {
     let rc = xorig!(X_WSAIOCTL, fn(usize, u32, *const u8, u32, *mut u8, u32, *mut u32, *mut c_void, *const c_void) -> i32)(s, code, inb, inlen, outb, outlen, ret, ov, routine);
-    if rc != 0 || code != SIO_GET_EXTENSION_FUNCTION_POINTER || inb.is_null() || inlen < 16 || outb.is_null() || outlen < 8 {
-        return rc;
+    if rc == 0 {
+        guard_extension_out(code, inb, inlen, outb, outlen);
+    }
+    rc
+}
+
+pub unsafe fn guard_extension_out(code: u32, inb: *const u8, inlen: u32, outb: *mut u8, outlen: u32) {
+    if code != SIO_GET_EXTENSION_FUNCTION_POINTER || inb.is_null() || inlen < 16 || outb.is_null() || outlen < 8 {
+        return;
     }
     let mut guid = [0u8; 16];
     core::ptr::copy_nonoverlapping(inb, guid.as_mut_ptr(), 16);
     let real = core::ptr::read_unaligned(outb as *const usize);
     if real == 0 {
-        return rc;
+        return;
     }
     let wrapped = if guid == WSAID_CONNECTEX {
         Some(register(&CX_REAL, real).map_or(cx_deny as *const () as usize, cx_wrapper))
@@ -173,7 +193,6 @@ pub unsafe extern "system" fn h_wsaioctl(
     if let Some(w) = wrapped {
         core::ptr::write_unaligned(outb as *mut usize, w);
     }
-    rc
 }
 
 pub unsafe extern "system" fn h_wsasendmsg(s: usize, msg: *const u8, flags: u32, sent: *mut u32, ov: *mut c_void, routine: *const c_void) -> i32 {
@@ -349,6 +368,10 @@ pub fn install(redirect: bool) {
     let (mut hooked, mut denied, mut missing) = (0, Vec::new(), Vec::new());
     for (m, f, idx, hook, deny) in table {
         let name = String::from_utf8_lossy(&f[..f.len() - 1]).into_owned();
+        if idx == X_WSAIOCTL && super::wsaioctl_shared() {
+            hooked += 1;
+            continue;
+        }
         let p = unsafe { resolve_export(m, f) };
         if p.is_null() {
             missing.push(name);

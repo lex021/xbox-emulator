@@ -122,6 +122,59 @@ fn ds_lds_compute() {
             cs.push(cc("ds_write_b16", w, b.clone(), &[10], &move |t| vec![f(dv(nb(t)))]));
             cs.push(cc(m, r, b, &[10], &move |t| vec![f(dv(nb(t)))]));
         }
+        type Ext = fn(u32) -> u32;
+        let w8 = ds(0x1e, off, 0, 2, 0, 0);
+        let w16 = ds(0x1f, off & !1, 8, 2, 0, 0);
+        let d16: [(&'static str, u32, bool, Ext); 6] = [
+            ("ds_read_u8_d16", 0xa2, false, |x| x & 0xff),
+            ("ds_read_u8_d16_hi", 0xa3, true, |x| x & 0xff),
+            ("ds_read_i8_d16", 0xa4, false, |x| (x as u8 as i8) as i16 as u16 as u32),
+            ("ds_read_i8_d16_hi", 0xa5, true, |x| (x as u8 as i8) as i16 as u16 as u32),
+            ("ds_read_u16_d16", 0xa6, false, |x| x & 0xffff),
+            ("ds_read_u16_d16_hi", 0xa7, true, |x| x & 0xffff),
+        ];
+        for (m, op, hi, f) in d16 {
+            let wide = op >= 0xa6;
+            let (w, raddr, roff) = if wide { (w16, 9, off & !1) } else { (w8, 7, off) };
+            let r = ds(op, roff, raddr, 0, 0, 10);
+            let mut b = w.to_vec();
+            b.push(vop1(1, 10, v(4)));
+            b.extend_from_slice(&r);
+            cs.push(cc(m, r, b, &[10], &move |t| {
+                let (old, x) = (ev(t), f(dv(nb(t))));
+                vec![if hi { (old & 0xffff) | (x << 16) } else { (old & 0xffff_0000) | x }]
+            }));
+        }
+        for byte in 0..4u32 {
+            let at = (off & !3) + byte;
+            let w_init = ds(0x0d, off & !3, 1, 4, 0, 0);
+            let w_hi = ds(0xa0, at, 1, 2, 0, 0);
+            let r_full = ds(0x36, off & !3, 3, 0, 0, 10);
+            let mut b = w_init.to_vec();
+            b.extend_from_slice(&w_hi);
+            b.extend_from_slice(&r_full);
+            let sh = byte * 8;
+            cs.push(cc("ds_write_b8_d16_hi", w_hi, b, &[10], &move |t| {
+                let n = nb(t);
+                vec![(ev(n) & !(0xffu32 << sh)) | (((dv(n) >> 16) & 0xff) << sh)]
+            }));
+        }
+        let base_off = off & !3;
+        for half_off in [base_off, base_off + 2] {
+            let w_init = ds(0x0d, base_off, 1, 4, 0, 0);
+            let w_hi = ds(0xa1, half_off, 1, 2, 0, 0);
+            let r_full = ds(0x36, base_off, 3, 0, 0, 10);
+            let mut b = w_init.to_vec();
+            b.extend_from_slice(&w_hi);
+            b.extend_from_slice(&r_full);
+            let hi_shift = (half_off & 2) * 8;
+            cs.push(cc("ds_write_b16_d16_hi", w_hi, b, &[10], &move |t| {
+                let n = nb(t);
+                let orig = ev(n);
+                let hi = dv(n) >> 16;
+                vec![(orig & !(0xffffu32 << hi_shift)) | (hi << hi_shift)]
+            }));
+        }
     }
     type At = fn(u32, u32) -> u32;
     let atoms: [(&'static str, &'static str, u32, At); 6] = [
@@ -220,6 +273,58 @@ fn ds_lds_atomics_ext() {
 }
 
 #[test]
+fn ds_lds_mskor_wrxchg2() {
+    let mut cs = Vec::new();
+    let nb = |t: u32| t ^ 1;
+    let grid: &[(u32, u32, u32)] = &[(4, 2, 0), (2, 4, 7), (0, 13, 4), (4, 4, 4), (13, 13, 2), (2, 2, 13), (4, 0, 2), (2, 7, 4)];
+    for (k, &(old, d0, d1)) in grid.iter().enumerate() {
+        let off = if k % 2 == 0 { 0 } else { 0x104 };
+        let want = move |t: u32| (reg_val(old, t) & !reg_val(d0, t)) | reg_val(d1, t);
+        for rtn in [false, true] {
+            let a = ds(if rtn { 0x2c } else { 0x0c }, off, 1, d0, d1, 11);
+            let mut b = vec![vop1(1, 13, ic(0)), vop1(1, 11, v(4))];
+            b.extend_from_slice(&ds(0x0d, off, 1, old, 0, 0));
+            b.extend_from_slice(&a);
+            b.extend_from_slice(&ds(0x36, off, 3, 0, 0, 10));
+            if rtn {
+                cs.push(cc("ds_mskor_rtn_b32", a, b, &[11, 10], &move |t| vec![reg_val(old, t), want(nb(t))]));
+            } else {
+                cs.push(cc("ds_mskor_b32", a, b, &[11, 10], &move |t| vec![ev(t), want(nb(t))]));
+            }
+        }
+    }
+    let mut b = vec![vop1(1, 12, LIT), 0x5aa5_0ff0, vop1(1, 13, ic(0)), vop1(1, 15, ic(1))];
+    b.extend_from_slice(&[vop2(0x1a, 14, v(0), 15), vop2(0x1b, 16, ic(1), 0), vop2(0x1a, 17, v(0), 16)]);
+    b.extend_from_slice(&ds(0x0d, 0x200, 13, 12, 0, 0));
+    let a = ds(0x0c, 0x200, 13, 14, 17, 0);
+    b.extend_from_slice(&a);
+    b.extend_from_slice(&ds(0x36, 0x200, 13, 0, 0, 10));
+    cs.push(cc("ds_mskor_b32", a, b, &[10], &|_| vec![0xaaaa_aaaa]));
+    for &(o0, o1) in &[(0u32, 1u32), (1, 0), (2, 3)] {
+        let offs = o0 | (o1 << 8);
+        for (m, wr, xc, rd, own, other) in [("ds_wrxchg2_rtn_b32", 0x0eu32, 0x2eu32, 0x37u32, 5u32, 6u32), ("ds_wrxchg2st64_rtn_b32", 0x0f, 0x2f, 0x38, 1, 3)] {
+            let x = ds(xc, offs, own, 4, 0, 10);
+            let mut b = ds(wr, offs, own, 2, 4, 0).to_vec();
+            b.extend_from_slice(&x);
+            b.extend_from_slice(&ds(rd, offs, other, 0, 0, 12));
+            cs.push(cc(m, x, b, &[10, 11, 12, 13], &|t| vec![dv(t), ev(t), ev(nb(t)), nb(t)]));
+        }
+    }
+    let x = ds(0x2e, 0x0101, 5, 4, 0, 10);
+    let mut b = ds(0x0d, 4, 5, 2, 0, 0).to_vec();
+    b.extend_from_slice(&x);
+    b.extend_from_slice(&ds(0x36, 4, 6, 0, 0, 12));
+    cs.push(cc("ds_wrxchg2_rtn_b32", x, b, &[10, 11, 12], &|t| vec![dv(t), ev(t), nb(t)]));
+    let x = ds(0x2e, 0x0100, 14, 15, 0, 14);
+    let mut b = vec![vop1(1, 14, v(5)), vop1(1, 15, v(4))];
+    b.extend_from_slice(&ds(0x0e, 0x0100, 5, 2, 4, 0));
+    b.extend_from_slice(&x);
+    b.extend_from_slice(&ds(0x37, 0x0100, 6, 0, 0, 12));
+    cs.push(cc("ds_wrxchg2_rtn_b32", x, b, &[14, 15, 12, 13], &|t| vec![dv(t), ev(t), ev(nb(t)), nb(t)]));
+    run_cs_cases("ds_lds_mskor_wrxchg2", &cs);
+}
+
+#[test]
 fn ds_lds_b64_compute() {
     let mut cs = Vec::new();
     let nb = |t: u32| t ^ 1;
@@ -300,6 +405,72 @@ fn ds_permute_compute() {
         vec![src.map(|k| dv(g(t) + k)).unwrap_or(0)]
     }));
     run_cs_cases("ds_permute", &cs);
+}
+
+#[test]
+fn ds_swizzle_compute() {
+    let mut cs = Vec::new();
+    let g = |t: u32| t & !31;
+    let bit = |off: u32, l: u32| (((l & (off & 0x1f)) | ((off >> 5) & 0x1f)) ^ ((off >> 10) & 0x1f)) & 31;
+    let quad = |off: u32, l: u32| (l & !3) | ((off >> (2 * (l & 3))) & 3);
+    for &off in &[0x001fu32, 0x041f, 0x081f, 0x101f, 0x401f, 0x0010, 0x03e0, 0x00a0, 0x0c1b, 0x7c00, 0x1fa5, 0x7fff] {
+        let op = ds(0x35, off, 2, 0, 0, 10);
+        cs.push(cc("ds_swizzle_b32", op, op.to_vec(), &[10], &move |t| vec![dv(g(t) + bit(off, t & 31))]));
+    }
+    for &m in &[0xe4u32, 0x1b, 0x55, 0xaa, 0x4e, 0xb1, 0x00, 0xff] {
+        let off = 0x8000 | m;
+        let op = ds(0x35, off, 2, 0, 0, 10);
+        cs.push(cc("ds_swizzle_b32", op, op.to_vec(), &[10], &move |t| vec![dv(g(t) + quad(off, t & 31))]));
+    }
+    run_cs_cases("ds_swizzle_cs", &cs);
+}
+
+fn rotate_source(off: u32, lane: u32) -> u32 {
+    let mask = off & 31;
+    let n = (off >> 5) & 31;
+    let amount = if off & 0x400 == 0 { n } else { (32 - n) % 32 };
+    (lane & mask) | (((lane + amount) & 31) & !mask & 31)
+}
+
+fn fft_source(off: u32, lane: u32) -> u32 {
+    let mask = off & 31;
+    let reversed = (0..5).fold(0, |a, b| a | (((lane >> b) & 1) << (4 - b)));
+    (reversed >> mask.count_ones()) | (lane & mask)
+}
+
+#[test]
+fn ds_swizzle_rotate_and_fft_compute() {
+    assert_eq!((0..4).map(|l| fft_source(0xe000, l)).collect::<Vec<_>>(), [0, 16, 8, 24]);
+    assert!((0..32).all(|l| fft_source(0xe01f, l) == l));
+    assert_eq!([1, 16, 17].map(|l| fft_source(0xe010, l)), [8, 16, 24]);
+    assert_eq!((0..4).map(|l| rotate_source(0xc020, l)).collect::<Vec<_>>(), [1, 2, 3, 4]);
+    assert_eq!((0..4).map(|l| rotate_source(0xc420, l)).collect::<Vec<_>>(), [31, 0, 1, 2]);
+    assert_eq!((0..8).map(|l| rotate_source(0xc060 | 0x18, l)).collect::<Vec<_>>(), [3, 4, 5, 6, 7, 0, 1, 2]);
+    let g = |t: u32| t & !31;
+    let mut cs = Vec::new();
+    let mut offsets = Vec::new();
+    for dir in [0u32, 1] {
+        for n in [0u32, 1, 3, 31] {
+            for mask in [0x00u32, 0x18, 0x1c, 0x01] {
+                offsets.push(0xc000 | (dir << 10) | (n << 5) | mask);
+            }
+        }
+    }
+    offsets.extend([0xd800u32 | 0x0460 | 0x18, 0xc000 | (3 << 5) | 0x1f, 0xdbff]);
+    for &off in &offsets {
+        let op = ds(0x35, off, 2, 0, 0, 10);
+        cs.push(cc("ds_swizzle_b32", op, op.to_vec(), &[10], &move |t| vec![dv(g(t) + rotate_source(off, t & 31))]));
+    }
+    for &mask in &[0x00u32, 0x10, 0x1f, 0x18, 0x1c, 0x1e, 0x01, 0x0f, 0x15, 0x08] {
+        let off = 0xe000 | mask;
+        let op = ds(0x35, off, 2, 0, 0, 10);
+        cs.push(cc("ds_swizzle_b32", op, op.to_vec(), &[10], &move |t| vec![dv(g(t) + fft_source(off, t & 31))]));
+    }
+    for &off in &[0xffe0u32, 0xf550, 0xfffe, 0xe3f1] {
+        let op = ds(0x35, off, 2, 0, 0, 10);
+        cs.push(cc("ds_swizzle_b32", op, op.to_vec(), &[10], &move |t| vec![dv(g(t) + fft_source(off, t & 31))]));
+    }
+    run_cs_cases("ds_swizzle_rotate_fft", &cs);
 }
 
 #[test]

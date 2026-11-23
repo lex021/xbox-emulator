@@ -19,3 +19,4 @@ xone-exports = { path = "../xone-exports" }
 
 [dev-dependencies]
 xone-exports = { path = "../xone-exports" }
+compat-common = { path = "../compat-common" }

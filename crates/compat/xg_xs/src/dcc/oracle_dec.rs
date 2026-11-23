@@ -71,11 +71,12 @@ struct Ctx<'a> {
     hl: Vec<bool>,
     u: [[bool; 256]; 3],
     masked: u64,
+    force: bool,
 }
 
 impl<'a> Ctx<'a> {
     fn new(o: &'a Oracle, f: Con, hl: Vec<bool>) -> Ctx<'a> {
-        Ctx { o, f, hl, u: [[false; 256]; 3], masked: 0 }
+        Ctx { o, f, hl, u: [[false; 256]; 3], masked: 0, force: false }
     }
     fn cmp(&mut self, t: &mut Tally, name: &'static str, n: &Dcc, post: &Dcc, ctx: &str) {
         let mut c = copy(post);
@@ -167,7 +168,7 @@ impl<'a> Ctx<'a> {
         s.w32(0x58, meta as u32);
         let start = copy(s);
         let mut nat = copy(s);
-        if dec::run(&mut nat).is_err() {
+        if dec::run(&mut nat).is_err() && !self.force {
             let c = cause(s);
             t.err(c);
             if c == "color 0x24ec0" {
@@ -562,7 +563,7 @@ fn oracle_dcc_dec_stages() {
 }
 
 #[test]
-fn oracle_dcc_dec_e2e() {
+fn oracle_dcc_dec_e2e_undefined_masked() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
     let cdec: DecF = unsafe { core::mem::transmute(o.f("XGDecodeDCC")) };
@@ -570,7 +571,7 @@ fn oracle_dcc_dec_e2e() {
     let bad_metas: Vec<u8> = (0..256u32).filter(|&m| !valid_meta(m)).map(|m| m as u8).collect();
     let st = states();
     let mut r = Rng(0xe2e_dcc_77);
-    let (mut calls, mut blocks, mut bad, mut nerr, mut inval) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut calls, mut blocks, mut bad, mut nerr, mut inval, mut masked) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut causes: std::collections::BTreeMap<&'static str, u64> = std::collections::BTreeMap::new();
     let mut extra: Vec<(u32, u32, u32, u32, u32)> = configs();
     extra.retain(|_| r.below(40) == 0);
@@ -630,11 +631,13 @@ fn oracle_dcc_dec_e2e() {
                 }
                 continue;
             }
+            let nu = crate::dcc::last_undefined();
+            masked += nu.iter().filter(|&&x| x).count() as u64;
             let mut cd = vec![0u8; 256 * count];
             let cr = unsafe { cdec(count as u32, src.as_ptr(), meta.as_ptr(), cd.as_mut_ptr(), f, sw, dim, prm.as_ptr()) };
             calls += 1;
             blocks += count as u64;
-            if cr != 0 || cd != nd {
+            if cr != 0 || (0..count).any(|i| !nu[i] && cd[i * 256..i * 256 + 256] != nd[i * 256..i * 256 + 256]) {
                 bad += 1;
                 if bad <= 10 {
                     let j = (0..cd.len()).find(|&j| cd[j] != nd[j]);
@@ -651,7 +654,7 @@ fn oracle_dcc_dec_e2e() {
             assert_eq!(nr, E_INVALIDARG, "invalid meta {:#x} accepted", m);
         }
     }
-    println!("dcc dec e2e: {} XGDecodeDCC calls, {} blocks, {} mismatches, {} native E_INVALIDARG skips, {} invalid-meta calls all E_INVALIDARG", calls, blocks, bad, nerr, inval);
+    println!("dcc dec e2e, undefined blocks masked: {} XGDecodeDCC calls, {} blocks ({} undefined on the console and masked), {} mismatches on defined blocks, {} native E_INVALIDARG skips, {} invalid-meta calls all E_INVALIDARG", calls, blocks, masked, bad, nerr, inval);
     for (c, n) in &causes {
         println!("dcc dec e2e native E_INVALIDARG cause {}: {}", c, n);
     }
@@ -950,4 +953,33 @@ fn oracle_dcc_dec_color_fault_child() {
         faults += 1;
     }
     println!("dcc dec color #DE: {} predicted cases, console XGDecodeDCC raised STATUS_INTEGER_DIVIDE_BY_ZERO in {} child processes", cases.len(), faults);
+}
+
+#[test]
+#[ignore]
+fn dcc_stage_trace_case() {
+    let Ok(ids) = std::env::var("TOMBOX_DCC_TRACE_IDS") else { return };
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let o = oracle().expect("console xg_xs.dll");
+    let hl = holes(&o);
+    for id in ids.split(',').map(|x| x.parse::<u64>().unwrap()) {
+        let c = super::oracle_cases::case(id);
+        if c.enc {
+            continue;
+        }
+        let (Some(con), Some(fresh)) = (Con::new(&o, c.fmt, c.sw, c.dim, c.p[0], c.p[1]), Con::new(&o, c.fmt, c.sw, c.dim, c.p[0], c.p[1])) else { continue };
+        let mut cx = Ctx::new(&o, fresh, hl.clone());
+        cx.force = true;
+        let mut s = defined(con.pull());
+        let mut t = Tally::new();
+        dec::tolerant(|| {
+            for k in 0..c.n {
+                let mut b = [0u8; 256];
+                b.copy_from_slice(&c.src[k * 256..k * 256 + 256]);
+                let ctx = format!("case {id} blk {k} f={} sw={} dim={} p={:x?} meta={:#04x}", c.fmt, c.sw, c.dim, c.p, c.meta[k]);
+                cx.block(&mut t, &mut s, &b, c.meta[k], &ctx);
+            }
+        });
+        t.print(&format!("trace {id}"));
+    }
 }

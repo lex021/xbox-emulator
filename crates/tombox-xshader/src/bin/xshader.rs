@@ -102,7 +102,7 @@ fn main() -> ExitCode {
         }
     }
     for r in &ex.resources {
-        println!("  psv0 resource: type={} space={} reg={}..{}", r.res_type, r.space, r.lower, r.upper);
+        println!("  psv0 resource: type={} space={} reg={}..{} kind={}", r.res_type, r.space, r.lower, r.upper, r.kind);
     }
     if let Some(rs) = &ex.root_sig {
         let source = root_signature.map_or("embedded", |path| path.as_str());

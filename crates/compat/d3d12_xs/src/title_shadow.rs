@@ -304,6 +304,9 @@ fn buf_desc(width: u64) -> [u8; 0x38] {
 }
 
 pub unsafe fn create_heap(real: *mut c_void, lo: u64, hi: u64) -> Option<usize> {
+    if crate::dred::removed() {
+        return None;
+    }
     let size = hi.checked_sub(lo).filter(|s| *s > 0)?;
     let mut hd = [0u8; 0x30];
     hd[0..8].copy_from_slice(&size.to_le_bytes());
@@ -513,6 +516,44 @@ pub unsafe fn place_reserved(real: *mut c_void, heap: usize, offset: u64, desc: 
     hr
 }
 
+pub unsafe fn place_tiled(real: *mut c_void, heap: usize, offset: u64, desc: &[u8; 0x38], init_state: u32, pclear: *const c_void, ppv: *mut *mut c_void) -> i32 {
+    let mut d = *desc;
+    d[8..16].copy_from_slice(&0u64.to_le_bytes());
+    d[0x2c..0x30].copy_from_slice(&2u32.to_le_bytes());
+    let hr = unsafe { vcall!(real, 30, fn(*const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32, d.as_ptr(), init_state, pclear, &IID_RESOURCE, ppv) };
+    if hr < 0 || unsafe { *ppv }.is_null() {
+        unsafe { *ppv = core::ptr::null_mut() };
+        return if hr < 0 { hr } else { 0x8000_4005u32 as i32 };
+    }
+    let res = unsafe { *ppv };
+    let mut tiles = 0u32;
+    let mut packed = [0u32; 3];
+    let mut shape = [0u32; 3];
+    let mut subs = 0u32;
+    unsafe { vcall!(real, 42, fn(*mut c_void, *mut u32, *mut u32, *mut u32, *mut u32, u32, *mut c_void) -> (), res, &mut tiles, packed.as_mut_ptr(), shape.as_mut_ptr(), &mut subs, 0, core::ptr::null_mut()) };
+    let mut hd = [0u8; 0x30];
+    unsafe { vcall!(heap as *mut c_void, 8, fn(*mut u8) -> *mut u8, hd.as_mut_ptr()) };
+    let heap_size = u64::from_le_bytes(hd[0..8].try_into().unwrap());
+    let fits = tiles != 0 && offset % TILE == 0 && offset + tiles as u64 * TILE <= heap_size;
+    let ok = fits && unsafe {
+        with_tiles(real, |t| {
+            t.map(res, tiles, heap as *mut c_void, (offset / TILE) as u32);
+            t.flush()
+        })
+    } == Some(true);
+    if !ok {
+        record("d3d12_xs", "title_shadow", &format!("tiled MSAA at heap {heap:#x}+{offset:#x}: {tiles} tile(s) in a {heap_size:#x} heap could not be mapped"));
+        unsafe { vcall!(res, 2, fn() -> u32) };
+        unsafe { *ppv = core::ptr::null_mut() };
+        return 0x8007_000eu32 as i32;
+    }
+    static L: AtomicUsize = AtomicUsize::new(0);
+    if L.fetch_add(1, Ordering::Relaxed) < 16 {
+        record("d3d12_xs", "title_shadow", &format!("MSAA texture at heap {heap:#x}+{offset:#x} (not a 4 MB step) is a reserved resource whose {tiles} tile(s) map that heap range, so it aliases the title's other placements there"));
+    }
+    hr
+}
+
 pub fn is_shadow_heap(heap: usize) -> bool {
     shadows(|m| m.contains_key(&heap))
 }
@@ -556,6 +597,9 @@ fn drain_queues() {
 }
 
 pub unsafe fn migrate(real: *mut c_void, shadow_heap: usize, local_heap: usize) -> bool {
+    if crate::dred::removed() {
+        return false;
+    }
     drain_queues();
     sync_up();
     sync_down();
@@ -733,3 +777,16 @@ pub unsafe fn after_execute(queue: *mut c_void, signal: usize, wait: usize) -> O
 #[cfg(test)]
 #[path = "title_shadow_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod removed_gate {
+    #[test]
+    fn no_shadow_heap_or_migration_after_device_removal() {
+        crate::dred::mark_removed();
+        let h = unsafe { super::create_heap(core::ptr::null_mut(), 0x1000, 0x2000) };
+        let m = unsafe { super::migrate(core::ptr::null_mut(), 1, 2) };
+        crate::dred::clear_removed_for_test();
+        assert!(h.is_none());
+        assert!(!m);
+    }
+}

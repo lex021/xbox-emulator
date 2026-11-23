@@ -131,7 +131,7 @@ unsafe fn vslot(obj: *mut c_void, i: usize) -> usize {
 unsafe fn flush_barrier(list: *mut c_void) {
     let mut b = [0u8; 32];
     b[0..4].copy_from_slice(&BARRIER_TYPE_UAV.to_le_bytes());
-    let f: unsafe extern "system" fn(*mut c_void, u32, *const u8) = unsafe { core::mem::transmute(vslot(list, PC_SLOT_RESOURCE_BARRIER)) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const u8) = unsafe { core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SLOT_RESOURCE_BARRIER)) };
     unsafe { f(list, 1, b.as_ptr()) };
 }
 
@@ -146,6 +146,10 @@ pub unsafe extern "system" fn write64(this: *mut c_void, va: u64, value: u64, fl
             return;
         }
         Plan::Write { eop, diagnostic } => {
+            static FIRST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+            if !FIRST.swap(true, Ordering::Relaxed) {
+                record("d3d12_xs", "bop64", &format!("first call {W}(va={va:#x}, value={value:#x}, flush={flush:#x}, flags={flags:#x}) list type {ty}: recorded as {:?}", eop.kind));
+            }
             if let Some(d) = diagnostic {
                 if once(16) {
                     record("d3d12_xs", "bop64", &format!("{W}(va={va:#x}, value={value:#x}, flush={flush:#x}, flags={flags:#x}): debug UMD reports \"{d}\"; the console UMD still emits the end-of-pipe packet it encodes ({eop:?}), emulated the same"));
@@ -225,6 +229,7 @@ unsafe fn scratch(list: *mut c_void) -> Option<Scratch> {
 }
 
 unsafe fn write_value(list: *mut c_void, va: u64, value: u64) {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::COPY) };
     let words = [value as u32, (value >> 32) as u32];
     let fallback = |why: &str| {
         if once(16) {
@@ -254,16 +259,16 @@ unsafe fn write_value(list: *mut c_void, va: u64, value: u64) {
     let modes = [WBI_MODE_MARKER_OUT; 2];
     let pred = crate::cl2_state::predication_of(list);
     unsafe {
-        let sp: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u32) = core::mem::transmute(vslot(list, PC_SLOT_SET_PREDICATION));
+        let sp: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SLOT_SET_PREDICATION));
         if pred.is_some() {
             sp(list, core::ptr::null_mut(), 0, 0);
         }
         crate::fill::barrier_pub(list, s.res, STATE_COMMON, STATE_COPY_DEST);
-        let wbi: unsafe extern "system" fn(*mut c_void, u32, *const crate::console_slots::WbiParam, *const u32) = core::mem::transmute(vslot(list, PC_SLOT_WRITE_BUFFER_IMMEDIATE));
+        let wbi: unsafe extern "system" fn(*mut c_void, u32, *const crate::console_slots::WbiParam, *const u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SLOT_WRITE_BUFFER_IMMEDIATE));
         wbi(list, 2, params.as_ptr(), modes.as_ptr());
         crate::fill::barrier_pub(list, s.res, STATE_COPY_DEST, STATE_COPY_SOURCE);
         if let Some((a, b)) = db { crate::fill::barrier_pub(list, e.res, a, b); }
-        let cp: unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64) = core::mem::transmute(vslot(list, PC_SLOT_COPY_BUFFER_REGION));
+        let cp: unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SLOT_COPY_BUFFER_REGION));
         cp(list, e.res, off, s.res, soff, 8);
         if let Some((a, b)) = db { crate::fill::barrier_pub(list, e.res, b, a); }
         crate::fill::barrier_pub(list, s.res, STATE_COPY_SOURCE, STATE_COMMON);

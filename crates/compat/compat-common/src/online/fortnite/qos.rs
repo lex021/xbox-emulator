@@ -12,7 +12,10 @@ fn responder() -> &'static Option<u16> {
     static P: OnceLock<Option<u16>> = OnceLock::new();
     P.get_or_init(|| {
         let sock = match UdpSocket::bind(("127.0.0.1", 0)) {
-            Ok(s) => s,
+            Ok(s) => {
+                crate::netview::sockets::report_std(&s);
+                s
+            }
             Err(e) => {
                 crate::record_raw("online", "[qos]", &format!("bind failed: {e}"));
                 return None;

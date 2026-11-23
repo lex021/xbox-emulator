@@ -29,6 +29,36 @@ fn ws() -> Ws {
 }
 
 #[test]
+fn layout_19041_reports_the_first_title_allocation_in_4k_frames() {
+    if std::env::var_os("XMEM_LAYOUT_TEST_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "layout_19041_reports_the_first_title_allocation_in_4k_frames"])
+            .env("XMEM_LAYOUT_TEST_CHILD", "1")
+            .env("TOMBOX_CONSOLE_OSBUILD", "19041")
+            .status().unwrap();
+        assert!(status.success());
+        return;
+    }
+    let module = xmem();
+    unsafe {
+        let query: extern "system" fn(*mut u64) -> i32 = core::mem::transmute(export(module, c"XMemGetPhysicalMemoryLayout"));
+        let allocate: extern "system" fn(u64, *mut usize, *mut u64) -> i32 = core::mem::transmute(export(module, c"XMemAllocatePhysicalPages"));
+        let free: extern "system" fn(usize, *mut u64) -> i32 = core::mem::transmute(export(module, c"XMemFreePhysicalPages"));
+        let mut words = [u64::MAX; 4];
+        assert_eq!(query(words.as_mut_ptr().add(1)), 1);
+        let mut count = 2;
+        let mut pages = [0; 2];
+        assert_eq!(allocate(0x2040_0000, &mut count, pages.as_mut_ptr()), 1);
+        assert_eq!(free(count, pages.as_mut_ptr()), 1);
+        let first_frame = pages[0] * 16;
+        assert_eq!(words, [u64::MAX, first_frame, first_frame, u64::MAX]);
+        assert_eq!(pages[1], pages[0] + 1);
+        assert_eq!(query(words.as_mut_ptr().add(1)), 1);
+        assert_eq!(words[1..3], [first_frame; 2]);
+    }
+}
+
+#[test]
 fn allocation_is_queryable_through_the_dll_exports() {
     const SIZE: usize = 64;
     const MEM_COMMIT: u32 = 0x1000;
@@ -96,4 +126,38 @@ fn legacy_puts_internal_pool_bytes_at_0x24_like_console_2b44() {
     }
     assert_ne!(d(&int, 0x48), 0);
     near(d(&old, 0x24), d(&int, 0x48));
+}
+
+#[test]
+fn legacy_free_page_query_writes_two_triples_through_the_dll_export() {
+    if std::env::var_os("XMEM_FREE_PAGE_TEST_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "legacy_free_page_query_writes_two_triples_through_the_dll_export"])
+            .env("XMEM_FREE_PAGE_TEST_CHILD", "1")
+            .env("TOMBOX_CONSOLE_OSBUILD", "19041")
+            .status().unwrap();
+        assert!(status.success());
+        return;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetNumaHighestNodeNumber(highest: *mut u32) -> i32;
+    }
+    let mut highest = 0;
+    assert_ne!(unsafe { GetNumaHighestNodeNumber(&mut highest) }, 0);
+    let query: unsafe extern "system" fn(*mut u64) -> i32 =
+        unsafe { core::mem::transmute(export(xmem(), c"XMemGetFreePageStatistics")) };
+    let mut words = [u64::MAX; 8];
+    let result = unsafe { query(words.as_mut_ptr().add(1)) };
+    if highest > 1 {
+        assert_eq!(result, 0);
+        assert_eq!(words, [u64::MAX; 8]);
+    } else {
+        assert_eq!(result, 1);
+        assert_eq!((words[0], words[7]), (u64::MAX, u64::MAX));
+        assert!(!words[1..7].contains(&u64::MAX));
+        if highest == 0 {
+            assert_eq!(words[1..4], words[4..7]);
+        }
+    }
 }

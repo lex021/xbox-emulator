@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 pub const DISPLAY_MODE_1: u32 = 0x0001_0007;
@@ -7,6 +8,27 @@ pub const PROXY_APP: u32 = 0x0064_003f;
 pub const CHANNEL_OPEN: u32 = 0x0000_0005;
 pub const WINDOW_MESSAGING: u32 = 0x0000_0001;
 pub const AUDIO_HELLO: u32 = 0x0008;
+pub const AUDIO_NOTIFY: u32 = 0x0002;
+pub const AUDIO_FRAME: usize = 0x810;
+
+static AUDIO_STREAM: AtomicU64 = AtomicU64::new(0);
+
+pub fn audio_stream() -> Option<u64> {
+    match AUDIO_STREAM.load(Ordering::SeqCst) {
+        0 => None,
+        v => Some(v - 1),
+    }
+}
+
+pub fn push_audio(frame: &[u8]) -> i32 {
+    if frame.len() != AUDIO_FRAME {
+        return -2147024809;
+    }
+    let Some(id) = audio_stream() else {
+        return -2147483638;
+    };
+    push(id, (crate::crossvm::generation() << 16) | AUDIO_NOTIFY, frame)
+}
 
 #[derive(Default)]
 struct Stream {
@@ -87,6 +109,7 @@ pub fn push_input(id: u64, records: &[(u32, u64, u64)]) -> i32 {
 
 pub fn forget(id: u64) {
     streams().remove(&id);
+    let _ = AUDIO_STREAM.compare_exchange(id + 1, 0, Ordering::SeqCst, Ordering::SeqCst);
 }
 
 pub fn on_bytes(id: u64, data: &[u8]) -> Vec<u8> {
@@ -101,6 +124,7 @@ pub fn on_bytes(id: u64, data: &[u8]) -> Vec<u8> {
         if kind & 0xffff == AUDIO_HELLO && payload.is_empty() {
             let ack = kind & 0xffff_0000;
             crate::crossvm::set_hello((kind >> 16) as u16);
+            AUDIO_STREAM.store(id + 1, Ordering::SeqCst);
             compat_common::record_raw("gamecore-host", "audio", &format!("XVMAudioService hello {kind:#010x}; host ack frame {ack:#010x}"));
             out.extend(frame(st.prev_out, ack, &[]));
             st.prev_out = 0;

@@ -2,7 +2,13 @@
 use core::ffi::c_void;
 
 #[cfg(not(pixrt_classic))]
+pub mod driver;
+#[cfg(not(pixrt_classic))]
+pub mod etw;
+#[cfg(not(pixrt_classic))]
 pub mod runtime;
+#[cfg(not(pixrt_classic))]
+pub mod session;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 

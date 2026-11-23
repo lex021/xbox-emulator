@@ -9,6 +9,7 @@ extern "system" {
     fn GetModuleFileNameW(m: *mut c_void, buf: *mut u16, n: u32) -> u32;
     fn GetSystemWindowsDirectoryW(buf: *mut u16, n: u32) -> u32;
     fn GetModuleHandleExW(flags: u32, addr: *const u16, out: *mut *mut c_void) -> i32;
+    fn FreeLibrary(m: *mut c_void) -> i32;
 }
 
 #[derive(Clone, Copy)]
@@ -187,20 +188,97 @@ pub unsafe fn loaded_modules() -> Vec<*mut c_void> {
     v
 }
 
-pub unsafe fn sweep(hooks: &[Hook], report: &mut Vec<(String, Vec<String>)>) -> usize {
+pub unsafe fn pin_module(m: *mut c_void) -> Option<*mut c_void> {
+    let mut h = core::ptr::null_mut();
+    if m.is_null() || GetModuleHandleExW(0x4, m as *const u16, &mut h) == 0 || h.is_null() {
+        return None;
+    }
+    if h != m {
+        FreeLibrary(h);
+        return None;
+    }
+    Some(h)
+}
+
+pub unsafe fn unpin_module(m: *mut c_void) {
+    FreeLibrary(m);
+}
+
+pub unsafe fn sweep_modules(mods: &[*mut c_void], hooks: &[Hook], report: &mut Vec<(String, Vec<String>)>) -> usize {
     let mut total = 0;
-    for m in loaded_modules() {
-        let path = module_path(m);
-        if !is_title_module(&path, m as usize) {
-            continue;
+    for &m in mods {
+        let Some(pinned) = pin_module(m) else { continue };
+        let path = module_path(pinned);
+        if !path.is_empty() && is_title_module(&path, pinned as usize) && !super::foreign::is_host_injected(&path) {
+            let mut hits = Vec::new();
+            let n = patch_image(pinned as *mut u8, hooks, &mut hits);
+            if n > 0 {
+                total += n;
+                let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
+                report.push((name, hits));
+            }
         }
-        let mut hits = Vec::new();
-        let n = patch_image(m as *mut u8, hooks, &mut hits);
-        if n > 0 {
-            total += n;
-            let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
-            report.push((name, hits));
-        }
+        FreeLibrary(pinned);
     }
     total
+}
+
+pub unsafe fn sweep(hooks: &[Hook], report: &mut Vec<(String, Vec<String>)>) -> usize {
+    sweep_modules(&loaded_modules(), hooks, report)
+}
+
+#[cfg(test)]
+mod sweep_race_tests {
+    use super::*;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+    }
+
+    fn w(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(Some(0)).collect()
+    }
+
+    static MSIMG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn sweep_skips_a_module_unloaded_after_enumeration() {
+        let _g = MSIMG.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let name = w("msimg32.dll");
+            if !GetModuleHandleW(name.as_ptr()).is_null() {
+                return;
+            }
+            let base = LoadLibraryW(name.as_ptr());
+            assert!(!base.is_null());
+            let listed = vec![base];
+            while !GetModuleHandleW(name.as_ptr()).is_null() {
+                FreeLibrary(base);
+            }
+            assert!(pin_module(base).is_none(), "an unloaded base cannot be pinned");
+            let mut report = Vec::new();
+            assert_eq!(sweep_modules(&listed, &[], &mut report), 0, "the stale base is skipped, never read");
+            assert!(report.is_empty());
+        }
+    }
+
+    #[test]
+    fn pinning_a_live_module_keeps_it_loaded_and_releases_the_reference() {
+        let _g = MSIMG.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let name = w("msimg32.dll");
+            if !GetModuleHandleW(name.as_ptr()).is_null() {
+                return;
+            }
+            let base = LoadLibraryW(name.as_ptr());
+            let pinned = pin_module(base).expect("a loaded module pins");
+            assert_eq!(pinned, base);
+            FreeLibrary(base);
+            assert!(!GetModuleHandleW(name.as_ptr()).is_null(), "the pin holds the module while a sweep patches it");
+            unpin_module(pinned);
+            assert!(GetModuleHandleW(name.as_ptr()).is_null(), "unpin drops the only reference");
+        }
+    }
 }

@@ -1,12 +1,13 @@
-use compat_common::{record, E_NOTIMPL, S_OK};
-use opusdec::OpusDecoder;
+use compat_common::{record, S_OK};
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
+pub mod engine;
 pub mod rec;
+use engine::{Config, Start, Stream};
 pub use rec::{XApuConnect, XApuDequeueResult, XApuDisconnect, XApuEnqueueCommand, XApuGetResultCount};
 
 const M: &str = "xapu";
@@ -20,7 +21,11 @@ pub const XAPU_E_NO_RESULT: i32 = 0x8AC8_1001u32 as i32;
 pub const XAPU_E_BAD_STREAM: i32 = 0x8AC8_1003u32 as i32;
 pub const XAPU_E_NO_STREAMS: i32 = 0x8AC8_1004u32 as i32;
 pub const XAPU_E_STREAM_ACTIVE: i32 = 0x8AC8_1005u32 as i32;
-pub const XAPU_E_START_BUFFER: i32 = 0x8AC8_1006u32 as i32;
+pub const XAPU_E_BUFFER_TOO_SMALL: i32 = 0x8AC8_1006u32 as i32;
+pub const XAPU_E_START_BUFFER: i32 = XAPU_E_BUFFER_TOO_SMALL;
+pub const XAPU_E_INVALID_COMMAND: i32 = 0x8AC8_1002u32 as i32;
+pub const XAPU_E_PROCESSING_ERROR: i32 = 0x8AC8_1007u32 as i32;
+pub const XAPU_E_BAD_OPUS_PACKET: i32 = 0x8AC8_1008u32 as i32;
 
 pub const CODEC_OPUS: u32 = 2;
 
@@ -36,8 +41,8 @@ const TOTAL_STREAMS: u32 = 500;
 const MAX_BASE_DATA: u32 = 0x2000_0000;
 const RESULT_SIZE: usize = 0x50;
 const CMD_SIZE: usize = 0x40;
-const OPUS_RATE: i32 = 48000;
-const OPUS_MAX_FRAME: usize = 5760;
+pub(crate) const OPUS_RATE: i32 = 48000;
+pub(crate) const OPUS_MAX_FRAME: usize = 5760;
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -63,22 +68,6 @@ fn sync_mode() -> bool {
     SYNC.load(Ordering::Relaxed) || *ENV.get_or_init(|| std::env::var("TOMBOX_XAPU_SYNC").is_ok_and(|v| v.trim() == "1"))
 }
 
-struct Stream {
-    channels: usize,
-    start_gain: f32,
-    gain: f32,
-    decoder: Option<OpusDecoder>,
-    fifo: Vec<VecDeque<f32>>,
-    pcm: Vec<f32>,
-    gains: Vec<f32>,
-}
-
-impl Stream {
-    fn new() -> Stream {
-        Stream { channels: 0, start_gain: 1.0, gain: 1.0, decoder: None, fifo: Vec::new(), pcm: Vec::new(), gains: Vec::new() }
-    }
-}
-
 #[derive(Default, Clone, Copy)]
 struct Ctl {
     active: bool,
@@ -90,7 +79,7 @@ struct Job {
     seq: u32,
     kind: u32,
     cmd: [u8; CMD_SIZE],
-    start: Option<(usize, f32, OpusDecoder)>,
+    start: Option<Start>,
 }
 
 #[derive(Default)]
@@ -106,8 +95,7 @@ struct Done {
 }
 
 struct Shared {
-    frame: usize,
-    epoch: Instant,
+    cfg: Config,
     event: usize,
     work: Vec<Mutex<Stream>>,
     lanes: Vec<Mutex<Lane>>,
@@ -193,31 +181,37 @@ fn drain(sh: Arc<Shared>, s: usize) {
             let st = &mut *st;
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(&sh, st, kind, &cmd, start))).unwrap_or_else(|_| {
                 record(M, "worker", &format!("decode of seq {seq} stream {s} panicked -> E_FAIL"));
-                base_result(sh.epoch, &cmd, E_FAIL)
+                base_result(0, &cmd, E_FAIL)
             })
         };
         sh.complete(seq, r);
     }
 }
 
-fn run_job(sh: &Shared, st: &mut Stream, kind: u32, cmd: &[u8; CMD_SIZE], start: Option<(usize, f32, OpusDecoder)>) -> [u8; RESULT_SIZE] {
+fn run_job(sh: &Shared, st: &mut Stream, kind: u32, cmd: &[u8; CMD_SIZE], start: Option<Start>) -> [u8; RESULT_SIZE] {
+    let t0 = Instant::now();
+    let us = |t0: Instant| t0.elapsed().as_micros() as u64;
     match kind {
         CMD_START => {
-            if let Some((ch, gain, dec)) = start {
-                st.channels = ch;
-                st.start_gain = gain;
-                st.gain = gain;
-                st.decoder = Some(dec);
-                st.fifo = vec![VecDeque::new(); ch];
+            let status = start.as_ref().map_or(S_OK, |s| s.error);
+            if let Some(s) = start {
+                st.apply_start(s);
             }
-            base_result(sh.epoch, cmd, S_OK)
+            base_result(us(t0), cmd, status)
         }
         CMD_RESET => {
-            reset_stream(st);
-            base_result(sh.epoch, cmd, S_OK)
+            let options = u32::from_le_bytes(cmd[0xc..0x10].try_into().unwrap());
+            st.reset(&sh.cfg, options);
+            base_result(us(t0), cmd, S_OK)
         }
-        CMD_STOP => base_result(sh.epoch, cmd, S_OK),
-        _ => data_command(sh.frame, sh.epoch, st, cmd),
+        CMD_STOP => base_result(us(t0), cmd, S_OK),
+        _ => {
+            let o = engine::process(&sh.cfg, st, cmd);
+            let mut r = base_result(0, cmd, o.status);
+            engine::fill_result(&mut r, &o, cmd);
+            put64(&mut r, 0x24, us(t0));
+            r
+        }
     }
 }
 
@@ -289,10 +283,10 @@ pub(crate) extern "system" fn connect_impl(params: *const u32, region: *mut u8, 
     }
     let p: [u32; 6] = core::array::from_fn(|i| unsafe { core::ptr::read_unaligned(params.add(i)) });
     let [codec, streams, depth, mem_size, frame, options] = p;
-    let ok = (1..=3).contains(&codec)
+    let ok = (engine::PT_DECODE_OPUS..=engine::PT_CONVERT_PCM).contains(&codec)
         && (1..=TOTAL_STREAMS).contains(&streams)
         && (1..=16).contains(&depth)
-        && (codec == 1 || ((0x80..=0x400).contains(&frame) && frame % 2 == 0))
+        && (codec == engine::PT_DECODE_OPUS || ((0x80..=0x400).contains(&frame) && frame % 2 == 0))
         && options & !0xF == 0;
     if !ok {
         record(M, "XApuConnect", &format!("params={p:x?} -> E_INVALIDARG"));
@@ -300,10 +294,6 @@ pub(crate) extern "system" fn connect_impl(params: *const u32, region: *mut u8, 
     }
     if mem_size > MAX_BASE_DATA {
         return E_OUTOFMEMORY;
-    }
-    if codec != CODEC_OPUS {
-        record(M, "XApuConnect", &format!("codec={codec} -> E_NOTIMPL (only processType 2 = Opus is identified; no title uses 1 or 3)"));
-        return E_NOTIMPL;
     }
     {
         let mut u = streams_in_use();
@@ -325,8 +315,7 @@ pub(crate) extern "system" fn connect_impl(params: *const u32, region: *mut u8, 
     };
     let event = if options & OPT_RESULT_EVENT != 0 { unsafe { CreateEventW(core::ptr::null_mut(), 0, 0, core::ptr::null()) } } else { 0 };
     let sh = Arc::new(Shared {
-        frame: frame as usize,
-        epoch: Instant::now(),
+        cfg: Config { codec, frame: frame as usize, deint_in: options & engine::OPT_DEINTERLEAVED_INPUT != 0, deint_out: options & engine::OPT_DEINTERLEAVED_OUTPUT != 0 },
         event,
         work: (0..streams).map(|_| Mutex::new(Stream::new())).collect(),
         lanes: (0..streams).map(|_| Mutex::new(Lane::default())).collect(),
@@ -339,7 +328,7 @@ pub(crate) extern "system" fn connect_impl(params: *const u32, region: *mut u8, 
         core::ptr::write_unaligned(region.add(8) as *mut u64, event as u64);
         *handle = !(apu as usize);
     }
-    record(M, "XApuConnect", &format!("codec={codec} streams={streams} depth={depth} mem={mem_size:#x} frame={frame} options={options:#x} -> S_OK (Opus decoded asynchronously on host workers)"));
+    record(M, "XApuConnect", &format!("codec={codec} streams={streams} depth={depth} mem={mem_size:#x} frame={frame} options={options:#x} -> S_OK (processed asynchronously on host workers)"));
     S_OK
 }
 
@@ -363,125 +352,11 @@ pub(crate) extern "system" fn disconnect_impl(h: usize) -> i32 {
     }
 }
 
-fn base_result(epoch: Instant, cmd: &[u8; CMD_SIZE], status: i32) -> [u8; RESULT_SIZE] {
+fn base_result(us: u64, cmd: &[u8; CMD_SIZE], status: i32) -> [u8; RESULT_SIZE] {
     let mut r = [0u8; RESULT_SIZE];
     r[0..0x18].copy_from_slice(&cmd[0..0x18]);
-    let t = (epoch.elapsed().as_nanos() / 100) as u64;
-    put64(&mut r, 0x24, t);
+    put64(&mut r, 0x24, us);
     put32(&mut r, 0x2c, status as u32);
-    r
-}
-
-fn prepare_start(frame: usize, cmd: &[u8; CMD_SIZE]) -> Result<(usize, f32, OpusDecoder), i32> {
-    let ch = u32::from_le_bytes(cmd[0x18..0x1c].try_into().unwrap()) as usize;
-    let gain = f32::from_le_bytes(cmd[0x28..0x2c].try_into().unwrap());
-    let size = u32::from_le_bytes(cmd[0x2c..0x30].try_into().unwrap()) as usize;
-    if !(1..=2).contains(&ch) {
-        return Err(E_INVALIDARG);
-    }
-    let need_out = ch * frame * 4;
-    if size < need_out || size - need_out < ch * 480 * 4 {
-        return Err(XAPU_E_START_BUFFER);
-    }
-    let dec = OpusDecoder::new(OPUS_RATE, ch).map_err(|_| E_INVALIDARG)?;
-    Ok((ch, if gain.is_finite() { gain } else { 1.0 }, dec))
-}
-
-fn reset_stream(st: &mut Stream) {
-    st.gain = st.start_gain;
-    if let Some(d) = st.decoder.as_mut() {
-        d.reset();
-    }
-    for f in st.fifo.iter_mut() {
-        f.clear();
-    }
-}
-
-fn data_command(frame: usize, epoch: Instant, st: &mut Stream, cmd: &[u8; CMD_SIZE]) -> [u8; RESULT_SIZE] {
-    let g = |o: usize| u32::from_le_bytes(cmd[o..o + 4].try_into().unwrap());
-    let g64 = |o: usize| u64::from_le_bytes(cmd[o..o + 8].try_into().unwrap());
-    let step = f32::from_bits(g(0x18));
-    let target = f32::from_bits(g(0x1c));
-    let skip = g(0x20) as usize;
-    let keep = g(0x24);
-    let in_len = g(0x28) as usize;
-    let in_ptr = g64(0x2c) as usize;
-    let out_cap = g(0x34) as usize;
-    let out_ptr = g64(0x38) as usize;
-    let mut status = S_OK;
-    let ch = st.channels.max(1);
-    let mut covered = 0usize;
-    if in_ptr != 0 && in_len != 0 {
-        let pkt = unsafe { core::slice::from_raw_parts(in_ptr as *const u8, in_len.min(0x10000)) };
-        if st.pcm.len() != OPUS_MAX_FRAME * ch {
-            st.pcm = vec![0f32; OPUS_MAX_FRAME * ch];
-        }
-        let n = match st.decoder.as_mut() {
-            Some(d) => d.decode_float(pkt, &mut st.pcm, OPUS_MAX_FRAME as i32, false),
-            None => opusdec::celt::OPUS_INTERNAL_ERROR,
-        };
-        if n < 0 {
-            status = E_FAIL;
-        } else {
-            let n = n as usize;
-            let start = skip.min(n);
-            let end = if keep == u32::MAX { n } else { (start + keep as usize).min(n) };
-            let pcm = &st.pcm;
-            for (c, f) in st.fifo.iter_mut().enumerate().take(ch) {
-                f.extend((start..end).map(|i| pcm[i * ch + c]));
-            }
-            covered = end - start;
-        }
-    }
-    let avail = st.fifo.first().map_or(0, |f| f.len());
-    let fit = if out_ptr == 0 { 0 } else { out_cap / (4 * ch) };
-    let count = avail.min(frame).min(fit);
-    let step = if step.is_finite() { step } else { 0.0 };
-    let target = if target.is_finite() { target } else { st.gain };
-    let mut gain = st.gain;
-    st.gains.clear();
-    for _ in 0..count {
-        if gain != target {
-            gain += step;
-            if (step >= 0.0 && gain > target) || (step < 0.0 && gain < target) || step == 0.0 {
-                gain = target;
-            }
-        }
-        st.gains.push(gain);
-    }
-    for c in 0..ch {
-        if count == 0 {
-            break;
-        }
-        let dst = unsafe { (out_ptr as *mut f32).add(c * frame) };
-        let mut put = |i: usize, v: f32| unsafe { core::ptr::write_unaligned(dst.add(i), v) };
-        match st.fifo.get_mut(c) {
-            Some(f) => {
-                let have = count.min(f.len());
-                for (i, (s, g)) in f.drain(..have).chain(core::iter::repeat(0.0)).zip(&st.gains).enumerate() {
-                    put(i, s * g);
-                }
-            }
-            None => {
-                for (i, g) in st.gains.iter().enumerate() {
-                    put(i, 0.0 * g);
-                }
-            }
-        }
-    }
-    if count == 0 && gain != target && step == 0.0 {
-        gain = target;
-    }
-    st.gain = gain;
-    let left = st.fifo.first().map_or(0, |f| f.len());
-    let mut r = base_result(epoch, cmd, status);
-    r[0x1c..0x1e].copy_from_slice(&(left.min(0xffff) as u16).to_le_bytes());
-    r[0x1e..0x20].copy_from_slice(&(covered.min(0xffff) as u16).to_le_bytes());
-    put32(&mut r, 0x30, count as u32);
-    put32(&mut r, 0x34, (count * ch * 4) as u32);
-    put64(&mut r, 0x38, out_ptr as u64);
-    put32(&mut r, 0x40, gain.to_bits());
-    put64(&mut r, 0x48, in_ptr as u64);
     r
 }
 
@@ -517,7 +392,7 @@ pub(crate) extern "system" fn enqueue_impl(h: usize, cmd: *const u8, out_seq: *m
         }
     }
     let start = if kind == CMD_START {
-        match prepare_start(a.frame, &c) {
+        match engine::prepare_start(&a.sh.cfg, &c) {
             Ok(x) => Some(x),
             Err(e) => return e,
         }
@@ -582,8 +457,7 @@ pub(crate) extern "system" fn dequeue_impl(h: usize, out: *mut u8) -> i32 {
                     c.stop_pending -= 1;
                     c.active = false;
                     let mut st = lock(&a.sh.work[s]);
-                    st.decoder = None;
-                    st.fifo.clear();
+                    st.stop();
                 }
             }
             a.dequeued = a.dequeued.wrapping_add(1);

@@ -7,7 +7,7 @@
 use compat_common::record;
 use core::ffi::c_void;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use tombox_xshader::hlsl::InputInterp;
 
@@ -23,6 +23,74 @@ static DUMPED: AtomicUsize = AtomicUsize::new(0);
 static ORIGIN: OnceLock<Mutex<HashMap<usize, (u64, Arc<Vec<u8>>)>>> = OnceLock::new();
 
 static ORIGIN_HASH: OnceLock<Mutex<HashMap<usize, u64>>> = OnceLock::new();
+static TYPED_ATOMIC64: AtomicI32 = AtomicI32::new(-1);
+
+const FEATURE_SHADER_MODEL: u32 = 7;
+const FEATURE_OPTIONS9: u32 = 37;
+const SHADER_MODEL_6_6: u32 = 0x66;
+const IID_D3D12_DEVICE: crate::device_wrap::Guid = crate::device_wrap::Guid { d1: 0x1898_19f1, d2: 0x1db6, d3: 0x4b57, d4: [0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7] };
+
+unsafe fn is_d3d12_device(obj: *mut c_void) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    let vt = *(obj as *const *const usize);
+    let qi: unsafe extern "system" fn(*mut c_void, *const crate::device_wrap::Guid, *mut *mut c_void) -> i32 = core::mem::transmute(*vt);
+    let mut dev: *mut c_void = core::ptr::null_mut();
+    if qi(obj, &IID_D3D12_DEVICE, &mut dev) < 0 || dev.is_null() {
+        return false;
+    }
+    let release: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*(*(dev as *const *const usize)).add(2));
+    release(dev);
+    true
+}
+
+pub(crate) unsafe fn query_typed_atomic64(real_device: *mut c_void) -> Option<(bool, i32, u32, u32)> {
+    if !is_d3d12_device(real_device) {
+        return None;
+    }
+    let vt = *(real_device as *const *const usize);
+    let check: unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32) -> i32 = core::mem::transmute(*vt.add(13));
+    let mut o9 = [0u32; 6];
+    let hr9 = check(real_device, FEATURE_OPTIONS9, o9.as_mut_ptr() as *mut c_void, 24);
+    let mut sm = [SHADER_MODEL_6_6];
+    let hr_sm = check(real_device, FEATURE_SHADER_MODEL, sm.as_mut_ptr() as *mut c_void, 4);
+    let ok = hr9 >= 0 && o9[2] != 0 && hr_sm >= 0 && sm[0] >= SHADER_MODEL_6_6;
+    Some((ok, hr9, o9[2], if hr_sm >= 0 { sm[0] } else { 0 }))
+}
+
+pub(crate) unsafe fn probe_typed_atomic64(real_device: *mut c_void) {
+    let Some((ok, hr9, flag, sm)) = query_typed_atomic64(real_device) else {
+        return;
+    };
+    let prev = TYPED_ATOMIC64.swap(ok as i32, Ordering::Relaxed);
+    if prev != ok as i32 {
+        record(
+            "d3d12_xs",
+            "shader_xlat",
+            &format!(
+                "OPTIONS9 hr={hr9:#010x} AtomicInt64OnTypedResourceSupported={flag} shader_model={sm:#x}: 64-bit typed image atomics {}",
+                if ok { "supported" } else { "unsupported (shaders using them will be refused)" }
+            ),
+        );
+    }
+}
+
+pub(crate) fn device_typed_atomic64() -> Option<bool> {
+    match TYPED_ATOMIC64.load(Ordering::Relaxed) {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+pub(crate) fn typed_atomic64_refusal(uses_typed_atomic64: bool, supported: Option<bool>) -> Option<&'static str> {
+    if uses_typed_atomic64 && supported == Some(false) {
+        Some("64-bit typed image atomics require D3D12_FEATURE_DATA_D3D12_OPTIONS9::AtomicInt64OnTypedResourceSupported and Shader Model 6.6")
+    } else {
+        None
+    }
+}
 
 pub fn note_origin_hash(code: usize, hash: u64) {
     ORIGIN_HASH.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner()).insert(code, hash);
@@ -164,11 +232,66 @@ fn translate_uncached(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInter
 }
 
 pub(crate) fn translate_edited(blob: &[u8], hash: u64, rtfmt: &[u8; 8], edit: &dyn Fn(&str) -> Result<String, String>) -> Result<Vec<u8>, String> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| translate_uncached_with(blob, hash, rtfmt, &InputInterp::default(), Some(edit), None))).unwrap_or_else(|_| Err("translator panicked".to_string()))
+    translate_edited_linked(blob, hash, rtfmt, &InputInterp::default(), edit)
 }
 
-fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, edit: Option<&dyn Fn(&str) -> Result<String, String>>, root: Option<&[u8]>) -> Result<Vec<u8>, String> {
-    let t_start = std::time::Instant::now();
+pub(crate) fn translate_edited_linked(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, edit: &dyn Fn(&str) -> Result<String, String>) -> Result<Vec<u8>, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| translate_uncached_with(blob, hash, rtfmt, link, Some(edit), None))).unwrap_or_else(|_| Err("translator panicked".to_string()))
+}
+
+pub(crate) struct RtSrc {
+    pub hlsl: String,
+    pub profile: String,
+    pub use_dxc: bool,
+}
+
+pub(crate) fn runtime_mode() -> &'static tombox_xshader::pack_key::Mode {
+    static M: OnceLock<tombox_xshader::pack_key::Mode> = OnceLock::new();
+    M.get_or_init(|| {
+        let xbox_one = crate::cbv_raw::xbox_one_title();
+        let cbv_raw = crate::cbv_raw::pack_mode(xbox_one);
+        let m = tombox_xshader::pack_key::Mode { cbv_raw, loop_grad: loop_grad(), fma: fma_mode() };
+        let line = format!("{} xbox_one={}\n", m.line(), xbox_one as u8);
+        let p = tombox_xshader::shader_cache::runtime_mode_path(&title_name());
+        if std::fs::read_to_string(&p).ok().as_deref() != Some(line.as_str()) {
+            write_atomic(&p, line.as_bytes());
+        }
+        record("d3d12_xs", "shader_xlat", &format!("pack key mode: {} xbox_one={} (written to {} for xshader_prelaunch)", m.line(), xbox_one as u8, p.display()));
+        m
+    })
+}
+
+fn prelaunch_records() -> &'static HashMap<String, String> {
+    static R: OnceLock<HashMap<String, String>> = OnceLock::new();
+    R.get_or_init(|| {
+        let p = tombox_xshader::shader_cache::title_dir(&title_name()).join("prelaunch_keys.txt");
+        std::fs::read_to_string(p).unwrap_or_default().lines().filter_map(|l| l.split_once(' ')).map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    })
+}
+
+fn log_pack_miss(hash: u64, rtfmt: &[u8; 8], linked: bool, src: &str, profile: &str, mode: &tombox_xshader::pack_key::Mode, more: &[&str]) {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 5 {
+        return;
+    }
+    let ours = tombox_xshader::pack_key::KeyParts::of(src, profile, mode, more).line();
+    let id = format!("{hash:016x}_{}", rtfmt_hex(rtfmt));
+    let theirs = prelaunch_records().get(&id);
+    let verdict = match (theirs, linked, more.is_empty()) {
+        (_, true, _) => "linked variant: prelaunch only sees the unlinked dump, so it has no key for this one".to_string(),
+        (_, _, false) => format!("edited variant ({}): prelaunch compiles only the plain translation", more.join(" ")),
+        (None, _, _) => "prelaunch has no record of this variant (new shader, or prelaunch did not run)".to_string(),
+        (Some(t), _, _) => match tombox_xshader::pack_key::KeyParts::first_difference(&ours, t) {
+            Some(d) => format!("first differing component {d}"),
+            None if t.split_whitespace().next() == ours.split_whitespace().next() => "same key as prelaunch; the entry is missing from the pack (prelaunch skipped or its compile failed)".to_string(),
+            None => "components match but the keys differ".to_string(),
+        },
+    };
+    record("d3d12_xs", "shader_xlat", &format!("pack miss #{n} {id}: {verdict}; runtime {ours}; prelaunch {}", theirs.map(String::as_str).unwrap_or("<none>")));
+}
+
+pub(crate) fn runtime_source(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, root: Option<&[u8]>, mode: &tombox_xshader::pack_key::Mode) -> Result<RtSrc, String> {
     let mut ex = tombox_xshader::extract(blob).map_err(|e| {
         dump_failure(hash, blob, None, &e);
         format!("extract: {e}")
@@ -176,23 +299,25 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Input
     if let Some(root) = root.filter(|_| !ex.has_root_sig) {
         ex.root_sig = Some(tombox_xshader::parse_root_signature(root).map_err(|e| format!("pipeline root signature: {e}"))?);
     }
-    let mut t = tombox_xshader::hlsl::translate_linked(&ex, Some(link)).map_err(|e| {
+    let mut t = tombox_xshader::pack_key::translate(&ex, Some(link), mode.cbv_raw).map_err(|e| {
         dump_failure(hash, blob, None, &e);
-        format!("translate: {e}")
+        e
     })?;
-    if crate::cbv_raw::enabled() {
-        if !tombox_xshader::gcn::is_durango(&ex.fssm) {
-            dump_failure(hash, blob, None, "Xbox One title shader is not a Durango program");
-            return Err("bind: Xbox One title shader is not a Durango program; its constant buffers cannot follow the raw-SRV binding".into());
-        }
-        t.hlsl = crate::cbv_raw::rewrite_hlsl(&t.hlsl).map_err(|e| {
-            dump_failure(hash, blob, None, &e);
-            format!("bind: {e}")
-        })?;
-        if let Some((slot, lim)) = crate::cbv_raw::clamp_knob() {
+    if mode.cbv_raw.rewrites() {
+        if let Some((slot, lim, _)) = crate::cbv_raw::clamp_knob().filter(|k| k.2.map_or(true, |h| h == hash)) {
             t.hlsl = crate::cbv_raw::clamp_reads(&t.hlsl, slot, lim);
         }
+        if crate::cbv_raw::hoist_hashes().contains(&hash) {
+            let (h, n) = crate::cbv_raw::hoist_const_loads(&t.hlsl);
+            t.hlsl = h;
+            record("d3d12_xs", "cbv_raw", &format!("HOIST: hash={hash:016x} reads {n} constant raw constant-buffer rows once before the dispatcher loop (TOMBOX_CBRAW_HOIST)"));
+        }
     }
+    if mode.cbv_raw == tombox_xshader::pack_key::CbvRaw::Copy {
+        crate::cbv_copy::note_shader_cb(hash, crate::cbv_copy::meta_of(&t));
+    }
+    crate::fmask_check::note_translation(hash, &t.hlsl, &t.fmask);
+    RUNTIME_SOURCES.with(|c| c.set(c.get() + 1));
     let needs = crate::mip_bind::Needs::of(&t);
     crate::mip_bind::note(hash, &needs);
     if let Some(why) = needs.refusal() {
@@ -201,6 +326,11 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Input
     }
     if let Some(why) = crate::global_bind::refusal(t.needs_global) {
         dump_failure(hash, blob, None, &why);
+        return Err(format!("bind: {why}"));
+    }
+    if let Some(why) = typed_atomic64_refusal(t.uses_typed_atomic64, device_typed_atomic64()) {
+        record("d3d12_xs", "shader_xlat", &format!("REFUSE hash={hash:016x}: {why}"));
+        dump_failure(hash, blob, None, why);
         return Err(format!("bind: {why}"));
     }
     // Development aid: `%TEMP%	ombox_shader_override<hash>.hlsl` replaces the generated
@@ -231,7 +361,7 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Input
             record("d3d12_xs", "shader_xlat", &format!("STUB_AT: hash={hash:016x} has no ISA line {off:#06x}"));
         }
     }
-    t.hlsl = tombox_xshader::runtime_hlsl::finalize(&t.hlsl, rtfmt, loop_grad());
+    t.hlsl = tombox_xshader::pack_key::finalize(&t.hlsl, rtfmt, mode);
     // Compiler: DXC (SM6 DXIL) when dxcompiler.dll + dxil.dll are available, otherwise FXC
     // (SM5 DXBC). FXC needs minutes for some of the generated compute shaders; DXC about a
     // second. `TOMBOX_SHADER_COMPILER=fxc` forces the old path.
@@ -246,6 +376,14 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Input
         record("d3d12_xs", "shader_xlat", if use_dxc { "compiler: DXC (shader model 6.0, DXIL)" } else { "compiler: FXC (shader model 5, DXBC) - DXC not available or disabled" });
     });
     let profile = if use_dxc { tombox_xshader::dxc::profile_for(t.profile) } else { t.profile.to_string() };
+    Ok(RtSrc { hlsl: t.hlsl, profile, use_dxc })
+}
+
+fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, edit: Option<&dyn Fn(&str) -> Result<String, String>>, root: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    let t_start = std::time::Instant::now();
+    let mode = runtime_mode();
+    let t = runtime_source(blob, hash, rtfmt, link, root, mode)?;
+    let (profile, use_dxc) = (t.profile.clone(), t.use_dxc);
     if let Some(edit) = edit {
         if !use_dxc {
             return Err("edited translation needs DXC".to_string());
@@ -254,14 +392,20 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Input
         if !edited_pack() {
             return tombox_xshader::dxc::compile(&h, &profile);
         }
-        return tombox_xshader::shader_cache::compile_cached_with(&h, &profile, fma_mode(), &["edited-plain-compile"], || tombox_xshader::dxc::compile(&h, &profile)).map(|c| c.code);
+        let more = ["edited-plain-compile"];
+        return tombox_xshader::shader_cache::compile_cached_with(&h, &profile, mode.fma, &tombox_xshader::pack_key::extra(mode, &more), || {
+            log_pack_miss(hash, rtfmt, false, &h, &profile, mode, &more);
+            tombox_xshader::dxc::compile(&h, &profile)
+        })
+        .map(|c| c.code);
     }
     if use_dxc {
         let xlat_ms = t_start.elapsed().as_secs_f64() * 1000.0;
         let dir = std::env::temp_dir().join("tombox_shaders");
         let inflight = dir.join(format!("inflight_{hash:016x}.dxbc"));
-        let fma = fma_mode();
-        let r = tombox_xshader::shader_cache::compile_cached_with(&t.hlsl, &profile, fma, &[], || {
+        let fma = mode.fma;
+        let r = tombox_xshader::shader_cache::compile_cached_with(&t.hlsl, &profile, fma, &tombox_xshader::pack_key::extra(mode, &[]), || {
+            log_pack_miss(hash, rtfmt, !link.0.is_empty(), &t.hlsl, &profile, mode, &[]);
             let _ = std::fs::create_dir_all(&dir);
             let _ = std::fs::write(&inflight, blob);
             let compiled = tombox_xshader::dxc::compile_fma(&t.hlsl, &profile, fma, &[]);
@@ -365,14 +509,19 @@ pub fn export_formats(num_rt: u32, formats: &[u32; 8]) -> [u8; 8] {
     if !SW.on() {
         return k;
     }
+    let ps = crate::blendclamp::ps_mode();
     for i in 0..(num_rt as usize).min(8) {
-        k[i] = match formats[i] {
-            10 | 34 | 54 => 1,
-            26 => 2,
-            _ => 0,
-        };
+        k[i] = export_kind(formats[i], ps);
     }
     k
+}
+
+pub fn export_kind(format: u32, ps_clamp: bool) -> u8 {
+    match format {
+        10 | 34 | 54 => if ps_clamp { 3 } else { 1 },
+        26 => if ps_clamp { 4 } else { 2 },
+        _ => 0,
+    }
 }
 
 pub fn cache_key(hash: u64, rtfmt: &[u8; 8]) -> u64 {
@@ -417,6 +566,10 @@ pub fn parse_src_name(name: &str) -> Option<(u64, [u8; 8])> {
         rt[i] = u8::from_str_radix(&f[2 * i..2 * i + 2], 16).ok()?;
     }
     Some((hash, rt))
+}
+
+pub(crate) fn title_name_pub() -> String {
+    title_name()
 }
 
 fn title_name() -> String {
@@ -504,13 +657,30 @@ fn index_ctx() -> &'static str {
     static C: OnceLock<String> = OnceLock::new();
     C.get_or_init(|| {
         let f = fma_mode();
-        format!("dxc={} cbv_raw={} loop_grad={} fma={}{}{}{}", tombox_xshader::dxc::available(), crate::cbv_raw::enabled(), loop_grad(), f.preserve as u8, f.any as u8, f.hybrid as u8, f.f2h as u8)
+        format!("dxc={} cbv_raw={} loop_grad={} fma={}{}{}{}", tombox_xshader::dxc::available(), if crate::cbv_raw::copy_on() { "copy2".to_string() } else { crate::cbv_raw::enabled().to_string() }, loop_grad(), f.preserve as u8, f.any as u8, f.hybrid as u8, f.f2h as u8)
     })
+}
+
+thread_local! {
+    pub(crate) static RUNTIME_SOURCES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+const CB_META_SALT: u128 = 0x7462_6362_6d65_7461_0000_0000_0000_0001;
+
+fn copy_meta_hit(ik: u128, hash: u64) -> bool {
+    match tombox_xshader::shader_cache::get(ik ^ CB_META_SALT).as_deref().and_then(crate::cbv_copy::decode_meta) {
+        Some(m) => {
+            crate::cbv_copy::note_shader_cb(hash, m);
+            true
+        }
+        None => false,
+    }
 }
 
 fn produce(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, _key: u64) -> Result<Vec<u8>, String> {
     let ik = crate::xlat_index::key(blob, hash, rtfmt, link, index_ctx());
-    let hit = ik.and_then(crate::xlat_index::get);
+    let copy = crate::cbv_raw::copy_on();
+    let hit = ik.and_then(crate::xlat_index::get).filter(|_| !copy || ik.is_some_and(|k| copy_meta_hit(k, hash)));
     let r = match hit {
         Some(v) => Ok(v),
         None => {
@@ -518,6 +688,9 @@ fn produce(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, _key: u6
             let r = std::panic::catch_unwind(|| translate_uncached(blob, hash, rtfmt, link)).unwrap_or_else(|_| Err("translator panicked".to_string()));
             if let (Some(k), Ok(v)) = (ik, &r) {
                 crate::xlat_index::put(k, v, t0.elapsed().as_secs_f64() * 1000.0);
+                if let Some(m) = copy.then(|| crate::cbv_copy::shader_cb(hash)).flatten() {
+                    let _ = tombox_xshader::shader_cache::put(k ^ CB_META_SALT, &crate::cbv_copy::encode_meta(&m));
+                }
             }
             r
         }
@@ -525,11 +698,64 @@ fn produce(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, _key: u6
     if let Ok(v) = &r {
         crate::dbcount::note_translated(v, blob, hash, rtfmt);
         let sp = src_path(hash, rtfmt);
-        if link.0.is_empty() && !sp.exists() {
+        if link.0.is_empty() && !GUESS.with(|g| g.get()) && !sp.exists() {
             write_atomic(&sp, blob);
         }
     }
     r
+}
+
+thread_local! {
+    static GUESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+const BG_RESERVE: u64 = 2 << 30;
+const BG_PER_JOB: u64 = 256 << 20;
+static BG_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+static BG_THROTTLED: AtomicUsize = AtomicUsize::new(0);
+
+pub fn bg_allowed(total: u64, used: u64, cap: usize) -> usize {
+    let head = total.saturating_sub(used).saturating_sub(BG_RESERVE);
+    ((head / BG_PER_JOB) as usize).min(cap)
+}
+
+pub struct BgSlot;
+
+impl Drop for BgSlot {
+    fn drop(&mut self) {
+        BG_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+pub fn bg_slot(cap: usize) -> BgSlot {
+    let mut waited = false;
+    loop {
+        let allowed = match compat_common::gdk::memstatus::title_view() {
+            Some(v) => bg_allowed(v.total, v.used, cap),
+            None => cap,
+        };
+        let cur = BG_ACTIVE.load(Ordering::Relaxed);
+        if cur < allowed && BG_ACTIVE.compare_exchange(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            return BgSlot;
+        }
+        if !waited {
+            waited = true;
+            let n = BG_THROTTLED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 4 || n % 100 == 0 {
+                let v = compat_common::gdk::memstatus::title_view();
+                record("d3d12_xs", "shader_xlat", &format!("background shader work paused for title memory (#{n}): {} of {cap} jobs allowed, title used {} MB of {} MB, {} MB reserved, {} MB per job", allowed, v.map(|v| v.used >> 20).unwrap_or(0), v.map(|v| v.total >> 20).unwrap_or(0), BG_RESERVE >> 20, BG_PER_JOB >> 20));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn drop_if_unclaimed(key: u64, c: &Arc<OnceLock<Cached>>) {
+    let Some(cache) = CACHE.get() else { return };
+    let mut m = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if m.get(&key).is_some_and(|e| Arc::ptr_eq(e, c)) && Arc::strong_count(c) == 2 {
+        m.remove(&key);
+    }
 }
 
 fn cell(key: u64) -> Arc<OnceLock<Cached>> {
@@ -605,6 +831,22 @@ fn boost_prewarm(key: u64) {
     }
 }
 
+const GAME_PS_RTFMTS: [[u8; 8]; 3] = [[0x80, 0, 0, 0, 0, 0, 0, 0], [0x02, 0, 0, 0, 0, 0, 0, 0], [0x82, 0, 0, 0, 0, 0, 0, 0]];
+
+fn is_pixel(blob: &[u8]) -> bool {
+    std::panic::catch_unwind(|| tombox_xshader::extract(blob).map(|e| matches!(e.stage, tombox_xshader::Stage::Pixel)).unwrap_or(false)).unwrap_or(false)
+}
+
+fn prewarm_order<T>(known: Vec<T>, from_game: Vec<T>) -> Vec<T> {
+    let mut v: Vec<T> = from_game.into_iter().rev().collect();
+    v.extend(known.into_iter().rev());
+    v
+}
+
+fn prewarm_workers(cores: usize, from_game: usize) -> usize {
+    if from_game > 0 { cores.saturating_sub(4).max(1) } else { (cores / 3).clamp(1, 6) }
+}
+
 pub fn start_prewarm() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -617,6 +859,8 @@ pub fn start_prewarm() {
         let mut todo: Vec<(std::path::PathBuf, u64, [u8; 8])> = Vec::new();
         let mut seen: std::collections::HashSet<(u64, [u8; 8])> = std::collections::HashSet::new();
         let mut migrated = 0usize;
+        let game = tombox_xshader::shader_cache::game_scan_dir(&title_name());
+        let mut from_game: Vec<(std::path::PathBuf, u64, [u8; 8])> = Vec::new();
         for d in [dir.clone(), legacy_src_dir()] {
             let Ok(rd) = std::fs::read_dir(&d) else { continue };
             for e in rd.flatten() {
@@ -637,15 +881,32 @@ pub fn start_prewarm() {
                 todo.push((p, h, rt));
             }
         }
-        record("d3d12_xs", "shader_xlat", &format!("prewarm: {} known (shader, render-target format) variants from {} ({migrated} migrated from the old temp manifest); pack {} with {} records", todo.len(), dir.display(), tombox_xshader::shader_cache::pack_path().display(), tombox_xshader::shader_cache::stats().records));
+        let known = todo.len();
+        let game_on = std::env::var("TOMBOX_GAME_SCAN_PREWARM").map(|v| v.trim() == "1").unwrap_or(false);
+        if let Some(rd) = game_on.then(|| std::fs::read_dir(&game).ok()).flatten() {
+            let mut names: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            for name in names {
+                let Some((h, rt)) = parse_src_name(&name) else { continue };
+                if seen.insert((h, rt)) {
+                    from_game.push((game.join(&name), h, rt));
+                }
+            }
+        }
+        let extra = from_game.len();
+        todo = prewarm_order(todo, from_game);
+        record("d3d12_xs", "shader_xlat", &format!("prewarm: {known} known (shader, render-target format) variants from {} ({migrated} migrated from the old temp manifest) + {extra} not yet seen from the title's own files in {}; pack {} with {} records", dir.display(), game.display(), tombox_xshader::shader_cache::pack_path().display(), tombox_xshader::shader_cache::stats().records));
         if todo.is_empty() {
             return;
         }
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let workers = (cores / 3).clamp(1, 6);
+        let workers = prewarm_workers(cores, extra);
         let queue = Arc::new(Mutex::new(todo));
+        let seen_rt = Arc::new(Mutex::new(seen));
         for _ in 0..workers {
             let q = queue.clone();
+            let seen_rt = seen_rt.clone();
+            let game_dir = game.clone();
             let _ = std::thread::Builder::new().name("tombox-shader-prewarm".into()).spawn(move || {
                 unsafe { SetThreadPriority(GetCurrentThread(), PREWARM_PRIORITY) };
                 let me = unsafe { OpenThread(THREAD_SET_QUERY, 0, GetCurrentThreadId()) } as usize;
@@ -659,9 +920,20 @@ pub fn start_prewarm() {
                         let _ = std::fs::remove_file(&p);
                         continue;
                     }
+                    if rt == [0u8; 8] && p.starts_with(&game_dir) && is_pixel(&blob) {
+                        let mut g = q.lock().unwrap_or_else(|e| e.into_inner());
+                        for v in GAME_PS_RTFMTS {
+                            if seen_rt.lock().unwrap_or_else(|e| e.into_inner()).insert((h, v)) {
+                                g.insert(0, (p.clone(), h, v));
+                            }
+                        }
+                    }
+                    let guess = p.starts_with(&game_dir);
                     let key = cache_key(h, &rt);
                     let c = cell(key);
                     let mut ran = false;
+                    let slot = (c.get().is_none()).then(|| bg_slot(workers));
+                    GUESS.with(|g| g.set(guess));
                     c.get_or_init(|| {
                         ran = true;
                         if me != 0 {
@@ -674,6 +946,11 @@ pub fn start_prewarm() {
                         }
                         r
                     });
+                    GUESS.with(|g| g.set(false));
+                    drop(slot);
+                    if guess {
+                        drop_if_unclaimed(key, &c);
+                    }
                     if ran {
                         done += 1;
                         PREWARMED.fetch_add(1, Ordering::Relaxed);
@@ -795,6 +1072,110 @@ pub fn counts() -> (usize, usize) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn background_jobs_follow_title_memory_headroom() {
+        let gb = 1u64 << 30;
+        assert_eq!(bg_allowed(14 * gb, 4 * gb, 14), 14);
+        assert_eq!(bg_allowed(14 * gb, 11 * gb, 14), 4);
+        assert_eq!(bg_allowed(14 * gb, 12 * gb, 14), 0);
+        assert_eq!(bg_allowed(14 * gb, 20 * gb, 14), 0);
+        assert_eq!(bg_allowed(14 * gb, 0, 3), 3);
+    }
+
+    #[test]
+    fn guessed_variants_are_not_promoted_and_unclaimed_cells_are_dropped() {
+        GUESS.with(|g| g.set(true));
+        assert!(GUESS.with(|g| g.get()));
+        GUESS.with(|g| g.set(false));
+        let key = 0x7b5e_0000_0000_0001u64;
+        let c = cell(key);
+        let _ = c.set(Err(Arc::new("x".to_string())));
+        drop_if_unclaimed(key, &c);
+        assert!(!Arc::ptr_eq(&cell(key), &c));
+        let held = cell(key);
+        let c2 = cell(key);
+        drop_if_unclaimed(key, &c2);
+        assert!(Arc::ptr_eq(&cell(key), &held));
+    }
+
+    #[test]
+    fn prewarm_takes_known_variants_before_game_scan_ones_and_widens_only_for_a_game_scan() {
+        let mut q = prewarm_order(vec!["k1", "k2"], vec!["g1", "g2", "g3"]);
+        let mut popped = Vec::new();
+        while let Some(x) = q.pop() {
+            popped.push(x);
+        }
+        assert_eq!(popped, vec!["k1", "k2", "g1", "g2", "g3"]);
+        assert_eq!(prewarm_workers(18, 0), 6);
+        assert_eq!(prewarm_workers(18, 2741), 14);
+        assert_eq!(prewarm_workers(4, 10), 1);
+        assert_eq!(prewarm_workers(2, 0), 1);
+    }
+
+    fn key_fixtures() -> Vec<(String, Vec<u8>)> {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../analysis/shaders");
+        ["xdefiant_vs_swappc_s4.dxbc", "xdefiant_ps_frontface_quad.dxbc", "fortnite_vs_sample.dxbc", "fortnite_ps_sample.dxbc", "fortnite_cs_clear.dxbc"].iter().filter_map(|n| std::fs::read(base.join(n)).ok().map(|b| (n.to_string(), b))).collect()
+    }
+
+    #[test]
+    fn prelaunch_key_equals_runtime_key_for_the_same_variant() {
+        use tombox_xshader::pack_key::{self, CbvRaw, Mode};
+        let fx = key_fixtures();
+        if fx.is_empty() {
+            assert!(!std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../analysis/shaders").is_dir(), "analysis/shaders exists but holds none of the key fixtures");
+            return;
+        }
+        let fma = tombox_xshader::shader_cache::Fma { preserve: true, any: false, hybrid: true, f2h: true };
+        let mut compared = 0;
+        for cbv in [CbvRaw::Off, CbvRaw::Forced, CbvRaw::On, CbvRaw::Copy] {
+            for loop_grad in [true, false] {
+                let mode = Mode { cbv_raw: cbv, loop_grad, fma };
+                for (name, blob) in &fx {
+                    for rt in [[0u8; 8], [1, 0, 0, 0, 0, 0, 0, 0]] {
+                        let rtm = runtime_source(blob, fnv1a(blob), &rt, &InputInterp::default(), None, &mode);
+                        let pre = pack_key::prelaunch(blob, None, &rt, None, &mode);
+                        match (rtm, pre) {
+                            (Ok(r), Ok(p)) => {
+                                assert!(r.use_dxc || !tombox_xshader::dxc::available());
+                                if !r.use_dxc {
+                                    continue;
+                                }
+                                assert_eq!(r.profile, p.profile, "{name} {cbv:?}");
+                                assert_eq!(pack_key::key(&r.hlsl, &r.profile, &mode, &[]), p.parts.key, "{name} {cbv:?} loop_grad {loop_grad}: {}", pack_key::KeyParts::first_difference(&pack_key::KeyParts::of(&r.hlsl, &r.profile, &mode, &[]).line(), &p.parts.line()).unwrap_or_default());
+                                compared += 1;
+                            }
+                            (Err(a), Err((_, b))) => assert_eq!(a, b, "{name} {cbv:?}"),
+                            (a, b) => panic!("{name} {cbv:?}: runtime {:?} vs prelaunch {:?}", a.map(|r| r.profile), b.map(|p| p.profile)),
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("compared {compared} runtime and prelaunch keys");
+        if tombox_xshader::dxc::available() {
+            assert!(compared > 0);
+        }
+    }
+
+    #[test]
+    fn runtime_cbv_mode_matches_the_prelaunch_decision() {
+        use tombox_xshader::pack_key::CbvRaw;
+        for setting in [None, Some(""), Some("auto"), Some("1"), Some("on"), Some("0"), Some("off"), Some("junk"), Some("copy")] {
+            for xbox_one in [false, true] {
+                let mode = crate::cbv_raw::parse_mode(setting).unwrap_or(crate::cbv_raw::Mode::Copy);
+                let enabled = match mode {
+                    crate::cbv_raw::Mode::Auto => xbox_one,
+                    crate::cbv_raw::Mode::On => true,
+                    crate::cbv_raw::Mode::Off | crate::cbv_raw::Mode::Copy => false,
+                };
+                assert_eq!(crate::cbv_raw::pack_mode_of(mode, enabled, xbox_one), CbvRaw::decide(setting, xbox_one), "{setting:?} xbox_one {xbox_one}");
+                assert_eq!(mode == crate::cbv_raw::Mode::Copy, CbvRaw::decide(setting, xbox_one) == CbvRaw::Copy, "{setting:?}");
+                let refuses = crate::cbv_raw::shader_kind_refusal(xbox_one, false).is_some();
+                assert_eq!(enabled && refuses, CbvRaw::of(enabled, xbox_one) == CbvRaw::On, "{setting:?} xbox_one {xbox_one}");
+            }
+        }
+    }
+
     fn poison<T: Send + 'static>(m: &'static Mutex<T>) {
         let _ = std::thread::spawn(move || {
             let _g = m.lock();
@@ -908,6 +1289,59 @@ mod tests {
         assert!(ps_link(&junk, false).0.is_empty());
         assert!(Arc::ptr_eq(&ps_link(&junk, true), &ps_link(&junk, true)));
         assert_eq!(InputInterp(vec![("T0".into(), "TB_CEN_Q".into())]).pc_centroid().0[0].1, "centroid");
+    }
+
+    #[test]
+    fn typed_atomic64_gate_refuses_only_when_device_lacks_support() {
+        assert!(typed_atomic64_refusal(true, Some(false)).is_some_and(|s| s.contains("AtomicInt64OnTypedResourceSupported")));
+        assert_eq!(typed_atomic64_refusal(true, Some(true)), None);
+        assert_eq!(typed_atomic64_refusal(true, None), None);
+        assert_eq!(typed_atomic64_refusal(false, Some(false)), None);
+        assert_eq!(typed_atomic64_refusal(false, Some(true)), None);
+
+        crate::enable_experimental_shader_models();
+        let create = crate::host_proc(b"D3D12CreateDevice\0");
+        assert!(create != 0, "d3d12.dll missing");
+        let f: unsafe extern "system" fn(*mut c_void, u32, *const crate::device_wrap::Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(create) };
+        let iid = crate::device_wrap::Guid { d1: 0x1898_19f1, d2: 0x1db6, d3: 0x4b57, d4: [0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7] };
+        let mut dev: *mut c_void = core::ptr::null_mut();
+        let hr = unsafe { f(core::ptr::null_mut(), 0xc000, &iid, &mut dev) };
+        assert!(hr >= 0 && !dev.is_null(), "D3D12CreateDevice hr={hr:#010x}");
+        let (ok, hr9, flag, sm) = unsafe { query_typed_atomic64(dev) }.expect("a D3D12 device answers IID_ID3D12Device");
+        assert!(hr9 >= 0, "CheckFeatureSupport(OPTIONS9) hr={hr9:#010x}");
+        assert_eq!(ok, flag != 0 && sm >= SHADER_MODEL_6_6);
+        let rel: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(*(*(dev as *const *const usize)).add(2)) };
+        unsafe { rel(dev) };
+    }
+
+    static SHORT_QI: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "system" fn short_qi_refuse(_t: *mut c_void, _g: *const crate::device_wrap::Guid, _p: *mut *mut c_void) -> i32 {
+        SHORT_QI.fetch_add(1, Ordering::SeqCst);
+        0x8000_4002u32 as i32
+    }
+    unsafe extern "system" fn short_qi_null(_t: *mut c_void, _g: *const crate::device_wrap::Guid, p: *mut *mut c_void) -> i32 {
+        SHORT_QI.fetch_add(1, Ordering::SeqCst);
+        unsafe { *p = core::ptr::null_mut() };
+        0
+    }
+    unsafe extern "system" fn short_ref(_t: *mut c_void) -> u32 {
+        1
+    }
+
+    #[test]
+    fn typed_atomic64_probe_skips_objects_that_are_not_d3d12_devices() {
+        for qi in [short_qi_refuse as usize, short_qi_null as usize] {
+            let vt: &'static [usize; 3] = Box::leak(Box::new([qi, short_ref as usize, short_ref as usize]));
+            let p = Box::leak(Box::new(vt.as_ptr())) as *mut *const usize as *mut c_void;
+            let before = SHORT_QI.load(Ordering::SeqCst);
+            assert_eq!(unsafe { query_typed_atomic64(p) }, None);
+            unsafe { probe_typed_atomic64(p) };
+            let w = crate::device_wrap::wrap_device(p);
+            assert!(!w.is_null());
+            assert_eq!(SHORT_QI.load(Ordering::SeqCst) - before, 3);
+        }
+        assert_eq!(unsafe { query_typed_atomic64(core::ptr::null_mut()) }, None);
     }
 }
 

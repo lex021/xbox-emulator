@@ -24,12 +24,15 @@ fn log_path() -> &'static std::path::PathBuf {
 
 /// Record a call from `module` (e.g. "xmem") to `func` with a short `detail`.
 pub mod net_guard;
+pub mod netview;
 pub mod locale;
+pub mod physical_pages;
 pub mod gdk_user;
 pub mod gdk_store;
 pub mod gdk;
 pub mod gamepad;
 pub mod host_input;
+pub mod pad_host;
 pub mod gameinput_ext;
 pub mod online;
 pub mod os_host;
@@ -38,7 +41,11 @@ pub mod live;
 pub mod title_os;
 pub mod kmd_bridge;
 pub mod private_heap;
+pub mod partition_heap;
 pub mod headless;
+pub mod iat;
+pub mod title_offsets;
+pub mod title_symbols;
 
 #[global_allocator]
 static TB_ALLOC: private_heap::PrivateHeap = private_heap::PrivateHeap;

@@ -432,6 +432,12 @@ pub fn validate(inv: &ZipInventory, ratio_threshold: f64) -> SafetyReport {
                     ),
                 );
             }
+        } else if e.uncomp_size > 10 * 1024 * 1024 {
+            warn(
+                &mut r,
+                name,
+                &format!("declares {} uncompressed bytes from 0 compressed bytes", e.uncomp_size),
+            );
         }
     }
     r

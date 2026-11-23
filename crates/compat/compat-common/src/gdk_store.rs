@@ -1,17 +1,3 @@
-//! Local, empty Microsoft Store (`XStore*`) for the title's local user.
-//!
-//! Why: once a local user exists (gdk_user), the title's privilege check runs
-//! `FOnlineAsyncTaskGDKGetUserPrivilege::CheckForGDKPackageUpdate`, which calls
-//! `XStoreCreateContext(user)`. Microsoft's PC runtime rejects the local user handle
-//! ("Handle: does not exist") and the following `XStoreQueryGameAndDlcPackageUpdatesAsync`
-//! faults inside the runtime on the null context.
-//!
-//! Model: a store that knows nothing. No package updates, no associated / entitled /
-//! purchasable products, zero consumable balance, and purchase / redeem UI that reports
-//! "cancelled". This grants the user **no** entitlements; it only lets the title's store
-//! queries complete. Signatures are the public GDK ones (XStore.h).
-//!
-//! Specific to the same Fortnite build as gdk_user (wrappers located by symbol table).
 
 use core::ffi::c_void;
 use crate::gdk_user::{start_async, write_jump, xasync_complete, xasync_get_status, ProviderData, E_PENDING};
@@ -20,8 +6,8 @@ const S_OK: i32 = 0;
 const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
 const E_ABORT: i32 = 0x8000_4004u32 as i32;
 
-static CONTEXT_ANCHOR: u64 = 0x5853_544F_5245_4354; // store context handle
-static QUERY_ANCHOR: u64 = 0x5853_544F_5245_5152; // empty product-query handle
+static CONTEXT_ANCHOR: u64 = 0x5853_544F_5245_4354;
+static QUERY_ANCHOR: u64 = 0x5853_544F_5245_5152;
 fn ctx() -> usize { &CONTEXT_ANCHOR as *const u64 as usize }
 fn query() -> usize { &QUERY_ANCHOR as *const u64 as usize }
 
@@ -88,7 +74,7 @@ unsafe extern "system" fn products_result(block: *mut c_void, out: *mut usize) -
     hr
 }
 unsafe extern "system" fn enumerate(_q: usize, _ctx: *mut c_void, _cb: *const c_void) -> i32 {
-    S_OK // no products: the callback is never invoked
+    S_OK
 }
 unsafe extern "system" fn has_more_pages(_q: usize) -> bool {
     false
@@ -101,7 +87,7 @@ unsafe extern "system" fn consumable_async(_ctx: usize, _id: *const u8, block: *
 unsafe extern "system" fn consumable_result(block: *mut c_void, out: *mut u32) -> i32 {
     let hr = xasync_get_status(block);
     if hr >= 0 && !out.is_null() {
-        *out = 0; // XStoreConsumableResult { quantity }
+        *out = 0;
     }
     hr
 }
@@ -118,37 +104,61 @@ unsafe extern "system" fn ui_result(block: *mut c_void) -> i32 {
     xasync_get_status(block)
 }
 
-/// Called by gdk_user::install after the build check.
-pub(crate) unsafe fn install(base: *mut u8) {
-    let table: [(&str, usize, usize); 22] = [
-        ("XStoreCloseContextHandle", 0x1dca7e4, close_handle as usize),
-        ("XStoreCloseProductsQueryHandle", 0x1dca83c, close_handle as usize),
-        ("XStoreCreateContext", 0x1dca898, create_context as usize),
-        ("XStoreEnumerateProductsQuery", 0x1dca910, enumerate as usize),
-        ("XStoreProductsQueryHasMorePages", 0x1dca998, has_more_pages as usize),
-        ("XStoreProductsQueryNextPageAsync", 0x1dca9fc, next_page_async as usize),
-        ("XStoreProductsQueryNextPageResult", 0x1dcaa70, products_result as usize),
-        ("XStoreQueryAssociatedProductsAsync", 0x1dcaae4, products_async as usize),
-        ("XStoreQueryAssociatedProductsResult", 0x1dcab78, products_result as usize),
-        ("XStoreQueryConsumableBalanceRemainingAsync", 0x1dcabec, consumable_async as usize),
-        ("XStoreQueryConsumableBalanceRemainingResult", 0x1dcac70, consumable_result as usize),
-        ("XStoreQueryEntitledProductsAsync", 0x1dcace4, products_async as usize),
-        ("XStoreQueryEntitledProductsResult", 0x1dcad78, products_result as usize),
-        ("XStoreQueryGameAndDlcPackageUpdatesAsync", 0x1dcadec, updates_async as usize),
-        ("XStoreQueryGameAndDlcPackageUpdatesResult", 0x1dcae60, updates_result as usize),
-        ("XStoreQueryGameAndDlcPackageUpdatesResultCount", 0x1dcaee4, updates_count as usize),
-        ("XStoreQueryProductsAsync", 0x1dcaf58, products_by_id_async as usize),
-        ("XStoreQueryProductsResult", 0x1dcb014, products_result as usize),
-        ("XStoreShowPurchaseUIAsync", 0x1dcb088, purchase_ui_async as usize),
-        ("XStoreShowPurchaseUIResult", 0x1dcb12c, ui_result as usize),
-        ("XStoreShowRedeemTokenUIAsync", 0x1dcb190, redeem_ui_async as usize),
-        ("XStoreShowRedeemTokenUIResult", 0x1dcb240, ui_result as usize),
+pub(crate) unsafe fn install(base: *mut u8, rvas: &[usize]) {
+    let table: [(&str, usize); 22] = [
+        ("XStoreCloseContextHandle", close_handle as usize),
+        ("XStoreCloseProductsQueryHandle", close_handle as usize),
+        ("XStoreCreateContext", create_context as usize),
+        ("XStoreEnumerateProductsQuery", enumerate as usize),
+        ("XStoreProductsQueryHasMorePages", has_more_pages as usize),
+        ("XStoreProductsQueryNextPageAsync", next_page_async as usize),
+        ("XStoreProductsQueryNextPageResult", products_result as usize),
+        ("XStoreQueryAssociatedProductsAsync", products_async as usize),
+        ("XStoreQueryAssociatedProductsResult", products_result as usize),
+        ("XStoreQueryConsumableBalanceRemainingAsync", consumable_async as usize),
+        ("XStoreQueryConsumableBalanceRemainingResult", consumable_result as usize),
+        ("XStoreQueryEntitledProductsAsync", products_async as usize),
+        ("XStoreQueryEntitledProductsResult", products_result as usize),
+        ("XStoreQueryGameAndDlcPackageUpdatesAsync", updates_async as usize),
+        ("XStoreQueryGameAndDlcPackageUpdatesResult", updates_result as usize),
+        ("XStoreQueryGameAndDlcPackageUpdatesResultCount", updates_count as usize),
+        ("XStoreQueryProductsAsync", products_by_id_async as usize),
+        ("XStoreQueryProductsResult", products_result as usize),
+        ("XStoreShowPurchaseUIAsync", purchase_ui_async as usize),
+        ("XStoreShowPurchaseUIResult", ui_result as usize),
+        ("XStoreShowRedeemTokenUIAsync", redeem_ui_async as usize),
+        ("XStoreShowRedeemTokenUIResult", ui_result as usize),
     ];
     let mut ok = 0;
-    for (_, rva, target) in table {
-        if write_jump(base.add(rva), target) {
+    for ((_, target), rva) in table.iter().zip(rvas) {
+        if write_jump(base.add(*rva), *target) {
             ok += 1;
         }
     }
     crate::record_raw("gdk_store", "install", &format!("local empty store installed ({ok}/22 XStore wrappers redirected)"));
 }
+
+pub const XSTORE_NAMES: [&str; 22] = [
+    "XStoreCloseContextHandle",
+    "XStoreCloseProductsQueryHandle",
+    "XStoreCreateContext",
+    "XStoreEnumerateProductsQuery",
+    "XStoreProductsQueryHasMorePages",
+    "XStoreProductsQueryNextPageAsync",
+    "XStoreProductsQueryNextPageResult",
+    "XStoreQueryAssociatedProductsAsync",
+    "XStoreQueryAssociatedProductsResult",
+    "XStoreQueryConsumableBalanceRemainingAsync",
+    "XStoreQueryConsumableBalanceRemainingResult",
+    "XStoreQueryEntitledProductsAsync",
+    "XStoreQueryEntitledProductsResult",
+    "XStoreQueryGameAndDlcPackageUpdatesAsync",
+    "XStoreQueryGameAndDlcPackageUpdatesResult",
+    "XStoreQueryGameAndDlcPackageUpdatesResultCount",
+    "XStoreQueryProductsAsync",
+    "XStoreQueryProductsResult",
+    "XStoreShowPurchaseUIAsync",
+    "XStoreShowPurchaseUIResult",
+    "XStoreShowRedeemTokenUIAsync",
+    "XStoreShowRedeemTokenUIResult",
+];

@@ -4,14 +4,13 @@ use std::sync::{Mutex, OnceLock};
 type Handle = *mut c_void;
 
 pub const ERROR_INVALID_PARAMETER: u32 = 0x57;
-pub const ERROR_BAD_ARGUMENTS: u32 = 0xa0;
+pub use compat_common::partition_heap::{partition_create_heap, segment_parameters, SegmentHeapParameters, ERROR_BAD_ARGUMENTS};
 pub const ERROR_PARTITION_NOT_FOUND: u32 = 0x10d8;
 pub const REDIRECTED_FUNCTIONS: u32 = 0x4a;
 const PARTITION_NAMES: [&str; 3] = ["\\KernelObjects\\MemoryPartition0", "\\GLOBAL??\\MemoryPartitionXboxTitle", "\\GLOBAL??\\MemoryPartitionXboxTools"];
 const PARTITION_ALL_ACCESS: u32 = 0x1f_0003;
 const DUPLICATE_SAME_ACCESS: u32 = 2;
 const PARTITION_HEAP_TYPE: [u32; 3] = [2, 0, 2];
-const HEAP_FLAGS: u32 = 0x102;
 
 pub const REDIRECT_FLAGS: [u8; 74] = [
     1, 2, 2, 1, 0, 2, 0, 0, 2, 0, 0, 0, 0, 1, 1, 1, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0, 1, 0, 0, 0, 0, 2, 1, 2, 2, 2, 1, 1, 3, 3, 1, 2, 2, 2, 2, 2, 2,
@@ -60,24 +59,10 @@ struct ObjectAttributes {
     qos: *const c_void,
 }
 
-#[repr(C)]
-#[derive(Default)]
-pub struct SegmentHeapParameters {
-    pub version_size: u32,
-    pub flags: u32,
-    pub source_flags: u32,
-    pub memory_type_mask: u32,
-    pub numa_node: u32,
-    pub partition: usize,
-    pub reserved: [usize; 2],
-    pub tail: [u64; 4],
-}
-
 #[link(name = "ntdll", kind = "raw-dylib")]
 extern "system" {
     fn NtOpenPartition(out: *mut Handle, access: u32, attrs: *const ObjectAttributes) -> i32;
     fn NtManagePartition(target: Handle, source: Handle, class: u32, info: *mut u8, len: u32) -> i32;
-    fn RtlCreateHeap(flags: u32, base: *mut c_void, reserve: usize, commit: usize, lock: *mut c_void, params: *mut c_void) -> Handle;
 }
 
 #[link(name = "kernel32")]
@@ -130,38 +115,6 @@ pub fn heap_partition(i: u32) -> Result<usize, u32> {
         Partition::Process => Ok(0),
         Partition::Missing => Err(ERROR_PARTITION_NOT_FOUND),
     }
-}
-
-pub fn segment_parameters(partition: usize, memory_type: u32) -> SegmentHeapParameters {
-    let mut mask = 1u32.wrapping_shl(memory_type);
-    if memory_type == 4 {
-        mask |= 8;
-    }
-    SegmentHeapParameters {
-        version_size: 0x50_0003,
-        numa_node: 0xffff_ffff,
-        memory_type_mask: mask & 0xff,
-        partition: if memory_type >= 2 { partition } else { 0 },
-        ..Default::default()
-    }
-}
-
-pub unsafe fn partition_create_heap(partition: usize, memory_type: u32, flags: u32, base: *mut c_void, reserve: usize, commit: usize, lock: *mut c_void, params: *mut c_void) -> Handle {
-    let mut built = segment_parameters(partition, memory_type);
-    let (flags, reserve, commit, params) = if params.is_null() {
-        (flags | HEAP_FLAGS, 0, 0, (&mut built as *mut SegmentHeapParameters).cast())
-    } else {
-        (flags, reserve, commit, params)
-    };
-    let mut h = RtlCreateHeap(flags, base, reserve, commit, lock, params);
-    if h.is_null() && params == (&mut built as *mut SegmentHeapParameters).cast() && partition == 0 && built.memory_type_mask != 1 {
-        built.memory_type_mask = 1;
-        h = RtlCreateHeap(flags, base, reserve, commit, lock, params);
-    }
-    if h.is_null() {
-        SetLastError(ERROR_BAD_ARGUMENTS);
-    }
-    h
 }
 
 unsafe fn create_heap(partition: usize, memory_type: u32, flags: u32, size: usize) -> Handle {

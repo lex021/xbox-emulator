@@ -34,6 +34,7 @@ fn shader(stage: Stage, words: &[u32], input_sig: Vec<SigElement>, output_sig: V
         has_root_sig: false,
         input_sig,
         output_sig,
+        prim_sig: Vec::new(),
         resources: Vec::new(),
         gs_info: None,
         root_sig: None,

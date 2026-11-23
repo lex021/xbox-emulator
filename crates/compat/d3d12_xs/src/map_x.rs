@@ -456,7 +456,37 @@ unsafe extern "system" fn map_hook(res: *mut c_void, sub: u32, range: *const (u6
     if n < 32 {
         record("d3d12_xs", "map_x", &format!("Map FAILED res={res:p} sub={sub} range={rr:x?} out={out:p} hr={hr:#010x} | {}", unsafe { describe(res) }));
     }
+    if !out.is_null() && sub == 0 && (crate::dred::is_removal(hr) || crate::dred::removed()) {
+        let mut d = [0u8; 0x38];
+        unsafe { vcall!(res, 10, fn(*mut u8) -> *mut u8, d.as_mut_ptr()) };
+        if let Some(p) = lost_block(res as usize, &d) {
+            unsafe { *out = p as *mut c_void };
+            static L: AtomicUsize = AtomicUsize::new(0);
+            if L.fetch_add(1, Ordering::Relaxed) < 8 {
+                record("d3d12_xs", "map_x", &format!("Map res={res:p} after device removal hr={hr:#010x}: the console keeps CPU-visible memory mapped, so *ppData points at a zeroed {:#x}-byte host block (hr still returned) instead of NULL; the title would otherwise read through NULL", lost_len(&d).unwrap_or(0)));
+            }
+        }
+    }
     hr
+}
+
+static LOST: Mutex<Option<HashMap<usize, Box<[u8]>>>> = Mutex::new(None);
+
+fn lost_len(desc: &[u8]) -> Option<usize> {
+    let dim = u32::from_le_bytes(desc.get(0..4)?.try_into().ok()?);
+    let width = u64::from_le_bytes(desc.get(0x10..0x18)?.try_into().ok()?);
+    (dim == 1 && width > 0 && width <= 1 << 30).then_some(width as usize)
+}
+
+fn lost_block(res: usize, desc: &[u8]) -> Option<usize> {
+    let n = lost_len(desc)?;
+    let mut g = LOST.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    let b = m.entry(res).or_insert_with(|| vec![0u8; n].into_boxed_slice());
+    if b.len() < n {
+        *b = vec![0u8; n].into_boxed_slice();
+    }
+    Some(b.as_ptr() as usize)
 }
 
 unsafe extern "system" fn unmap_hook(res: *mut c_void, sub: u32, written: *const (u64, u64)) {
@@ -480,6 +510,35 @@ unsafe extern "system" fn unmap_hook(res: *mut c_void, sub: u32, written: *const
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn buf_desc(width: u64) -> [u8; 0x38] {
+        let mut d = [0u8; 0x38];
+        d[0..4].copy_from_slice(&1u32.to_le_bytes());
+        d[0x10..0x18].copy_from_slice(&width.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn lost_device_map_serves_a_stable_zeroed_block_for_buffers_only() {
+        let d = buf_desc(8192);
+        let a = lost_block(0x1234, &d).unwrap();
+        let b = lost_block(0x1234, &d).unwrap();
+        assert_eq!(a, b);
+        let s = unsafe { core::slice::from_raw_parts(a as *const u8, 8192) };
+        assert!(s.iter().all(|&x| x == 0));
+        let mut tex = buf_desc(64);
+        tex[0..4].copy_from_slice(&3u32.to_le_bytes());
+        assert!(lost_block(0x5678, &tex).is_none());
+        assert!(lost_block(0x9abc, &buf_desc(0)).is_none());
+    }
+
+    #[test]
+    fn removal_failure_sets_the_removed_flag() {
+        crate::dred::on_failure(0x887A_0005u32 as i32, "test");
+        assert!(crate::dred::removed());
+        assert!(crate::dred::is_removal(0x887A_0006u32 as i32));
+        assert!(!crate::dred::is_removal(0x8007_0057u32 as i32));
+    }
 
     #[test]
     fn read_span_clamps_and_rejects_empty() {

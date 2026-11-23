@@ -162,6 +162,7 @@ pub fn bop64_route(va: u64, flags: u32) -> Result<Bop64, &'static str> {
 }
 
 unsafe fn stall_list(list: *mut c_void) {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::BARRIER) };
     let mut b = [0u8; 32];
     b[0..4].copy_from_slice(&2u32.to_le_bytes());
     let f: unsafe extern "system" fn(*mut c_void, u32, *const u8) = unsafe { core::mem::transmute(pc_fn(list, PC_SLOT_RESOURCE_BARRIER)) };

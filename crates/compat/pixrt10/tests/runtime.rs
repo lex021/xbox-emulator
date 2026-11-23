@@ -21,6 +21,10 @@ fn setup() -> std::path::PathBuf {
     dir
 }
 
+fn pool_is_none() -> bool {
+    context().pool.lock().unwrap().is_none()
+}
+
 fn wait_until(f: impl Fn() -> bool) -> bool {
     let t = Instant::now();
     while t.elapsed() < Duration::from_secs(5) {
@@ -184,6 +188,29 @@ fn from_title_builds_the_runtime_once_listens_on_0x1080_and_idles() {
         assert_eq!(install_df_pmc(1, 2, 3, 4), E_ACCESSDENIED);
         assert_eq!(install_l2i_pmc(0x10001, 2, 3, 4), E_ACCESSDENIED);
 
+        assert_eq!(context().state.load(Ordering::SeqCst), 1);
+        assert_eq!(event_buffer(), [0, 0, 0]);
+        assert_eq!(thread_event_buffer(0), 0);
+        assert_eq!(event_buffer(), [0, 0, usize::MAX]);
+        assert_eq!(thread_event_buffer(1), 0);
+        assert_eq!(event_buffer(), [0, 0, usize::MAX]);
+        assert!(pool_is_none());
+        std::thread::spawn(|| assert_eq!(event_buffer(), [0, 0, 0])).join().unwrap();
+
+        assert_eq!(XMON_GEN.load(Ordering::SeqCst), 0x15);
+        assert_eq!(slot8(0x1f, 0, 0, 0), E_INVALIDARG);
+        assert_eq!(slot8(0, 0, 0, 0x1f), E_INVALIDARG);
+        assert_eq!(slot8(0, 1, 2, 0x1e), E_ACCESSDENIED);
+        assert_eq!(XMON_GEN.load(Ordering::SeqCst), 0x15);
+        assert_eq!(driver_gen(), 0x15);
+        XMON_GEN.store(0x18, Ordering::SeqCst);
+        assert_eq!(slot8(0x1000, 0, 0, 0), E_ACCESSDENIED);
+        assert_eq!(XMON_GEN.load(Ordering::SeqCst), 0x15);
+        XMON_GEN.store(0x18, Ordering::SeqCst);
+        assert!(!xmon_tables_valid());
+        XMON_GEN.store(0x15, Ordering::SeqCst);
+        assert!(xmon_tables_valid());
+
         assert_eq!(PROVIDER_STATE.bits.load(Ordering::SeqCst), 0);
         let name: Vec<u16> = "fps".encode_utf16().chain(Some(0)).collect();
         report_counter(name.as_ptr(), 60.0);
@@ -268,4 +295,48 @@ fn layouts_match_the_console_dlls() {
         let name: Vec<u8> = THREAD_NAMES[1].encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
         assert!(img.windows(name.len()).any(|w| w == name.as_slice()), "{path}");
     }
+}
+
+#[test]
+fn xmon_tables_and_slot8_input_match_the_22000_dll() {
+    let Ok(img) = std::fs::read(r"D:\xbox-pc-port\games\XDefiant\extracted\EmbeddedXvd\Windows\System32\pixrt10.dll") else { return };
+    let pe = u32::from_le_bytes(img[0x3c..0x40].try_into().unwrap()) as usize;
+    let nsec = u16::from_le_bytes(img[pe + 6..pe + 8].try_into().unwrap()) as usize;
+    let opt = u16::from_le_bytes(img[pe + 20..pe + 22].try_into().unwrap()) as usize;
+    let sec = pe + 24 + opt;
+    let off = |rva: usize| -> usize {
+        for i in 0..nsec {
+            let s = sec + i * 40;
+            let va = u32::from_le_bytes(img[s + 12..s + 16].try_into().unwrap()) as usize;
+            let vs = u32::from_le_bytes(img[s + 8..s + 12].try_into().unwrap()) as usize;
+            let raw = u32::from_le_bytes(img[s + 20..s + 24].try_into().unwrap()) as usize;
+            if rva >= va && rva < va + vs {
+                return rva - va + raw;
+            }
+        }
+        panic!("{rva:#x}")
+    };
+    for t in [0x54850usize, 0x54b40, 0x54e30] {
+        for i in 0..XMON_TABLE_ROWS as usize {
+            let o = off(t + i * 24);
+            assert_eq!(u16::from_le_bytes([img[o], img[o + 1]]) as usize, i);
+        }
+    }
+    let g = off(0x55590);
+    let guid: Vec<u32> = (0..4).map(|i| u32::from_le_bytes(img[g + i * 4..g + i * 4 + 4].try_into().unwrap())).collect();
+    assert_eq!(guid, CORE_PMC_GUID);
+    let s = off(0x5f994);
+    assert_eq!(u32::from_le_bytes(img[s..s + 4].try_into().unwrap()), 0x15);
+    let code = &img[off(0x2cfc7)..off(0x2cfc7) + 7];
+    assert_eq!(&code[3..7], &(EVENT_BUFFER_BYTES as u32).to_le_bytes());
+    let first = &img[off(0x2cfd6)..off(0x2cfd6) + 7];
+    assert_eq!(&first[3..7], &(EVENT_BUFFER_FIRST as u32).to_le_bytes());
+    let nc = &img[off(0x2c9f8)..off(0x2c9f8) + 5];
+    assert_eq!(&nc[1..5], &(HR_NO_CAPTURE as u32).to_le_bytes());
+    let grow = &img[off(0x260e5)..off(0x260e5) + 8];
+    assert_eq!(&grow[4..8], &(POOL_GROW as u32).to_le_bytes());
+    let q = &img[off(0x44e82)..off(0x44e82) + 5];
+    assert_eq!(&q[1..5], &IOCTL_XMON_QUERY.to_le_bytes());
+    let c = &img[off(0x4545b)..off(0x4545b) + 5];
+    assert_eq!(&c[1..5], &IOCTL_CORE_PMC.to_le_bytes());
 }

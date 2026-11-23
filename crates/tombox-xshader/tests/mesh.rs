@@ -89,6 +89,7 @@ fn ms(words: &[u32], mi: MeshInfo, outs: Vec<SigElement>) -> ShaderExtract {
         has_root_sig: false,
         input_sig: vec![],
         output_sig: outs,
+        prim_sig: Vec::new(),
         resources: Vec::new(),
         gs_info: Some(GsInfo { input_primitive: 0, output_topology: 0, max_vertex_count: 0, mesh: Some(mi) }),
         root_sig: None,
@@ -325,6 +326,72 @@ fn mesh_typed_buffer_load_uses_root_table_range() {
     let translated = translate(&shader).expect("explicit SRV descriptor range");
     assert!(translated.hlsl.contains("Buffer<"), "{}", translated.hlsl);
     assert!(translated.hlsl.contains("register(t7, space2)"), "{}", translated.hlsl);
+}
+
+#[test]
+fn mesh_root_signature_inference_binds_scalar_buffer_load() {
+    let mut words = vec![sop1(3, 0, 16), sop1(3, 28, 0), 0xf420_000e, 0xfa00_0000];
+    words.extend(console_ms(3, 1, 0));
+    let mut shader = ms(&words, mesh_info(128, 128, 128, 2), pos_param_outs());
+    assert!(translate(&shader).is_err());
+    let sig = tombox_xshader::infer_root_signature(&shader).expect("inferred root signature");
+    assert_eq!(sig.params.len(), 1);
+    match &sig.params[0].kind {
+        tombox_xshader::meta::RootParamKind::Descriptor { kind, .. } => assert_eq!(*kind, 2),
+        other => panic!("expected root descriptor, got {other:?}"),
+    }
+    shader.root_sig = Some(sig);
+    let translated = translate(&shader).expect("translated with inferred root signature");
+    assert!(translated.hlsl.contains("cbuffer CB"), "{}", translated.hlsl);
+    assert!(dxc::compile(&translated.hlsl, &dxc::profile_for(translated.profile)).is_ok());
+}
+
+#[test]
+fn mesh_root_signature_inference_binds_typed_buffer_table() {
+    let mut words = vec![0xf408_0008, 0xfa00_0020, 0xe000_2000, 0x8000_0101];
+    words.extend(console_ms(3, 1, 0));
+    let shader = ms(&words, mesh_info(128, 128, 128, 2), pos_param_outs());
+    assert!(translate(&shader).is_err());
+    let sig = tombox_xshader::infer_root_signature(&shader).expect("inferred root signature");
+    assert_eq!(sig.params.len(), 1);
+    match &sig.params[0].kind {
+        tombox_xshader::meta::RootParamKind::Table(ranges) => {
+            assert_eq!(ranges.len(), 1);
+            assert_eq!(ranges[0].range_type, 0);
+            assert_eq!(ranges[0].offset_in_table, 1);
+        }
+        other => panic!("expected descriptor table, got {other:?}"),
+    }
+    let translated = tombox_xshader::translate_with_inference(&shader).expect("translated with inference");
+    assert!(translated.hlsl.contains("Buffer<"), "{}", translated.hlsl);
+    assert!(dxc::compile(&translated.hlsl, &dxc::profile_for(translated.profile)).is_ok());
+}
+
+#[test]
+fn mesh_root_signature_inference_matches_psv_metadata() {
+    use tombox_xshader::meta::PsvResource;
+
+    let mut words = vec![0xf408_0008, 0xfa00_0020, 0xe000_2000, 0x8000_0101];
+    words.extend(console_ms(3, 1, 0));
+    let mut shader = ms(&words, mesh_info(128, 128, 128, 2), pos_param_outs());
+    shader.resources = vec![PsvResource {
+        res_type: 3,
+        space: 4,
+        lower: 9,
+        upper: 9,
+        kind: 0,
+    }];
+    let sig = tombox_xshader::infer_root_signature(&shader).expect("inferred root signature");
+    match &sig.params[0].kind {
+        tombox_xshader::meta::RootParamKind::Table(ranges) => {
+            assert_eq!(ranges[0].base_register, 9);
+            assert_eq!(ranges[0].space, 4);
+        }
+        other => panic!("expected descriptor table, got {other:?}"),
+    }
+    let translated = tombox_xshader::translate_with_inference(&shader).expect("translated with inference");
+    assert!(translated.hlsl.contains("register(t9, space4)"), "{}", translated.hlsl);
+    assert!(dxc::compile(&translated.hlsl, &dxc::profile_for(translated.profile)).is_ok());
 }
 
 #[test]
@@ -791,4 +858,39 @@ fn compile_amplification_payload_subword_loads() {
         assert!(t.hlsl.lines().any(|line| line.contains("tb_gload(") && line.contains(&format!(", {width}u)"))), "{}", t.hlsl);
     }
     dxc::compile(&t.hlsl, &dxc::profile_for(t.profile)).unwrap();
+}
+
+#[test]
+fn mesh_256_threads_and_per_primitive_outputs_compile_with_dxc() {
+    let mut w = console_ms(200, 1, TRI);
+    w.pop();
+    w.extend(exp(33, 0xf, true, [7, 8, 7, 8]));
+    w.push(S_ENDPGM);
+    let mut mi = mesh_info(256, 256, 128, 2);
+    mi.prim_vectors = 1;
+    let mut s = ms(&w, mi, pos_param_outs());
+    s.prim_sig = vec![SigElement { name: "TEXCOORD".into(), index: 7, sysval: 0, comp_type: 1, register: 0, mask: 0xf, rw_mask: 0 }];
+    let t = translate(&s).expect("256-thread mesh + per-primitive output");
+    assert_eq!(t.profile, "ms_6_5");
+    assert!(t.hlsl.contains("[numthreads(128, 1, 1)]"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("for (uint tb_iter = 0u; tb_iter < 2u; tb_iter++)"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("uint tb_gi = gi + tb_iter * 128u;"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("uint4 p0 : TEXCOORD7;"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("tb_pout.p0 ="), "{}", t.hlsl);
+    assert!(t.hlsl.contains("verts[gi + 128u] = tb_vo[1];"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("tris[gi + 128u]"), "mp=128 must not index tris[gi+128]:\n{}", t.hlsl);
+    dxc::compile(&t.hlsl, &dxc::profile_for(t.profile)).expect("DXC compile 256-thread MS");
+
+    let mut bad_lds = w.clone();
+    bad_lds.insert(0, 0xd834_0000);
+    bad_lds.insert(1, 0x0000_0000);
+    let mut s_lds = ms(&bad_lds, mi, pos_param_outs());
+    s_lds.prim_sig = s.prim_sig.clone();
+    let err = translate(&s_lds).err().expect("256-thread MS with LDS must refuse");
+    assert!(err.contains("LDS"), "{err}");
+
+    let mut s_nopsg = ms(&w, mi, pos_param_outs());
+    let err = translate(&s_nopsg).err().expect("prim_vectors without PSG1 must refuse");
+    assert!(err.contains("PSG1"), "{err}");
+    let _ = &mut s_nopsg;
 }

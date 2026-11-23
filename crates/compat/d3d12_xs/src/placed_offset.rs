@@ -115,6 +115,14 @@ pub fn forget(res: usize) {
         crate::title_shadow::helper_gone(h);
         unsafe { release(h as *mut c_void) };
     }
+    for m in drop_mirrors(res) {
+        unsafe {
+            release(m.copy as *mut c_void);
+            if m.snap != 0 {
+                release(m.snap as *mut c_void);
+            }
+        }
+    }
 }
 
 unsafe fn vt(o: *mut c_void) -> *const usize {
@@ -383,11 +391,12 @@ pub fn rebase_view(view: &mut [u8], at: crate::console_slots_dev2::BufferView, o
     false
 }
 
-fn uneven(what: &str, o: u64, view: &[u8], at: crate::console_slots_dev2::BufferView) {
+fn uneven(what: &str, o: u64, view: &[u8], at: crate::console_slots_dev2::BufferView, mirrored: bool) {
     let n = UNEVEN.fetch_add(1, Ordering::Relaxed);
     if n < 16 || n.is_power_of_two() {
         let e = crate::console_slots_dev2::element_bytes(view, at);
-        record("d3d12_xs", "placed_offset", &format!("{what} on a buffer {o:#x} bytes into its 64 KB page: element size {e:?} does not divide the offset and no helper lines up, so the PC view starts {} bytes early (#{})", e.map_or(0, |e| o % e as u64), n + 1));
+        let how = if mirrored { "the view is built on an exact-offset copy buffer kept coherent at execute and barrier points" } else { "the exact-offset copy buffer could not be created, so a null view is written and reads return zero" };
+        record("d3d12_xs", "placed_offset", &format!("{what} on a buffer {o:#x} bytes into its 64 KB page: element size {e:?} does not divide the offset and no 64 KB step below it in the heap lines up; {how} (#{})", n + 1));
     }
 }
 
@@ -404,9 +413,10 @@ unsafe extern "system" fn srv(this: *mut c_void, res: *mut c_void, desc: *const 
         return with_true_desc(|| unsafe { f(this, t, v.as_ptr(), dest) });
     }
     v = orig;
-    rebase_view(&mut v, crate::console_slots_dev2::SRV_BUFFER, o);
-    uneven("CreateShaderResourceView", o, &v, crate::console_slots_dev2::SRV_BUFFER);
-    with_true_desc(|| unsafe { f(this, res, v.as_ptr(), dest) })
+    let m = unsafe { mirror_view(res as usize, &mut v, crate::console_slots_dev2::SRV_BUFFER, false) };
+    uneven("CreateShaderResourceView", o, &v, crate::console_slots_dev2::SRV_BUFFER, m.is_some());
+    let t = m.unwrap_or(core::ptr::null_mut());
+    with_true_desc(|| unsafe { f(this, t, v.as_ptr(), dest) })
 }
 
 unsafe extern "system" fn uav(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const u8, dest: usize) {
@@ -427,11 +437,13 @@ unsafe extern "system" fn uav(this: *mut c_void, res: *mut c_void, counter: *mut
             Some(t) => target = t,
             None => {
                 v = orig;
-                rebase_view(&mut v, crate::console_slots_dev2::UAV_BUFFER, o);
-                uneven("CreateUnorderedAccessView", o, &v, crate::console_slots_dev2::UAV_BUFFER);
+                let m = unsafe { mirror_view(res as usize, &mut v, crate::console_slots_dev2::UAV_BUFFER, true) };
+                uneven("CreateUnorderedAccessView", o, &v, crate::console_slots_dev2::UAV_BUFFER, m.is_some());
+                target = m.unwrap_or(core::ptr::null_mut());
             }
         }
     }
+    let counter = if target.is_null() { core::ptr::null_mut() } else { counter };
     with_true_desc(|| unsafe { f(this, target, counter, v.as_ptr(), dest) })
 }
 
@@ -593,6 +605,573 @@ pub fn install_cmdlist(vt: &[AtomicUsize]) -> usize {
         n += 1;
     }
     n
+}
+
+const PC_DISPATCH: usize = 14;
+const PC_COPY_BUFFER: usize = 15;
+const PC_SET_PSO: usize = 25;
+const PC_BARRIER: usize = 26;
+const PC_SET_CROOT: usize = 29;
+const PC_CROOT_CONSTS: usize = 35;
+const PC_CROOT_SRV: usize = 39;
+const PC_CROOT_UAV: usize = 41;
+const PC_SET_PREDICATION: usize = 55;
+const PC_CLOSE: usize = 9;
+const PC_RESET: usize = 10;
+const ST_COMMON: u32 = 0;
+const ST_UAV: u32 = 0x8;
+const ST_NPS: u32 = 0x40;
+const ST_ANY_SRV: u32 = 0xc0;
+const ST_COPY_DEST: u32 = 0x400;
+const ST_COPY_SOURCE: u32 = 0x800;
+const RES_GET_HEAP: usize = 14;
+const MERGE_GROUP: u64 = 64;
+const MAX_GROUPS: u64 = 65535;
+const IID_ROOT_SIG: Guid = Guid(0xc54a6b66, 0x72df, 0x4ee8, [0x8b, 0xe5, 0xa9, 0x46, 0xa1, 0x42, 0x92, 0x14]);
+const IID_PSO: Guid = Guid(0x765a30f3, 0xf624, 0x4c6f, [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45]);
+const IID_ALLOC: Guid = Guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
+const IID_LIST: Guid = Guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
+const IID_FENCE: Guid = Guid(0x0a753dcf, 0xc4d8, 0x4b91, [0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76]);
+
+const MERGE_CS: &str = "#define RS \"RootConstants(num32BitConstants=5, b0), UAV(u0), SRV(t0), SRV(t1)\"\n\
+cbuffer K : register(b0) { uint lo; uint at; uint len; uint base; uint count; };\n\
+RWByteAddressBuffer dst : register(u0);\n\
+ByteAddressBuffer cur : register(t0);\n\
+ByteAddressBuffer snap : register(t1);\n\
+uint cur_byte(uint i) { return (cur.Load(i & ~3u) >> ((i & 3u) * 8u)) & 0xffu; }\n\
+uint snap_byte(uint i) { return (snap.Load(i & ~3u) >> ((i & 3u) * 8u)) & 0xffu; }\n\
+[RootSignature(RS)]\n\
+[numthreads(64, 1, 1)]\n\
+void main(uint3 g : SV_DispatchThreadID) {\n\
+    uint d = base + g.x;\n\
+    if (d >= count) return;\n\
+    uint addr = lo + d * 4u;\n\
+    uint old = dst.Load(addr);\n\
+    uint v = old;\n\
+    [unroll] for (uint k = 0u; k < 4u; k++) {\n\
+        uint b = addr + k;\n\
+        if (b >= at && b - at < len) {\n\
+            uint e = cur_byte(b - at);\n\
+            if (e != snap_byte(b - at)) v = (v & ~(0xffu << (k * 8u))) | (e << (k * 8u));\n\
+        }\n\
+    }\n\
+    if (v != old) dst.Store(addr, v);\n\
+}\n";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mirror {
+    pub res: usize,
+    pub at: u64,
+    pub len: u64,
+    pub copy: usize,
+    pub snap: usize,
+    pub uav: bool,
+    pub fixed_read: bool,
+    pub dev: usize,
+}
+
+static MIRRORS: Mutex<Vec<Mirror>> = Mutex::new(Vec::new());
+static MIRROR_LIVE: AtomicUsize = AtomicUsize::new(0);
+static LIST_STATES: Mutex<Option<HashMap<(usize, usize), u32>>> = Mutex::new(None);
+static MERGE: Mutex<Option<HashMap<usize, Option<(usize, usize)>>>> = Mutex::new(None);
+static POOL: Mutex<Vec<Slot>> = Mutex::new(Vec::new());
+
+thread_local! {
+    static SYNCING: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+struct Slot {
+    dev: usize,
+    ty: u32,
+    alloc: usize,
+    list: usize,
+    fence: usize,
+    value: u64,
+}
+
+unsafe impl Send for Slot {}
+
+pub fn mirrors() -> Vec<Mirror> {
+    MIRRORS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn mirrors_of(res: usize) -> Vec<Mirror> {
+    MIRRORS.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|m| m.res == res).copied().collect()
+}
+
+fn drop_mirrors(res: usize) -> Vec<Mirror> {
+    if MIRROR_LIVE.load(Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
+    let mut g = MIRRORS.lock().unwrap_or_else(|e| e.into_inner());
+    let (gone, keep): (Vec<Mirror>, Vec<Mirror>) = g.drain(..).partition(|m| m.res == res);
+    *g = keep;
+    MIRROR_LIVE.store(g.len(), Ordering::Release);
+    gone
+}
+
+pub fn mirror_span(off: Off, first: u64, e: u64, num: u64) -> Option<(u64, u64)> {
+    let at = off.bytes.checked_add(first.checked_mul(e)?)?;
+    let end = off.bytes + off.width;
+    if e == 0 || num == 0 || at >= end {
+        return None;
+    }
+    Some((at, num.checked_mul(e)?.min(end - at)))
+}
+
+pub fn merge_words(at: u64, len: u64) -> (u64, u64) {
+    let lo = at & !3;
+    let hi = (at + len + 3) & !3;
+    (lo, (hi - lo) / 4)
+}
+
+pub fn sync_targets(b: &[u8], mirrored: &dyn Fn(usize) -> bool, all: &[usize], tracked: &dyn Fn(usize) -> u32) -> Vec<(usize, u32)> {
+    let mut out: Vec<(usize, u32)> = Vec::new();
+    let mut add = |r: usize, s: u32| {
+        if r != 0 && mirrored(r) {
+            match out.iter_mut().find(|x| x.0 == r) {
+                Some(x) => x.1 = s,
+                None => out.push((r, s)),
+            }
+        }
+    };
+    for e in b.chunks_exact(32) {
+        let ty = u32::from_le_bytes(e[0..4].try_into().unwrap());
+        let flags = u32::from_le_bytes(e[4..8].try_into().unwrap());
+        let r0 = u64::from_le_bytes(e[8..16].try_into().unwrap()) as usize;
+        match ty {
+            0 if flags & 1 == 0 => add(r0, u32::from_le_bytes(e[24..28].try_into().unwrap())),
+            1 => {
+                let r1 = u64::from_le_bytes(e[16..24].try_into().unwrap()) as usize;
+                add(r0, tracked(r0));
+                add(r1, tracked(r1));
+            }
+            2 if r0 != 0 => add(r0, ST_UAV),
+            2 => {
+                for &r in all {
+                    add(r, tracked(r));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+pub fn has_copy_source(state: u32) -> bool {
+    state & ST_COPY_SOURCE != 0 && state & (ST_COPY_DEST | ST_UAV) == 0
+}
+
+fn transition(res: usize, before: u32, after: u32) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    b[8..16].copy_from_slice(&(res as u64).to_le_bytes());
+    b[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+    b[20..24].copy_from_slice(&before.to_le_bytes());
+    b[24..28].copy_from_slice(&after.to_le_bytes());
+    b
+}
+
+fn uav_barrier(res: usize) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    b[0..4].copy_from_slice(&2u32.to_le_bytes());
+    b[8..16].copy_from_slice(&(res as u64).to_le_bytes());
+    b
+}
+
+unsafe fn real_slot(o: *mut c_void, slot: usize) -> usize {
+    unsafe { *vt(o).add(slot) }
+}
+
+unsafe fn barriers(l: *mut c_void, b: &[[u8; 32]]) {
+    if b.is_empty() {
+        return;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const u8) = unsafe { core::mem::transmute(real_slot(l, PC_BARRIER)) };
+    unsafe { f(l, b.len() as u32, b.as_ptr() as *const u8) };
+}
+
+unsafe fn copy_region(l: *mut c_void, dst: usize, doff: u64, src: usize, soff: u64, n: u64) {
+    let f: unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64) = unsafe { core::mem::transmute(real_slot(l, PC_COPY_BUFFER)) };
+    unsafe { f(l, dst, doff, src, soff, n) };
+}
+
+unsafe fn true_gpu_va(res: usize) -> u64 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u64 = unsafe { core::mem::transmute(real_slot(res as *mut c_void, RES_GET_GPU_VA)) };
+    let va = unsafe { f(res as *mut c_void) };
+    if bytes(res) != 0 { va & !(PAGE - 1) } else { va }
+}
+
+const RES_GET_GPU_VA: usize = 11;
+
+unsafe fn committed(dev: *mut c_void, width: u64, uav: bool) -> Option<usize> {
+    let heap: [u32; 5] = [1, 0, 0, 1, 1];
+    let mut d = [0u8; 0x38];
+    d[0..4].copy_from_slice(&1u32.to_le_bytes());
+    d[0x10..0x18].copy_from_slice(&((width + 3) & !3).max(4).to_le_bytes());
+    d[0x18..0x1c].copy_from_slice(&1u32.to_le_bytes());
+    d[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes());
+    d[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes());
+    d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+    d[0x2c..0x30].copy_from_slice(&1u32.to_le_bytes());
+    d[0x30..0x34].copy_from_slice(&(if uav { 4u32 } else { 0 }).to_le_bytes());
+    let f: unsafe extern "system" fn(*mut c_void, *const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(*vt(dev).add(27)) };
+    let mut r: *mut c_void = core::ptr::null_mut();
+    let hr = unsafe { f(dev, heap.as_ptr(), 0, d.as_ptr(), ST_COMMON, core::ptr::null(), &IID_RESOURCE, &mut r) };
+    if hr < 0 || r.is_null() {
+        record("d3d12_xs", "placed_offset", &format!("exact-offset copy buffer of {width:#x} bytes hr={hr:#010x}"));
+        return None;
+    }
+    Some(r as usize)
+}
+
+unsafe fn fixed_read_heap(res: usize) -> bool {
+    let f: unsafe extern "system" fn(*mut c_void, *mut u32, *mut u32) -> i32 = unsafe { core::mem::transmute(real_slot(res as *mut c_void, RES_GET_HEAP)) };
+    let mut props = [0u32; 5];
+    let mut flags = 0u32;
+    let hr = unsafe { f(res as *mut c_void, props.as_mut_ptr(), &mut flags) };
+    hr >= 0 && props[0] == 2
+}
+
+pub unsafe fn mirror_for(res: usize, at: u64, len: u64, uav: bool) -> Option<Mirror> {
+    if let Some(m) = MIRRORS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|m| m.res == res && m.at == at && m.len == len && m.uav == uav) {
+        return Some(*m);
+    }
+    let off = of(res)?;
+    let dev = off.real as *mut c_void;
+    let copy = unsafe { committed(dev, len, uav) }?;
+    let snap = if uav {
+        match unsafe { committed(dev, len, false) } {
+            Some(s) => s,
+            None => {
+                unsafe { release(copy as *mut c_void) };
+                return None;
+            }
+        }
+    } else {
+        0
+    };
+    let m = Mirror { res, at, len, copy, snap, uav, fixed_read: unsafe { fixed_read_heap(res) }, dev: dev as usize };
+    if uav && unsafe { merge_pipeline(dev) }.is_none() {
+        record("d3d12_xs", "placed_offset", "exact-offset UAV copy: merge shader unavailable, write-back copies the whole view range");
+    }
+    let mut g = MIRRORS.lock().unwrap_or_else(|e| e.into_inner());
+    g.push(m);
+    MIRROR_LIVE.store(g.len(), Ordering::Release);
+    static N: AtomicUsize = AtomicUsize::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 16 {
+        record("d3d12_xs", "placed_offset", &format!("exact-offset {} copy of buffer {res:#x} bytes {at:#x}+{len:#x}", if uav { "UAV" } else { "SRV" }));
+    }
+    Some(m)
+}
+
+pub unsafe fn mirror_view(res: usize, view: &mut [u8], at: crate::console_slots_dev2::BufferView, uav: bool) -> Option<*mut c_void> {
+    let off = of(res)?;
+    let e = crate::console_slots_dev2::element_bytes(view, at)? as u64;
+    let first = u64::from_le_bytes(view[at.first..at.first + 8].try_into().unwrap());
+    let num = u32::from_le_bytes(view[at.first + 8..at.first + 12].try_into().unwrap()) as u64;
+    let (pos, len) = mirror_span(off, first, e, num)?;
+    let m = unsafe { mirror_for(res, pos, len, uav) }?;
+    view[at.first..at.first + 8].copy_from_slice(&0u64.to_le_bytes());
+    Some(m.copy as *mut c_void)
+}
+
+unsafe fn merge_pipeline(dev: *mut c_void) -> Option<(usize, usize)> {
+    let mut g = MERGE.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    if let Some(p) = m.get(&(dev as usize)) {
+        return *p;
+    }
+    let made = unsafe { make_merge(dev) };
+    if let Err(e) = &made {
+        record("d3d12_xs", "placed_offset", &format!("exact-offset merge shader: {e}"));
+    }
+    let p = made.ok();
+    m.insert(dev as usize, p);
+    p
+}
+
+unsafe fn make_merge(dev: *mut c_void) -> Result<(usize, usize), String> {
+    if !tombox_xshader::dxc::available() {
+        return Err("DXC is not available".into());
+    }
+    let cs = tombox_xshader::dxc::compile(MERGE_CS, "cs_6_0")?;
+    let mk_rs: unsafe extern "system" fn(*mut c_void, u32, *const u8, usize, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(*vt(dev).add(16)) };
+    let mut rs: *mut c_void = core::ptr::null_mut();
+    let hr = unsafe { mk_rs(dev, 0, cs.as_ptr(), cs.len(), &IID_ROOT_SIG, &mut rs) };
+    if hr < 0 || rs.is_null() {
+        return Err(format!("CreateRootSignature hr={hr:#010x}"));
+    }
+    let mut d = [0u8; 56];
+    d[0..8].copy_from_slice(&(rs as u64).to_le_bytes());
+    d[8..16].copy_from_slice(&(cs.as_ptr() as u64).to_le_bytes());
+    d[16..24].copy_from_slice(&(cs.len() as u64).to_le_bytes());
+    let mk: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(*vt(dev).add(11)) };
+    let mut p: *mut c_void = core::ptr::null_mut();
+    let hr = unsafe { mk(dev, d.as_ptr(), &IID_PSO, &mut p) };
+    if hr < 0 || p.is_null() {
+        unsafe { release(rs) };
+        return Err(format!("CreateComputePipelineState hr={hr:#010x}"));
+    }
+    Ok((rs as usize, p as usize))
+}
+
+unsafe fn record_merge(l: *mut c_void, m: &Mirror, pipe: (usize, usize)) {
+    unsafe {
+        let set_rs: unsafe extern "system" fn(*mut c_void, usize) = core::mem::transmute(real_slot(l, PC_SET_CROOT));
+        let set_pso: unsafe extern "system" fn(*mut c_void, usize) = core::mem::transmute(real_slot(l, PC_SET_PSO));
+        let consts: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32) = core::mem::transmute(real_slot(l, PC_CROOT_CONSTS));
+        let srv: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(real_slot(l, PC_CROOT_SRV));
+        let uav: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(real_slot(l, PC_CROOT_UAV));
+        let dispatch: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = core::mem::transmute(real_slot(l, PC_DISPATCH));
+        set_rs(l, pipe.0);
+        set_pso(l, pipe.1);
+        uav(l, 1, true_gpu_va(m.res));
+        srv(l, 2, true_gpu_va(m.copy));
+        srv(l, 3, true_gpu_va(m.snap));
+        let (lo, count) = merge_words(m.at, m.len);
+        let mut base = 0u64;
+        while base < count {
+            let groups = (count - base).div_ceil(MERGE_GROUP).min(MAX_GROUPS);
+            let k = [lo as u32, m.at as u32, m.len as u32, base as u32, count as u32];
+            consts(l, 0, 5, k.as_ptr(), 0);
+            dispatch(l, groups as u32, 1, 1);
+            base += groups * MERGE_GROUP;
+        }
+    }
+}
+
+fn list_state(l: usize, r: usize) -> u32 {
+    LIST_STATES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&(l, r)).copied()).unwrap_or(ST_COMMON)
+}
+
+fn set_list_state(l: usize, r: usize, s: u32) {
+    LIST_STATES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert((l, r), s);
+}
+
+fn forget_lists(lists: &[*mut c_void]) {
+    if let Some(m) = LIST_STATES.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.retain(|k, _| !lists.iter().any(|&l| l as usize == k.0));
+    }
+}
+
+fn move_to(out: &mut Vec<[u8; 32]>, l: usize, r: usize, s: u32) {
+    let cur = list_state(l, r);
+    if cur != s {
+        out.push(transition(r, cur, s));
+        set_list_state(l, r, s);
+    }
+}
+
+pub unsafe fn sync_resource(l: *mut c_void, res: usize, state: u32) -> bool {
+    let _ij = unsafe { crate::inject::scope(l, crate::inject::COPY) };
+    let ms = mirrors_of(res);
+    if ms.is_empty() {
+        return false;
+    }
+    let lk = l as usize;
+    let mut cur = state;
+    let uavs: Vec<&Mirror> = ms.iter().filter(|m| m.uav).collect();
+    let pipe = uavs.first().and_then(|m| unsafe { merge_pipeline(m.dev as *mut c_void) });
+    let merged = !uavs.is_empty() && pipe.is_some();
+    if let Some(pipe) = pipe {
+        let mut b = Vec::new();
+        if cur != ST_UAV {
+            b.push(transition(res, cur, ST_UAV));
+            cur = ST_UAV;
+        }
+        for m in &uavs {
+            move_to(&mut b, lk, m.copy, ST_NPS);
+            move_to(&mut b, lk, m.snap, ST_NPS);
+        }
+        unsafe { barriers(l, &b) };
+        for m in &uavs {
+            unsafe { record_merge(l, m, pipe) };
+        }
+        unsafe { barriers(l, &[uav_barrier(res)]) };
+    } else if !uavs.is_empty() {
+        let mut b = Vec::new();
+        if cur != ST_COPY_DEST {
+            b.push(transition(res, cur, ST_COPY_DEST));
+            cur = ST_COPY_DEST;
+        }
+        for m in &uavs {
+            move_to(&mut b, lk, m.copy, ST_COPY_SOURCE);
+        }
+        unsafe { barriers(l, &b) };
+        for m in &uavs {
+            unsafe { copy_region(l, res, m.at, m.copy, 0, m.len) };
+        }
+    }
+    let fixed = ms.iter().any(|m| m.fixed_read);
+    let mut b = Vec::new();
+    if !fixed && !has_copy_source(cur) {
+        b.push(transition(res, cur, ST_COPY_SOURCE));
+        cur = ST_COPY_SOURCE;
+    }
+    for m in &ms {
+        move_to(&mut b, lk, m.copy, ST_COPY_DEST);
+        if m.uav {
+            move_to(&mut b, lk, m.snap, ST_COPY_DEST);
+        }
+    }
+    unsafe { barriers(l, &b) };
+    for m in &ms {
+        unsafe { copy_region(l, m.copy, 0, res, m.at, m.len) };
+        if m.uav {
+            unsafe { copy_region(l, m.snap, 0, res, m.at, m.len) };
+        }
+    }
+    let mut b = Vec::new();
+    if cur != state && !fixed {
+        b.push(transition(res, cur, state));
+    }
+    for m in &ms {
+        move_to(&mut b, lk, m.copy, if m.uav { ST_UAV } else { ST_ANY_SRV });
+    }
+    unsafe { barriers(l, &b) };
+    merged
+}
+
+pub unsafe fn after_barrier(l: *mut c_void, n: u32, b: *const u8) {
+    if MIRROR_LIVE.load(Ordering::Acquire) == 0 || b.is_null() || n == 0 || SYNCING.with(|c| c.get()) {
+        return;
+    }
+    let ty = unsafe { crate::fill::list_type(l) };
+    if ty != 0 && ty != 2 {
+        return;
+    }
+    let all: Vec<usize> = {
+        let mut v: Vec<usize> = mirrors().iter().map(|m| m.res).collect();
+        v.dedup();
+        v
+    };
+    let raw = unsafe { core::slice::from_raw_parts(b, n as usize * 32) };
+    let t = sync_targets(raw, &|r| all.contains(&r), &all, &crate::gpu_va::state);
+    if t.is_empty() {
+        return;
+    }
+    SYNCING.with(|c| c.set(true));
+    unsafe {
+        let pred: unsafe extern "system" fn(*mut c_void, usize, u64, u32) = core::mem::transmute(real_slot(l, PC_SET_PREDICATION));
+        pred(l, 0, 0, 0);
+        for (r, s) in t {
+            sync_resource(l, r, s);
+        }
+        crate::cl2_state::reapply(l);
+    }
+    SYNCING.with(|c| c.set(false));
+}
+
+unsafe fn slot_for(dev: *mut c_void, ty: u32) -> Option<(usize, usize, usize, u64)> {
+    let mut g = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    for s in g.iter_mut() {
+        if s.dev == dev as usize && s.ty == ty && unsafe { vcall_u64(s.fence, 8) } >= s.value {
+            let a = s.alloc as *mut c_void;
+            let l = s.list as *mut c_void;
+            unsafe {
+                let reset_a: unsafe extern "system" fn(*mut c_void) -> i32 = core::mem::transmute(*vt(a).add(8));
+                let reset_l: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = core::mem::transmute(real_slot(l, PC_RESET));
+                if reset_a(a) < 0 || reset_l(l, a, core::ptr::null_mut()) < 0 {
+                    continue;
+                }
+            }
+            s.value += 1;
+            return Some((s.alloc, s.list, s.fence, s.value));
+        }
+    }
+    let (mut a, mut l, mut f): (*mut c_void, *mut c_void, *mut c_void) = (core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut());
+    unsafe {
+        let ca: unsafe extern "system" fn(*mut c_void, u32, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(*vt(dev).add(9));
+        let cl: unsafe extern "system" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(*vt(dev).add(12));
+        let cf: unsafe extern "system" fn(*mut c_void, u64, u32, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(*vt(dev).add(36));
+        if ca(dev, ty, &IID_ALLOC, &mut a) < 0 || cl(dev, 0, ty, a, core::ptr::null_mut(), &IID_LIST, &mut l) < 0 || cf(dev, 0, 0, &IID_FENCE, &mut f) < 0 {
+            for o in [a, l, f] {
+                if !o.is_null() {
+                    release(o);
+                }
+            }
+            record("d3d12_xs", "placed_offset", &format!("exact-offset copy list for queue type {ty}: allocator/list/fence creation failed"));
+            return None;
+        }
+    }
+    g.push(Slot { dev: dev as usize, ty, alloc: a as usize, list: l as usize, fence: f as usize, value: 1 });
+    Some((a as usize, l as usize, f as usize, 1))
+}
+
+unsafe fn vcall_u64(o: usize, slot: usize) -> u64 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u64 = unsafe { core::mem::transmute(*vt(o as *mut c_void).add(slot)) };
+    unsafe { f(o as *mut c_void) }
+}
+
+unsafe fn boundary(queue: *mut c_void, ty: u32, exec: usize, signal: usize, rec: impl Fn(*mut c_void, &[Mirror]) -> bool) {
+    let ms = mirrors();
+    if ms.is_empty() || exec == 0 || signal == 0 {
+        return;
+    }
+    let mut devs: Vec<usize> = ms.iter().map(|m| m.dev).collect();
+    devs.sort_unstable();
+    devs.dedup();
+    for d in devs {
+        let mine: Vec<Mirror> = ms.iter().filter(|m| m.dev == d).copied().collect();
+        let Some((_, l, f, v)) = (unsafe { slot_for(d as *mut c_void, ty) }) else { continue };
+        let l = l as *mut c_void;
+        let any = rec(l, &mine);
+        unsafe {
+            let close: unsafe extern "system" fn(*mut c_void) -> i32 = core::mem::transmute(real_slot(l, PC_CLOSE));
+            let ok = close(l) >= 0;
+            let ex: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) = core::mem::transmute(exec);
+            let sig: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> i32 = core::mem::transmute(signal);
+            if ok && any {
+                let ls = [l];
+                ex(queue, 1, ls.as_ptr());
+            }
+            sig(queue, f as *mut c_void, v);
+        }
+    }
+}
+
+pub unsafe fn before_submit(queue: *mut c_void, lists: &[*mut c_void], exec: usize, signal: usize) {
+    if MIRROR_LIVE.load(Ordering::Acquire) == 0 || queue.is_null() || lists.is_empty() {
+        return;
+    }
+    forget_lists(lists);
+    let ty = unsafe { crate::fill::list_type(lists[0]) };
+    if ty != 0 && ty != 2 {
+        return;
+    }
+    unsafe {
+        boundary(queue, ty, exec, signal, |l, ms| {
+            for m in ms {
+                copy_region(l, m.copy, 0, m.res, m.at, m.len);
+                if m.uav {
+                    copy_region(l, m.snap, 0, m.res, m.at, m.len);
+                }
+            }
+            !ms.is_empty()
+        })
+    };
+}
+
+pub unsafe fn after_submit(queue: *mut c_void, lists: &[*mut c_void], exec: usize, signal: usize) {
+    if MIRROR_LIVE.load(Ordering::Acquire) == 0 || queue.is_null() || lists.is_empty() {
+        return;
+    }
+    let ty = unsafe { crate::fill::list_type(lists[0]) };
+    if ty != 0 && ty != 2 {
+        return;
+    }
+    unsafe {
+        boundary(queue, ty, exec, signal, |l, ms| {
+            let uavs: Vec<&Mirror> = ms.iter().filter(|m| m.uav).collect();
+            for m in &uavs {
+                match merge_pipeline(m.dev as *mut c_void) {
+                    Some(p) => record_merge(l, m, p),
+                    None => copy_region(l, m.res, m.at, m.copy, 0, m.len),
+                }
+            }
+            !uavs.is_empty()
+        })
+    };
 }
 
 #[cfg(test)]
@@ -846,6 +1425,288 @@ mod tests {
         assert!(dropped && of(fake_res).is_none(), "a failed watch attach drops the offset and the placement");
     }
 
+    pub(crate) fn gpu_free() -> bool {
+        let dir = std::path::Path::new("D:\\TomBox\\tools\\dev");
+        let busy = std::fs::read_dir(dir).map(|it| it.flatten().any(|e| {
+            let n = e.file_name().to_string_lossy().to_ascii_uppercase();
+            n.starts_with("GAME_LOCK") || n.starts_with("USER_PLAYING")
+        })).unwrap_or(false);
+        if busy {
+            println!("GPU test skipped: a GAME_LOCK or USER_PLAYING file exists in {}", dir.display());
+        }
+        !busy
+    }
+
+    #[test]
+    fn mirror_planning_and_barrier_targets() {
+        let off = Off { bytes: 0x2000, width: 0x1000, heap: 0, heap_off: 0, real: 0, flags: 0 };
+        assert_eq!(mirror_span(off, 0, 12, 10), Some((0x2000, 120)));
+        assert_eq!(mirror_span(off, 1, 12, 8), Some((0x200c, 96)));
+        assert_eq!(mirror_span(off, 0, 12, 0x1000), Some((0x2000, 0x1000)), "a view past the title buffer is clamped to it");
+        assert_eq!(mirror_span(off, 0x200, 12, 1), None);
+        assert_eq!(mirror_span(off, 0, 0, 1), None);
+        assert_eq!(merge_words(0x200c, 96), (0x200c, 24));
+        assert_eq!(merge_words(0x2001, 6), (0x2000, 2));
+        assert_eq!(merge_words(0x2003, 1), (0x2000, 1));
+        assert!(has_copy_source(0xac3) && has_copy_source(ST_COPY_SOURCE) && !has_copy_source(ST_UAV) && !has_copy_source(ST_COPY_DEST | ST_COPY_SOURCE));
+        let r = 0x1000usize;
+        let other = 0x2000usize;
+        let mut b = Vec::new();
+        b.extend_from_slice(&transition(r, ST_COPY_DEST, ST_NPS));
+        b.extend_from_slice(&transition(other, ST_COPY_DEST, ST_NPS));
+        let mut begin = transition(r, ST_NPS, ST_UAV);
+        begin[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let mirrored = |x: usize| x == r;
+        let tracked = |_: usize| 0x40u32;
+        assert_eq!(sync_targets(&b, &mirrored, &[r], &tracked), vec![(r, ST_NPS)]);
+        assert_eq!(sync_targets(&begin, &mirrored, &[r], &tracked), vec![], "a begin-only split barrier waits for its end");
+        let mut end = begin;
+        end[4..8].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(sync_targets(&end, &mirrored, &[r], &tracked), vec![(r, ST_UAV)]);
+        assert_eq!(sync_targets(&uav_barrier(r), &mirrored, &[r], &tracked), vec![(r, ST_UAV)]);
+        assert_eq!(sync_targets(&uav_barrier(0), &mirrored, &[r], &tracked), vec![(r, 0x40)], "a null UAV barrier syncs every mirrored buffer at its tracked state");
+        let mut alias = [0u8; 32];
+        alias[0..4].copy_from_slice(&1u32.to_le_bytes());
+        alias[16..24].copy_from_slice(&(r as u64).to_le_bytes());
+        assert_eq!(sync_targets(&alias, &mirrored, &[r], &tracked), vec![(r, 0x40)]);
+    }
+
+    #[test]
+    #[ignore]
+    fn uneven_views_never_start_early_through_exact_copies() {
+        if !gpu_free() {
+            return;
+        }
+        unsafe {
+            let p = crate::host_proc(b"D3D12CreateDevice\0");
+            let mk: extern "system" fn(*mut c_void, u32, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(p);
+            let mut dev: *mut c_void = core::ptr::null_mut();
+            assert!(mk(core::ptr::null_mut(), 0xc000, &IID_DEVICE, &mut dev) >= 0);
+            let r = VirtualAlloc(core::ptr::null_mut(), 0x80_0000, 0x2000, 0x01) as u64;
+            assert!(r != 0);
+            let mut db = buf_desc(0x1000);
+            db[0x30..0x34].copy_from_slice(&4u32.to_le_bytes());
+            let mut b: *mut c_void = core::ptr::null_mut();
+            create(dev, r + 0x2000, &db, 0x1000, 0, core::ptr::null(), &mut b).expect("sub-page placement in the heap's first page");
+            let off = of(b as usize).unwrap();
+            assert_eq!((off.bytes, off.heap_off), (0x2000, 0));
+            let mut sv = [0u8; 0x28];
+            sv[4..8].copy_from_slice(&1u32.to_le_bytes());
+            sv[0x18..0x1c].copy_from_slice(&10u32.to_le_bytes());
+            sv[0x1c..0x20].copy_from_slice(&12u32.to_le_bytes());
+            assert!(exact_view(b as usize, &mut sv.clone(), crate::console_slots_dev2::SRV_BUFFER).is_none(), "no 64 KB step lines up in the heap's first page");
+            let es = mirror_view(b as usize, &mut sv, crate::console_slots_dev2::SRV_BUFFER, false).expect("SRV copy") as usize;
+            assert_eq!(u64::from_le_bytes(sv[0x10..0x18].try_into().unwrap()), 0, "the copy's element 0 is the view's first element");
+            let mut uv = [0u8; 0x28];
+            uv[4..8].copy_from_slice(&1u32.to_le_bytes());
+            uv[8..16].copy_from_slice(&1u64.to_le_bytes());
+            uv[0x10..0x14].copy_from_slice(&8u32.to_le_bytes());
+            uv[0x14..0x18].copy_from_slice(&12u32.to_le_bytes());
+            let eu = mirror_view(b as usize, &mut uv, crate::console_slots_dev2::UAV_BUFFER, true).expect("UAV copy") as usize;
+            assert_eq!(mirror_view(b as usize, &mut sv.clone(), crate::console_slots_dev2::SRV_BUFFER, false), Some(es as *mut c_void), "the same view range shares one copy");
+            let um = mirrors().into_iter().find(|m| m.copy == eu).unwrap();
+            assert_eq!((um.at, um.len, um.uav), (0x200c, 96, true));
+            let qd = [0u32; 4];
+            let (mut q, mut al, mut l, mut fe): (*mut c_void, *mut c_void, *mut c_void, *mut c_void) = (core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut());
+            assert!(vc!(dev, 8, fn(*const u32, *const Guid, *mut *mut c_void) -> i32, qd.as_ptr(), &IID_QUEUE, &mut q) >= 0);
+            assert!(vc!(dev, 9, fn(u32, *const Guid, *mut *mut c_void) -> i32, 0, &IID_ALLOCATOR, &mut al) >= 0);
+            assert!(vc!(dev, 12, fn(u32, u32, *mut c_void, *mut c_void, *const Guid, *mut *mut c_void) -> i32, 0, 0, al, core::ptr::null_mut(), &IID_GFX_LIST, &mut l) >= 0);
+            assert!(vc!(dev, 36, fn(u64, u32, *const Guid, *mut *mut c_void) -> i32, 0, 0, &IID_FENCE, &mut fe) >= 0);
+            vc!(l, 9, fn() -> i32);
+            let committed = |ty: u32, size: u64, state: u32| {
+                let heap: [u32; 5] = [ty, 0, 0, 1, 1];
+                let d = buf_desc(size);
+                let mut x: *mut c_void = core::ptr::null_mut();
+                assert!(vc!(dev, 27, fn(*const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32, heap.as_ptr(), 0, d.as_ptr(), state, core::ptr::null(), &IID_RESOURCE, &mut x) >= 0);
+                x
+            };
+            let up = committed(2, 0x1_0000, 0xac3);
+            let rb = committed(3, 0x1_0000, 0x400);
+            let mut u: *mut u8 = core::ptr::null_mut();
+            assert!(vc!(up, 8, fn(u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut u) >= 0);
+            for i in 0..0x1000usize {
+                *u.add(i) = (i as u8) ^ 0x5a;
+            }
+            core::ptr::write_bytes(u.add(0x4000), 0xe1, 4);
+            core::ptr::write_bytes(u.add(0x4100), 0x77, 4);
+            core::ptr::write_bytes(u.add(0x4200), 0x3c, 0x10);
+            core::ptr::write_bytes(u.add(0x4300), 0x99, 4);
+            let exec = *vt(q).add(10);
+            let signal = *vt(q).add(14);
+            let mut value = 0u64;
+            let mut run = |rec: &dyn Fn(*mut c_void)| {
+                vc!(al, 8, fn() -> i32);
+                vc!(l, 10, fn(*mut c_void, *mut c_void) -> i32, al, core::ptr::null_mut());
+                rec(l);
+                assert!(vc!(l, 9, fn() -> i32) >= 0);
+                let ls = [l];
+                before_submit(q, &ls, exec, signal);
+                vc!(q, 10, fn(u32, *const *mut c_void) -> (), 1, ls.as_ptr());
+                after_submit(q, &ls, exec, signal);
+                value += 1;
+                vc!(q, 14, fn(*mut c_void, u64) -> i32, fe, value);
+                let mut n = 0;
+                while vc!(fe, 8, fn() -> u64) < value {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    n += 1;
+                    assert!(n < 5000);
+                }
+            };
+            let br = b as usize;
+            let bar = |l: *mut c_void, x: &[[u8; 32]]| barriers(l, x);
+            run(&|l| copy_region(l, br, 0x2000, up as usize, 0, 0x1000));
+            run(&|l| {
+                copy_region(l, rb as usize, 0, es, 0, 120);
+                copy_region(l, rb as usize, 0x100, eu, 0, 96);
+            });
+            let mut m: *mut u8 = core::ptr::null_mut();
+            assert!(vc!(rb, 8, fn(u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut m) >= 0);
+            assert!((0..120usize).all(|i| *m.add(i) == (i as u8) ^ 0x5a), "the SRV copy's first element is the buffer byte at +0x2000, not 0x2000 % 12 bytes early");
+            assert!((0..96usize).all(|i| *m.add(0x100 + i) == ((i + 12) as u8) ^ 0x5a), "the UAV copy starts at element 1 exactly");
+            vc!(rb, 9, fn(u32, *const c_void) -> (), 0, core::ptr::null());
+            run(&|l| {
+                copy_region(l, eu, 0, up as usize, 0x4000, 4);
+                copy_region(l, br, 0x2040, up as usize, 0x4100, 4);
+            });
+            run(&|l| copy_region(l, rb as usize, 0, br, 0x2000, 0x1000));
+            assert!(vc!(rb, 8, fn(u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut m) >= 0);
+            assert!((0xc..0x10usize).all(|i| *m.add(i) == 0xe1), "a write through the UAV copy reaches the title bytes at submit end");
+            assert!((0x40..0x44usize).all(|i| *m.add(i) == 0x77), "a write by another path inside the view range is not clobbered by the write-back");
+            assert!((0..0x1000usize).filter(|i| !(0xc..0x10).contains(i) && !(0x40..0x44).contains(i)).all(|i| *m.add(i) == (i as u8) ^ 0x5a), "bytes nobody wrote are unchanged");
+            vc!(rb, 9, fn(u32, *const c_void) -> (), 0, core::ptr::null());
+            run(&|l| {
+                copy_region(l, br, 0x2000, up as usize, 0x4200, 0x10);
+                let t = [transition(br, ST_COPY_DEST, ST_NPS)];
+                bar(l, &t);
+                after_barrier(l, 1, t.as_ptr() as *const u8);
+                bar(l, &[transition(es, ST_ANY_SRV, ST_COPY_SOURCE)]);
+                copy_region(l, rb as usize, 0, es, 0, 0x10);
+                bar(l, &[transition(es, ST_COPY_SOURCE, ST_ANY_SRV), transition(eu, ST_UAV, ST_COPY_DEST), transition(br, ST_NPS, ST_UAV)]);
+                copy_region(l, eu, 0x20, up as usize, 0x4300, 4);
+                bar(l, &[transition(eu, ST_COPY_DEST, ST_UAV)]);
+                let w = [uav_barrier(br)];
+                bar(l, &w);
+                after_barrier(l, 1, w.as_ptr() as *const u8);
+                bar(l, &[transition(br, ST_UAV, ST_COPY_SOURCE)]);
+                copy_region(l, rb as usize, 0x100, br, 0x2000, 0x100);
+            });
+            assert!(vc!(rb, 8, fn(u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut m) >= 0);
+            assert!((0..0x10usize).all(|i| *m.add(i) == 0x3c), "a barrier after a title write refreshes the SRV copy inside the same list");
+            assert!((0x12c..0x130usize).all(|i| *m.add(i) == 0x99), "a barrier after a UAV-copy write merges it into the title bytes inside the same list");
+            assert!((0x110..0x12cusize).chain(0x130..0x200).all(|i| *m.add(i) == if (0x140..0x144).contains(&i) { 0x77 } else { ((i - 0x100) as u8) ^ 0x5a }), "neighbouring bytes keep their values");
+            vc!(rb, 9, fn(u32, *const c_void) -> (), 0, core::ptr::null());
+            vc!(b, 2, fn() -> u32);
+            assert!(mirrors().iter().all(|m| m.res != br), "copies go with their buffer");
+            for x in [rb, up, l, al, fe, q] {
+                vc!(x, 2, fn() -> u32);
+            }
+            VirtualFree(r as *mut c_void, 0, 0x8000);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn msaa_off_a_4mb_step_shares_heap_tiles_with_same_va_placements() {
+        if !gpu_free() {
+            return;
+        }
+        unsafe {
+            let p = crate::host_proc(b"D3D12CreateDevice\0");
+            let mk: extern "system" fn(*mut c_void, u32, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(p);
+            let mut dev: *mut c_void = core::ptr::null_mut();
+            assert!(mk(core::ptr::null_mut(), 0xc000, &IID_DEVICE, &mut dev) >= 0);
+            let r = VirtualAlloc(core::ptr::null_mut(), 0x100_0000, 0x2000, 0x01) as u64;
+            assert!(r != 0);
+            let md = tex_desc(4);
+            let mut info = [0u64; 2];
+            vc!(dev, 25, fn(*mut u64, u32, u32, *const u8) -> *mut u64, info.as_mut_ptr(), 0, 1, md.as_ptr());
+            let mut big: *mut c_void = core::ptr::null_mut();
+            let mb = crate::alias::create_placed_x(dev, r + 0x80_0000, &tex_desc(1), 0x40_0000, 0, core::ptr::null(), &mut big).expect("texture that opens the shared heap");
+            let (mut a, mut b): (*mut c_void, *mut c_void) = (core::ptr::null_mut(), core::ptr::null_mut());
+            let ma = crate::alias::create_placed_x(dev, r + 0x51_0000, &md, info[0], 4, core::ptr::null(), &mut a).expect("MSAA 0x110000 bytes past a 4 MB step");
+            let mb2 = crate::alias::create_placed_x(dev, r + 0x51_0000, &md, info[0], 4, core::ptr::null(), &mut b).expect("second MSAA at the same title VA");
+            assert_eq!((ma.heap, ma.offset), (mb2.heap, mb2.offset));
+            assert_eq!(ma.heap, mb.heap, "the MSAA lands in the heap the title's other placements use");
+            assert_eq!(ma.offset + 0x80_0000, mb.offset + 0x51_0000);
+            assert!(info[1] < crate::msaa_place::MSAA_ALIGN || crate::msaa_place::needs_tiles(4, ma.offset, info[1], crate::msaa_place::capable(ma.heap)));
+            let qd = [0u32; 4];
+            let (mut q, mut al, mut l, mut fe, mut dh): (*mut c_void, *mut c_void, *mut c_void, *mut c_void, *mut c_void) = (core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut());
+            assert!(vc!(dev, 8, fn(*const u32, *const Guid, *mut *mut c_void) -> i32, qd.as_ptr(), &IID_QUEUE, &mut q) >= 0);
+            assert!(vc!(dev, 9, fn(u32, *const Guid, *mut *mut c_void) -> i32, 0, &IID_ALLOCATOR, &mut al) >= 0);
+            assert!(vc!(dev, 12, fn(u32, u32, *mut c_void, *mut c_void, *const Guid, *mut *mut c_void) -> i32, 0, 0, al, core::ptr::null_mut(), &IID_GFX_LIST, &mut l) >= 0);
+            assert!(vc!(dev, 36, fn(u64, u32, *const Guid, *mut *mut c_void) -> i32, 0, 0, &IID_FENCE, &mut fe) >= 0);
+            const IID_DESC_HEAP: Guid = Guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+            let hd = [2u32, 1, 0, 0];
+            assert!(vc!(dev, 14, fn(*const u32, *const Guid, *mut *mut c_void) -> i32, hd.as_ptr(), &IID_DESC_HEAP, &mut dh) >= 0);
+            let mut cpu = 0usize;
+            vc!(dh, 9, fn(*mut usize) -> *mut usize, &mut cpu);
+            vc!(dev, 20, fn(*mut c_void, *const c_void, usize) -> (), a, core::ptr::null(), cpu);
+            let heap: [u32; 5] = [1, 0, 0, 1, 1];
+            let single = tex_desc(1);
+            let mut one: *mut c_void = core::ptr::null_mut();
+            assert!(vc!(dev, 27, fn(*const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32, heap.as_ptr(), 0, single.as_ptr(), 0x1000, core::ptr::null(), &IID_RESOURCE, &mut one) >= 0);
+            let rbh: [u32; 5] = [3, 0, 0, 1, 1];
+            let rbd = buf_desc(256 * 256 * 4);
+            let mut rb: *mut c_void = core::ptr::null_mut();
+            assert!(vc!(dev, 27, fn(*const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32, rbh.as_ptr(), 0, rbd.as_ptr(), 0x400, core::ptr::null(), &IID_RESOURCE, &mut rb) >= 0);
+            vc!(l, 9, fn() -> i32);
+            vc!(al, 8, fn() -> i32);
+            vc!(l, 10, fn(*mut c_void, *mut c_void) -> i32, al, core::ptr::null_mut());
+            let colour = [0.25f32, 0.5, 0.75, 1.0];
+            vc!(l, 48, fn(usize, *const f32, u32, *const c_void) -> (), cpu, colour.as_ptr(), 0, core::ptr::null());
+            let mut ab = [0u8; 32];
+            ab[0..4].copy_from_slice(&1u32.to_le_bytes());
+            ab[8..16].copy_from_slice(&(a as u64).to_le_bytes());
+            ab[16..24].copy_from_slice(&(b as u64).to_le_bytes());
+            let bt = |res: *mut c_void, before: u32, after: u32| {
+                let mut x = [0u8; 32];
+                x[8..16].copy_from_slice(&(res as u64).to_le_bytes());
+                x[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+                x[20..24].copy_from_slice(&before.to_le_bytes());
+                x[24..28].copy_from_slice(&after.to_le_bytes());
+                x
+            };
+            let set = [ab, bt(b, 4, 0x2000)];
+            vc!(l, 26, fn(u32, *const u8) -> (), 2, set.as_ptr() as *const u8);
+            vc!(l, 19, fn(*mut c_void, u32, *mut c_void, u32, u32) -> (), one, 0, b, 0, 28);
+            let t = [bt(one, 0x1000, 0x800)];
+            vc!(l, 26, fn(u32, *const u8) -> (), 1, t.as_ptr() as *const u8);
+            let mut dst = [0u8; LOCATION];
+            dst[0..8].copy_from_slice(&(rb as u64).to_le_bytes());
+            dst[8..12].copy_from_slice(&1u32.to_le_bytes());
+            dst[0x18..0x1c].copy_from_slice(&28u32.to_le_bytes());
+            dst[0x1c..0x20].copy_from_slice(&256u32.to_le_bytes());
+            dst[0x20..0x24].copy_from_slice(&256u32.to_le_bytes());
+            dst[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            dst[0x28..0x2c].copy_from_slice(&1024u32.to_le_bytes());
+            let mut src = [0u8; LOCATION];
+            src[0..8].copy_from_slice(&(one as u64).to_le_bytes());
+            vc!(l, 16, fn(*const u8, u32, u32, u32, *const u8, *const c_void) -> (), dst.as_ptr(), 0, 0, 0, src.as_ptr(), core::ptr::null());
+            assert!(vc!(l, 9, fn() -> i32) >= 0);
+            let ls = [l];
+            vc!(q, 10, fn(u32, *const *mut c_void) -> (), 1, ls.as_ptr());
+            vc!(q, 14, fn(*mut c_void, u64) -> i32, fe, 1);
+            let mut n = 0;
+            while vc!(fe, 8, fn() -> u64) < 1 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                n += 1;
+                assert!(n < 5000);
+            }
+            let mut m: *mut u8 = core::ptr::null_mut();
+            assert!(vc!(rb, 8, fn(u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut m) >= 0);
+            let px = core::slice::from_raw_parts(m, 256 * 256 * 4);
+            let want = [64u8, 128, 191, 255];
+            let close = |p: &[u8]| p.iter().zip(want).all(|(x, y)| (*x as i32 - y as i32).abs() <= 1);
+            assert!(close(&px[0..4]) && close(&px[px.len() - 4..]), "a clear through one MSAA placement is what the other same-VA placement resolves: {:?}", &px[0..4]);
+            vc!(rb, 9, fn(u32, *const c_void) -> (), 0, core::ptr::null());
+            for x in [rb, one, dh, a, b, big, l, al, fe, q] {
+                vc!(x, 2, fn() -> u32);
+            }
+            VirtualFree(r as *mut c_void, 0, 0x8000);
+            vc!(dev, 2, fn() -> u32);
+        }
+    }
+
     fn tex_desc(samples: u32) -> [u8; 0x38] {
         let mut d = [0u8; 0x38];
         d[0..4].copy_from_slice(&3u32.to_le_bytes());
@@ -917,7 +1778,11 @@ mod tests {
             vc!(t3, 2, fn() -> u32);
             let mut t4: *mut c_void = core::ptr::null_mut();
             let same = crate::alias::create_placed_x(dev, r + 0x31_0000, &md, info[0], 4, core::ptr::null(), &mut t4);
-            if info[1] >= crate::msaa_place::MSAA_ALIGN {
+            if crate::msaa_place::tiles_usable() {
+                let same = same.expect("MSAA tiles share the title heap");
+                assert_eq!((same.kind, same.heap, same.offset), (crate::alias::Kind::Local, m1.heap, 0x31_0000));
+                vc!(t4, 2, fn() -> u32);
+            } else if info[1] >= crate::msaa_place::MSAA_ALIGN {
                 assert!(same.is_none(), "MSAA that fits its title layout but sits off a 4 MB step of the shared heap falls back to a committed resource");
             } else {
                 assert!(same.is_some(), "this adapter places MSAA at {:#x}, so any 64 KB step works", info[1]);

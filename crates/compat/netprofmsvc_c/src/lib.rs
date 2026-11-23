@@ -3,6 +3,16 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 pub mod aggregate;
 pub mod failure;
+#[cfg(any(test, feature = "service"))]
+pub mod iphlp;
+#[cfg(any(test, feature = "service"))]
+pub mod probes;
+#[cfg(any(test, feature = "service"))]
+pub mod webprobe;
+#[cfg(any(test, feature = "service"))]
+pub mod join;
+#[cfg(any(test, feature = "service"))]
+pub mod connectivity;
 pub mod tlg;
 
 pub use failure::{result_logging_callback, FailureInfo};
@@ -76,6 +86,16 @@ pub unsafe fn report_failure(info: &FailureInfo) {
         let f: unsafe extern "system" fn(*const FailureInfo, *mut u16, usize) = core::mem::transmute(cb);
         f(info, core::ptr::null_mut(), 0);
     }
+}
+
+#[cfg(feature = "service")]
+#[used]
+#[link_section = ".CRT$XCT"]
+pub static SERVICE_EARLY_OPT_OUT: extern "C" fn() = service_early_opt_out;
+
+#[cfg(feature = "service")]
+extern "C" fn service_early_opt_out() {
+    compat_common::gdk::EARLY_INIT_OPT_OUT.store(true, Ordering::SeqCst);
 }
 
 #[cfg(test)]

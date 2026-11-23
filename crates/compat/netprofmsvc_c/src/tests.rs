@@ -277,3 +277,139 @@ fn aggregate_create_destroy_closes_its_timer() {
         aggregate::destroy(a);
     }
 }
+
+#[test]
+fn physical_interface_probe_flow_finds_nothing_offline_and_the_nic_on_link() {
+    use compat_common::netview::{self, iphlp as model};
+    let _g = sandbox();
+    let [p4, p6] = probes::probe_addresses().unwrap();
+    let root4 = probes::as_sort_entry(&p4);
+    let root6 = probes::as_sort_entry(&p6);
+    assert_eq!(&root4[20..24], &[192, 228, 79, 201]);
+    unsafe {
+        let sorted = iphlp::sorted_probes(&[root6, root4]).unwrap();
+        assert_eq!(sorted, vec![root6, root4]);
+        assert_eq!(iphlp::physical_interface_for_probes(&[root4, root6]), None);
+        let link = probes::as_sort_entry(&probes::probe_from_text("169.254.1.2").unwrap());
+        let nic = netview::adapters().into_iter().find(|a| a.if_index == netview::NIC_IF_INDEX).unwrap();
+        assert_eq!(iphlp::physical_interface_for_probes(&[root4, link]), Some(model::interface_guid(&nic)));
+        let mut luid = 0u64;
+        assert_eq!(iphlp::convert_interface_guid_to_luid(&model::interface_guid(&nic), &mut luid), 0);
+        let mut idx = 0u32;
+        assert_eq!(iphlp::convert_interface_luid_to_index(&luid, &mut idx), 0);
+        assert_eq!(idx, netview::NIC_IF_INDEX);
+        let mut t: *mut u8 = core::ptr::null_mut();
+        assert_eq!(iphlp::get_if_table2(&mut t), 0);
+        assert_eq!(core::ptr::read_unaligned(t as *const u32), 2);
+        iphlp::free_mib_table(t as *mut c_void);
+    }
+}
+
+#[test]
+fn interface_settings_write_both_ip_modules_like_the_event_manager() {
+    use compat_common::netview::{self, iphlp as model};
+    model::nsi_reset();
+    unsafe {
+        assert_eq!(iphlp::apply_interface_settings(netview::NIC_LUID, 1, 1, [3u8; 16]), [0, 0]);
+        assert_eq!(iphlp::apply_interface_settings(0x99, 1, 1, [3u8; 16]), [netview::ERROR_NOT_FOUND, netview::ERROR_NOT_FOUND]);
+    }
+    for m in [model::NPI_MS_IPV4_MODULEID, model::NPI_MS_IPV6_MODULEID] {
+        let rw = model::nsi_interface_rw(&m, netview::NIC_LUID).unwrap();
+        assert_eq!(u32::from_le_bytes(rw[0x10..0x14].try_into().unwrap()), 1);
+        assert_eq!(&rw[0xc0..0xd0], &[3u8; 16]);
+        assert_eq!(&rw[0x14..0x18], &[0xff; 4]);
+    }
+    model::nsi_reset();
+}
+
+fn sandbox() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let d = std::env::temp_dir().join(format!("tombox-netprof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::env::set_var("TOMBOX_GDK_ROOT", &d);
+    });
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[test]
+fn probe_values_live_in_the_console_network_list_key() {
+    let mut seen = 0;
+    for p in ["Fortnite", "XDefiant"] {
+        let path = std::path::PathBuf::from(format!(r"D:\xbox-pc-port\games\{p}\extracted\EmbeddedXvd\Windows\System32\config\SOFTWARE"));
+        let Some(h) = console_sandbox::hive::Hive::open(&path) else { continue };
+        let k = h.key(h.find(probes::NETWORK_LIST_SUBTREE).unwrap()).unwrap();
+        let text = |name: &str| {
+            let v = k.values.iter().find(|v| v.name.eq_ignore_ascii_case(name)).unwrap();
+            assert_eq!(v.kind, 1);
+            let w: Vec<u16> = v.data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|c| *c != 0).collect();
+            String::from_utf16_lossy(&w)
+        };
+        assert_eq!(text(""), "192.228.79.201", "{p}");
+        assert_eq!(text(probes::ROOT_DNS_IPV6_VALUE), "2001:478:65::53", "{p}");
+        seen += 1;
+    }
+    assert!(seen > 0);
+}
+
+#[test]
+fn probe_reader_matches_the_console_sockaddr_layout() {
+    let _g = sandbox();
+    let [v4, v6] = probes::probe_addresses().unwrap();
+    assert_eq!(u16::from_le_bytes([v4[0], v4[1]]), 2);
+    assert_eq!(&v4[2..4], &[0, 0]);
+    assert_eq!(&v4[4..8], &[192, 228, 79, 201]);
+    assert!(v4[8..].iter().all(|b| *b == 0));
+    assert_eq!(u16::from_le_bytes([v6[0], v6[1]]), 0x17);
+    assert_eq!(&v6[8..24], &"2001:478:65::53".parse::<std::net::Ipv6Addr>().unwrap().octets());
+    assert!(v6[0x1c..].iter().all(|b| *b == 0));
+    let p = probes::probe_from_text("[fe80::1%7]:53").unwrap();
+    assert_eq!((&p[2..4], u32::from_le_bytes(p[0x18..0x1c].try_into().unwrap())), (&53u16.to_be_bytes()[..], 7));
+    assert_eq!(&probes::probe_from_text("10.1.2.3:80").unwrap()[2..8], &[0, 80, 10, 1, 2, 3]);
+    assert_eq!(probes::probe_from_text("1.2.3"), Err(probes::HR_NT_INVALID_PARAMETER));
+    assert_eq!(probes::read_probe("NoSuchProbeValue"), Err(probes::HR_FILE_NOT_FOUND));
+    let e = probes::as_sort_entry(&v4);
+    assert_eq!(u16::from_le_bytes([e[0], e[1]]), 0x17);
+    assert_eq!(&e[18..24], &[0xff, 0xff, 192, 228, 79, 201]);
+    assert_eq!(probes::as_sort_entry(&v6)[..], v6[..28]);
+}
+
+#[test]
+fn paired_web_probe_reports_no_internet_offline_without_sockets() {
+    let req = webprobe::Request { host: "www.msftconnecttest.com".into(), port: 80, path: "connecttest.txt".into() };
+    let o = webprobe::run_offline(&req, 3);
+    assert_eq!(o.events[0], webprobe::Event::RequestError(webprobe::AsyncResult { api: webprobe::API_SEND_REQUEST, error: webprobe::ERROR_WINHTTP_NAME_NOT_RESOLVED }));
+    assert_eq!(o.events.iter().filter(|e| **e == webprobe::Event::HandleClosing).count(), 3);
+    assert_eq!(o.hr, 0x8007_2ee7u32 as i32);
+    assert!(o.body.is_empty());
+    assert!(!webprobe::has_internet(&o));
+    let lo = webprobe::run_offline(&webprobe::Request { host: "127.0.0.1".into(), port: 80, path: "/".into() }, 0);
+    assert_eq!(lo.hr, webprobe::hresult_from_win32(12029));
+    assert!(!webprobe::has_internet(&lo));
+}
+
+#[link(name = "netapi32")]
+extern "system" {
+    fn NetApiBufferFree(p: *mut c_void) -> u32;
+}
+
+#[test]
+fn join_information_is_an_unjoined_workgroup() {
+    unsafe {
+        let mut name: *mut u16 = core::ptr::null_mut();
+        let mut status = 0u32;
+        assert_eq!(join::net_get_join_information(core::ptr::null(), &mut name, &mut status), join::NERR_SUCCESS);
+        assert_eq!(status, join::NET_SETUP_WORKGROUP_NAME);
+        assert!(!join::reads_domain_policy(status));
+        let s: Vec<u16> = (0..).map(|i| *name.add(i)).take_while(|c| *c != 0).collect();
+        assert_eq!(String::from_utf16_lossy(&s), join::WORKGROUP);
+        assert_eq!(NetApiBufferFree(name as *mut c_void), 0);
+        let srv: Vec<u16> = "OTHER\0".encode_utf16().collect();
+        assert_eq!(join::net_get_join_information(srv.as_ptr(), &mut name, &mut status), join::ERROR_NOT_SUPPORTED);
+        assert_eq!(join::net_get_join_information(core::ptr::null(), core::ptr::null_mut(), &mut status), join::ERROR_INVALID_PARAMETER);
+    }
+}
+
+#[path = "tests_service.rs"]
+mod service;

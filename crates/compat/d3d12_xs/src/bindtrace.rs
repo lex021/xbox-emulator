@@ -116,7 +116,22 @@ pub fn note_desc_after(dest: usize, heap_type: u32, d: Desc) {
     }
 }
 
+pub fn all_views() -> Vec<(usize, bool)> {
+    with(|s| {
+        s.descs.values().filter_map(|e| match &e.d {
+            Desc::Srv { res, .. } if *res != 0 => Some((*res, false)),
+            Desc::Uav { res, .. } if *res != 0 => Some((*res, true)),
+            _ => None,
+        }).collect()
+    })
+}
+
 pub fn note_desc(dest: usize, d: Desc) {
+    match &d {
+        Desc::Srv { res, .. } => crate::firstuse::note(*res, crate::firstuse::SRV),
+        Desc::Uav { res, .. } => crate::firstuse::note(*res, crate::firstuse::UAV),
+        _ => {}
+    }
     with(|s| {
         let frame = s.frame;
         s.descs.insert(dest, Entry { d, frame });
@@ -211,7 +226,33 @@ pub unsafe fn read_upload(base: u64) -> Option<Vec<u8>> {
     Some(core::slice::from_raw_parts(mapped as *const u8, size as usize).to_vec())
 }
 
+pub unsafe fn read_va(va: u64, n: usize) -> Option<Vec<u8>> {
+    let (base, _, size, heap_type) = buffer_at(va)?;
+    if heap_type != 2 {
+        return None;
+    }
+    let mut mapped = with(|s| s.buffers.get(&base).map(|b| b.mapped))?;
+    if mapped == 0 {
+        read_upload(base).map(|_| ())?;
+        mapped = with(|s| s.buffers.get(&base).map(|b| b.mapped))?;
+    }
+    if mapped == 0 {
+        return None;
+    }
+    let off = (va - base) as usize;
+    let n = n.min((size as usize).saturating_sub(off));
+    Some(core::slice::from_raw_parts((mapped + off) as *const u8, n).to_vec())
+}
+
+pub fn note_heap_inc(cpu: usize, gpu: u64, count: u32, inc: usize) {
+    with(|s| {
+        s.heaps.retain(|h| h.cpu != cpu);
+        s.heaps.push(Heap { cpu, gpu, count: count as usize, inc });
+    });
+}
+
 pub fn set_table(list: usize, compute: bool, index: u32, handle: u64) {
+    let handle = crate::title_heap::locate(handle).map_or(handle, |t| t.2);
     with(|s| {
         let v = s.tables.entry((list, compute)).or_default();
         if (index as usize) < 64 {
@@ -357,6 +398,100 @@ fn fmt_words(bytes: &[u8]) -> String {
 }
 
 /// Text describing every table bound on `list` (graphics or compute).
+pub fn table_srv(list: usize, compute: bool, param: u32, slot: u32) -> Option<(usize, u32, u32)> {
+    with(|s| {
+        let h = *s.tables.get(&(list, compute))?.get(param as usize)?;
+        if h == 0 {
+            return None;
+        }
+        let heap = s.heaps.iter().find(|x| x.gpu != 0 && x.inc != 0 && h >= x.gpu && h < x.gpu + (x.count * x.inc) as u64)?;
+        let idx = (h - heap.gpu) as usize / heap.inc + slot as usize;
+        if idx >= heap.count {
+            return None;
+        }
+        let cpu = heap.cpu + idx * heap.inc;
+        let d = match s.descs.get(&cpu) {
+            Some(e) => e.d.clone(),
+            None => unsafe { desc_bytes(cpu, heap.inc) }.and_then(|b| s.by_bytes.get(&b).cloned())?,
+        };
+        match d {
+            Desc::Srv { res, desc } => {
+                let u = |o: usize| desc.map(|d| u32::from_le_bytes(d[o..o + 4].try_into().unwrap())).unwrap_or(0);
+                Some((res, u(4), u(8)))
+            }
+            _ => None,
+        }
+    })
+}
+
+pub fn table_srv_fmt(list: usize, compute: bool, param: u32, slot: u32) -> Option<(usize, u32, u32, u32)> {
+    with(|s| {
+        let h = *s.tables.get(&(list, compute))?.get(param as usize)?;
+        if h == 0 {
+            return None;
+        }
+        let heap = s.heaps.iter().find(|x| x.gpu != 0 && x.inc != 0 && h >= x.gpu && h < x.gpu + (x.count * x.inc) as u64)?;
+        let idx = (h - heap.gpu) as usize / heap.inc + slot as usize;
+        if idx >= heap.count {
+            return None;
+        }
+        let cpu = heap.cpu + idx * heap.inc;
+        let d = match s.descs.get(&cpu) {
+            Some(e) => e.d.clone(),
+            None => unsafe { desc_bytes(cpu, heap.inc) }.and_then(|b| s.by_bytes.get(&b).cloned())?,
+        };
+        match d {
+            Desc::Srv { res, desc } => {
+                let u = |o: usize| desc.map(|d| u32::from_le_bytes(d[o..o + 4].try_into().unwrap())).unwrap_or(0);
+                Some((res, u(0), u(4), u(8)))
+            }
+            _ => None,
+        }
+    })
+}
+
+pub fn table_uav(list: usize, compute: bool, param: u32, slot: u32) -> Option<(usize, Option<[u8; 40]>)> {
+    with(|s| {
+        let h = *s.tables.get(&(list, compute))?.get(param as usize)?;
+        if h == 0 {
+            return None;
+        }
+        let heap = s.heaps.iter().find(|x| x.gpu != 0 && x.inc != 0 && h >= x.gpu && h < x.gpu + (x.count * x.inc) as u64)?;
+        let idx = (h - heap.gpu) as usize / heap.inc + slot as usize;
+        if idx >= heap.count {
+            return None;
+        }
+        let cpu = heap.cpu + idx * heap.inc;
+        let d = match s.descs.get(&cpu) {
+            Some(e) => e.d.clone(),
+            None => unsafe { desc_bytes(cpu, heap.inc) }.and_then(|b| s.by_bytes.get(&b).cloned())?,
+        };
+        match d {
+            Desc::Uav { res, desc } => Some((res, desc)),
+            _ => None,
+        }
+    })
+}
+
+pub fn uav_view_text(desc: Option<[u8; 40]>) -> String {
+    let Some(d) = desc else { return "default view (null desc)".to_string() };
+    let u = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+    let (fmt, dim) = (u(0), u(4));
+    match dim {
+        4 => format!("fmt={fmt} Texture2D MipSlice={} PlaneSlice={}", u(8), u(12)),
+        5 => format!("fmt={fmt} Texture2DArray MipSlice={} First={} Size={} PlaneSlice={}", u(8), u(12), u(16), u(20)),
+        3 => format!("fmt={fmt} Texture1DArray MipSlice={} First={} Size={}", u(8), u(12), u(16)),
+        2 => format!("fmt={fmt} Texture1D MipSlice={}", u(8)),
+        8 => format!("fmt={fmt} Texture3D MipSlice={} FirstW={} WSize={}", u(8), u(12), u(16)),
+        1 => format!("fmt={fmt} Buffer first={} n={} stride={}", u64::from_le_bytes(d[8..16].try_into().unwrap()), u(16), u(20)),
+        _ => format!("fmt={fmt} ViewDimension={dim}"),
+    }
+}
+
+pub fn table_count(list: usize, compute: bool) -> usize {
+    with(|s| s.tables.get(&(list, compute)).map_or(0, |t| t.len()))
+}
+
 pub unsafe fn dump(list: usize, compute: bool, name: &dyn Fn(usize) -> String) -> String {
     // Collect under the lock, read memory after it (Map may take driver locks).
     struct Item {
@@ -365,6 +500,7 @@ pub unsafe fn dump(list: usize, compute: bool, name: &dyn Fn(usize) -> String) -
         /// None: no record written this frame (`age` frames old, or never recorded).
         d: Option<Desc>,
         age: u32,
+        why: String,
     }
     let (items, frame) = with(|s| {
         let mut items = Vec::new();
@@ -375,6 +511,10 @@ pub unsafe fn dump(list: usize, compute: bool, name: &dyn Fn(usize) -> String) -
             }
             let Some(heap) = s.heaps.iter().find(|x| x.gpu != 0 && x.inc != 0 && h >= x.gpu && h < x.gpu + (x.count * x.inc) as u64) else { continue };
             let first = (h - heap.gpu) as usize / heap.inc;
+            let hlo = heap.cpu;
+            let hhi = heap.cpu + heap.count * heap.inc;
+            let in_heap = s.descs.keys().filter(|&&k| k >= hlo && k < hhi).count();
+            let mut why_once = true;
             // A table ends where the next table bound on this list begins (the title
             // allocates them back to back), or after 64 slots.
             let next = tables.iter().filter(|&&o| o > h && o < heap.gpu + (heap.count * heap.inc) as u64).min().copied();
@@ -384,13 +524,27 @@ pub unsafe fn dump(list: usize, compute: bool, name: &dyn Fn(usize) -> String) -
                     break;
                 }
                 match s.descs.get(&(heap.cpu + (first + slot) * heap.inc)) {
-                    Some(e) if s.frame.wrapping_sub(e.frame) <= 1 => items.push(Item { param, slot, d: Some(e.d.clone()), age: 0 }),
-                    Some(e) => items.push(Item { param, slot, d: Some(e.d.clone()), age: s.frame.wrapping_sub(e.frame) }),
+                    Some(e) if s.frame.wrapping_sub(e.frame) <= 1 => items.push(Item { param, slot, d: Some(e.d.clone()), age: 0, why: String::new() }),
+                    Some(e) => items.push(Item { param, slot, d: Some(e.d.clone()), age: s.frame.wrapping_sub(e.frame), why: String::new() }),
                     None => {
-                        let found = unsafe { desc_bytes(heap.cpu + (first + slot) * heap.inc, heap.inc) }.and_then(|b| s.by_bytes.get(&b).cloned());
+                        let addr = heap.cpu + (first + slot) * heap.inc;
+                        let raw = unsafe { desc_bytes(addr, heap.inc) };
+                        let found = raw.as_ref().and_then(|b| s.by_bytes.get(b).cloned());
                         match found {
-                            Some(d) => items.push(Item { param, slot, d: Some(d), age: 0 }),
-                            None => items.push(Item { param, slot, d: None, age: u32::MAX }),
+                            Some(d) => items.push(Item { param, slot, d: Some(d), age: 0, why: String::new() }),
+                            None => {
+                                let why = if why_once {
+                                    why_once = false;
+                                    let bytes = match &raw {
+                                        Some(v) => format!("bytes {} not among {} recorded byte patterns", v.iter().take(16).map(|x| format!("{x:02x}")).collect::<String>(), s.by_bytes.len()),
+                                        None => "bytes unreadable or all zero".to_string(),
+                                    };
+                                    format!(" [table gpu {h:#x} -> heap cpu {:#x} gpu {:#x} inc {} count {}; slot cpu {addr:#x}; {in_heap} of {} recorded descriptors lie in this heap; {bytes}]", heap.cpu, heap.gpu, heap.inc, heap.count, s.descs.len())
+                                } else {
+                                    String::new()
+                                };
+                                items.push(Item { param, slot, d: None, age: u32::MAX, why })
+                            }
                         }
                     }
                 }
@@ -403,8 +557,8 @@ pub unsafe fn dump(list: usize, compute: bool, name: &dyn Fn(usize) -> String) -
     for it in items {
         let Some(d) = it.d.clone() else {
             if it.age == u32::MAX {
-                out.push_str(&format!("    param[{}]+{} (no descriptor recorded)
-", it.param, it.slot));
+                out.push_str(&format!("    param[{}]+{} (no descriptor recorded){}
+", it.param, it.slot, it.why));
             }
             continue;
         };
@@ -452,7 +606,18 @@ pub unsafe fn dump(list: usize, compute: bool, name: &dyn Fn(usize) -> String) -
                     }
                 };
                 let aged = if it.age > 1 { format!(" (written {} frames ago)", it.age) } else { String::new() };
-                out.push_str(&format!("    param[{}]+{} {kind} {what} | {view}{aged}\n", it.param, it.slot));
+                let st = crate::rtcap::state_of(res).or_else(|| Some(crate::gpu_va::state(res)).filter(|&x| x != 0)).map(|x| format!(" state={x:#x}")).unwrap_or_default();
+                let loc = if res == 0 {
+                    String::new()
+                } else if let Some(p) = crate::placed::lookup(res as *mut c_void) {
+                    format!(" placed title va={:#x} {}x{} dim={}", p.va, p.width(), p.height(), p.dim())
+                } else if let Some(v) = crate::gpu_va::texture_va(res) {
+                    format!(" texture va={v:#x}")
+                } else {
+                    " not placed".to_string()
+                };
+                let fu = if res == 0 { String::new() } else { crate::firstuse::describe(res) };
+                out.push_str(&format!("    param[{}]+{} {kind} {what} | {view}{aged}{st}{loc}{fu}\n", it.param, it.slot));
             }
             Desc::Sampler { desc } => {
                 let u = |o: usize| u32::from_le_bytes(desc[o..o + 4].try_into().unwrap());

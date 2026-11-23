@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use tombox_xshader::uearchive::{find_archives, lz4_block};
-use tombox_xshader::{dxc, extract, hlsl, runtime_hlsl, Stage};
+use tombox_xshader::{dxc, extract, runtime_hlsl, Stage};
 
 fn fnv1a(b: &[u8]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -215,8 +215,9 @@ fn main() -> ExitCode {
                 let r = std::panic::catch_unwind(|| {
                     let ex = extract(blob).map_err(|e| ("?".to_string(), format!("extract: {e}")))?;
                     let st = stage_name(&ex.stage).to_string();
-                    let t = hlsl::translate(&ex).map_err(|e| (st.clone(), format!("translate: {}", e.lines().next().unwrap_or(""))))?;
-                    let src = runtime_hlsl::finalize(&t.hlsl, rt, loop_grad);
+                    let mode = tombox_xshader::pack_key::Mode { cbv_raw: tombox_xshader::pack_key::CbvRaw::Off, loop_grad, fma };
+                    let t = tombox_xshader::pack_key::translate(&ex, None, mode.cbv_raw).map_err(|e| (st.clone(), e.lines().next().unwrap_or("").to_string()))?;
+                    let src = tombox_xshader::pack_key::finalize(&t.hlsl, rt, &mode);
                     let profile = dxc::profile_for(t.profile);
                     if let Some((from, to)) = &bench {
                         let src = src.replacen(from.as_str(), to, 1);
@@ -224,13 +225,13 @@ fn main() -> ExitCode {
                         dxc::compile(&src, &profile).map_err(|e| (st.clone(), e))?;
                         return Ok((st, t0.elapsed().as_millis(), true, src.lines().count()));
                     }
-                    if tombox_xshader::shader_cache::contains(tombox_xshader::shader_cache::key(&src, &profile, fma, "")) {
+                    if tombox_xshader::shader_cache::contains(tombox_xshader::pack_key::key(&src, &profile, &mode, &[])) {
                         return Ok((st, 0u128, false, src.lines().count()));
                     }
                     if dry {
                         return Ok((st, 0u128, true, src.lines().count()));
                     }
-                    let c = tombox_xshader::shader_cache::compile_cached(&src, &profile, fma, &[]).map_err(|e| (st.clone(), e))?;
+                    let c = tombox_xshader::shader_cache::compile_cached_with(&src, &profile, fma, &tombox_xshader::pack_key::extra(&mode, &[]), || dxc::compile_fma(&src, &profile, fma, &[])).map_err(|e| (st.clone(), e))?;
                     Ok((st, c.dxc_ms as u128, c.source == tombox_xshader::shader_cache::Source::Compiled, src.lines().count()))
                 });
                 let mut g = tally.lock().unwrap();

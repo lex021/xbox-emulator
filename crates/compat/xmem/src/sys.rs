@@ -114,6 +114,23 @@ extern "system" {
     ) -> Handle;
 }
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetEnvironmentVariableA(name: *const u8, buf: *mut u8, size: u32) -> u32;
+}
+
+pub fn env_trimmed_is(name: &[u8], value: &[u8]) -> Option<bool> {
+    let mut buf = [0u8; 32];
+    let n = unsafe { GetEnvironmentVariableA(name.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n >= buf.len() {
+        return if n == 0 { None } else { Some(false) };
+    }
+    let s = &buf[..n];
+    let start = s.iter().position(|c| !c.is_ascii_whitespace()).unwrap_or(n);
+    let end = s.iter().rposition(|c| !c.is_ascii_whitespace()).map_or(start, |e| e + 1);
+    Some(&s[start..end] == value)
+}
+
 pub fn round_up(v: usize, a: usize) -> usize {
     (v + a - 1) & !(a - 1)
 }

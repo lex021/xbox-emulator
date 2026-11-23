@@ -6,10 +6,10 @@ MANAGED = ["crates", os.path.join("tools", "dev"), os.path.join("tools", "qa"), 
 
 TOP_FILES = {"Cargo.toml", "Cargo.lock"}
 TOP_DIRS = {"crates", "tools"}
-SKIP_DIRS = {"target", "batch_runs", "evidence", "node_modules", ".git", "__pycache__", "out", "runs", "backend_data"}
+SKIP_DIRS = {"target", "batch_runs", "evidence", "node_modules", ".git", "__pycache__", "out", "runs", "backend_data", ".pr"}
 SKIP_EXT = {".md", ".log", ".exe", ".dll", ".pdb", ".lib", ".obj", ".o", ".a", ".bin", ".dxil", ".cso", ".zip",
             ".7z", ".rar", ".xvd", ".xvc", ".msixvc", ".png", ".jpg", ".jpeg", ".gif", ".mp4", ".webm", ".wav",
-            ".xma", ".etl", ".dmp", ".pak", ".ucas", ".utoc", ".sys", ".so", ".dylib", ".rlib", ".pyc", ".ilk", ".exp"}
+            ".xma", ".etl", ".dmp", ".pak", ".ucas", ".utoc", ".sys", ".so", ".dylib", ".rlib", ".pyc", ".ilk", ".exp", ".diff", ".patch"}
 MAX_BYTES = 2 * 1024 * 1024
 PATTERN_FILE = os.path.join(".git", "info", "private-patterns")
 

@@ -21,14 +21,19 @@ pub mod dxil_meta;
 pub mod decls;
 pub mod uearchive;
 pub mod rdna2;
+pub mod trans16;
+pub mod trans32;
 pub mod gcn;
 pub mod gds_abi;
 pub mod global_abi;
 pub mod centroid_abi;
+pub mod user_data_abi;
 pub mod runtime_hlsl;
 pub mod cbv_raw_hlsl;
 #[cfg(windows)]
 pub mod shader_cache;
+pub mod game_scan;
+pub mod pack_key;
 pub mod branch_free;
 #[cfg(windows)]
 #[path = "../../tools/xreplay/src/d3d.rs"]
@@ -39,6 +44,8 @@ pub(crate) mod d3d;
 pub mod fma_probe;
 #[cfg(test)]
 mod sm5_helpers_tests;
+#[cfg(test)]
+mod xdat_layout_tests;
 #[cfg(all(test, windows))]
 mod fma16_tests;
 
@@ -108,6 +115,22 @@ impl Dxbc {
     pub fn chunk(&self, fourcc: &[u8; 4]) -> Option<&Chunk> {
         self.chunks.iter().find(|c| c.fourcc == *fourcc)
     }
+
+    fn output_signature(&self, blob: &[u8]) -> Result<Option<Vec<meta::SigElement>>, String> {
+        let mut found = false;
+        for tag in [b"OSG1", b"OSG5", b"OSGN"] {
+            if let Some(chunk) = self.chunk(tag) {
+                found = true;
+                let body = &blob[chunk.offset..chunk.offset + chunk.size];
+                match meta::parse_signature(tag, body) {
+                    Ok(signature) => return Ok(Some(signature)),
+                    Err(error) if tag == b"OSG5" => return Err(error),
+                    Err(_) => continue,
+                }
+            }
+        }
+        Ok(found.then(Vec::new))
+    }
 }
 
 pub fn parse_root_signature(data: &[u8]) -> Result<meta::RootSig, String> {
@@ -124,6 +147,9 @@ pub fn parse_root_signature(data: &[u8]) -> Result<meta::RootSig, String> {
     }
     meta::parse_rts0(body)
 }
+
+pub use hlsl::infer::infer_root_signature;
+pub use hlsl::translate_with_inference;
 
 /// Program type from the DXIL program header (D3D12_SHADER_VERSION_TYPE).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +209,7 @@ pub struct ShaderExtract {
     /// Parsed D3D-side metadata (empty/None when the chunk is absent or malformed).
     pub input_sig: Vec<meta::SigElement>,
     pub output_sig: Vec<meta::SigElement>,
+    pub prim_sig: Vec<meta::SigElement>,
     pub resources: Vec<meta::PsvResource>,
     /// Geometry-shader info from PSV0 (only meaningful for `Stage::Geometry`).
     pub gs_info: Option<meta::GsInfo>,
@@ -214,6 +241,9 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
     let bitcode_stripped = bc == b"NOBC";
 
     let xdat = body.get(24..).ok_or("DXIL chunk too small for XDAT")?;
+    if is_bitcode_at(xdat, 0) {
+        return Err(bitcode_only_error(dxbc, "DXIL+24 is LLVM DXIL bitcode with no XDAT section"));
+    }
     if fourcc_at(xdat, 0)? != *b"XDAT" {
         return Err(format!(
             "expected XDAT at DXIL+24, found {:?}",
@@ -234,7 +264,13 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
     if let Some(blob) = gcn::find_durango(xdat) {
         return gcn::extract_durango(dxbc, &container, stage, sm, bitcode_stripped, &blob);
     }
-    let variants = find_and_inflate_fssm(xdat)?;
+    let variants = match find_and_inflate_fssm(xdat) {
+        Ok(v) => v,
+        Err(_) if xdat_bitcode_section(xdat).is_some() => {
+            return Err(bitcode_only_error(dxbc, "XDAT holds an LLVM DXIL bitcode section and no compressed GPU program"));
+        }
+        Err(e) => return Err(e),
+    };
     let mut chosen = None;
     let mut last_err = String::from("no FSSM program found");
     for v in variants {
@@ -280,6 +316,7 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
     let psv_numthreads = if stage == Stage::Compute { chunk_body(b"PSV0").and_then(meta::parse_psv0_cs_threads) } else { None };
     let mut gs_info = chunk_body(b"PSV0").and_then(meta::parse_psv0_gs);
     dxil_meta::fill_num_threads(&mut gs_info, || dxil_disassembly(dxbc))?;
+    let output_sig = container.output_signature(dxbc)?;
     Ok(ShaderExtract {
         stage,
         shader_model: sm,
@@ -292,19 +329,45 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
         isa_data,
         fssm,
         has_input_sig: container.chunk(b"ISG1").is_some() || container.chunk(b"ISGN").is_some(),
-        has_output_sig: container.chunk(b"OSG1").is_some() || container.chunk(b"OSGN").is_some(),
+        has_output_sig: output_sig.is_some(),
         has_psv0: container.chunk(b"PSV0").is_some(),
         has_root_sig: container.chunk(b"RTS0").is_some(),
         input_sig: chunk_body(b"ISG1").and_then(|b| meta::parse_signature(b"ISG1", b).ok())
             .or_else(|| chunk_body(b"ISGN").and_then(|b| meta::parse_signature(b"ISGN", b).ok()))
             .unwrap_or_default(),
-        output_sig: chunk_body(b"OSG1").and_then(|b| meta::parse_signature(b"OSG1", b).ok())
-            .or_else(|| chunk_body(b"OSGN").and_then(|b| meta::parse_signature(b"OSGN", b).ok()))
+        output_sig: output_sig.unwrap_or_default(),
+        prim_sig: chunk_body(b"PSG1").and_then(|b| meta::parse_signature(b"PSG1", b).ok())
+            .or_else(|| chunk_body(b"PSGN").and_then(|b| meta::parse_signature(b"PSGN", b).ok()))
             .unwrap_or_default(),
         resources: chunk_body(b"PSV0").and_then(|b| meta::parse_psv0(b).ok()).unwrap_or_default(),
         gs_info,
         root_sig: chunk_body(b"RTS0").and_then(|b| meta::parse_rts0(b).ok()),
     })
+}
+
+const XDAT_BITCODE_SECTION: u32 = 7;
+
+fn is_bitcode_at(b: &[u8], off: usize) -> bool {
+    b.get(off..off + 4) == Some(b"BC\xC0\xDE")
+}
+
+fn xdat_bitcode_section(xdat: &[u8]) -> Option<(usize, usize)> {
+    let table = u32_at(xdat, 8).ok()? as usize;
+    if table % 12 != 0 || 12 + table > xdat.len() {
+        return None;
+    }
+    (0..table / 12).find_map(|e| {
+        let at = 12 + e * 12;
+        let (kind, off, size) = (u32_at(xdat, at).ok()?, u32_at(xdat, at + 4).ok()? as usize, u32_at(xdat, at + 8).ok()? as usize);
+        (kind == XDAT_BITCODE_SECTION && off.checked_add(size)? <= xdat.len() && is_bitcode_at(xdat, off)).then_some((off, size))
+    })
+}
+
+fn bitcode_only_error(dxbc: &[u8], layout: &str) -> String {
+    let dis = dxil_disassembly(dxbc).unwrap_or_default();
+    let triple = dis.lines().find_map(|l| l.trim().strip_prefix("target triple = ")).map(|t| t.trim_matches('"').to_string()).unwrap_or_else(|| "unknown".into());
+    let jit = if dis.contains("__XBOX_DISABLE_PRECOMPILE") { ", built with __XBOX_DISABLE_PRECOMPILE" } else { "" };
+    format!("{layout} (runtime-JIT DXIL, triple {triple}{jit}): the console compiles it when the PSO is created; TomBox has no DXIL passthrough yet")
 }
 
 /// Scan a blob for zlib streams and return every one that inflates to an `FSSM` container

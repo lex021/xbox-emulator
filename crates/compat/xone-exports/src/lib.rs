@@ -115,6 +115,9 @@ pub fn built_dll(crate_dir: &str, file: &str) -> Option<PathBuf> {
     let target = std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| Path::new(crate_dir).join("..").join("..").join("..").join("target"));
+    if let Some(p) = std::env::current_exe().ok().and_then(|e| profile_dir_of(&e)).map(|d| d.join(file)).filter(|p| p.is_file()) {
+        return Some(p);
+    }
     ["debug", "release"]
         .iter()
         .map(|p| target.join(p).join(file))
@@ -179,23 +182,46 @@ pub fn check_crate(crate_dir: &str, dll: &str, exports_txt: &str) {
 }
 
 fn profile_dir_of(exe: &std::path::Path) -> Option<std::path::PathBuf> {
-    exe.ancestors().skip(1).find(|a| matches!(a.file_name().and_then(|n| n.to_str()), Some("debug") | Some("release")) && a.parent().is_some()).map(|a| a.to_path_buf())
+    if let Some(a) = exe.ancestors().skip(1).find(|a| matches!(a.file_name().and_then(|n| n.to_str()), Some("debug") | Some("release")) && a.parent().is_some()) {
+        return Some(a.to_path_buf());
+    }
+    let marker = exe.ancestors().skip(1).find(|a| matches!(a.file_name().and_then(|n| n.to_str()), Some("deps") | Some("build")))?;
+    let profile = marker.parent()?;
+    profile.parent()?;
+    Some(profile.to_path_buf())
+}
+
+fn profile_args(profile: &std::path::Path) -> Vec<String> {
+    match profile.file_name().and_then(|n| n.to_str()) {
+        Some("debug") | None => Vec::new(),
+        Some("release") => vec!["--release".into()],
+        Some(other) => vec!["--profile".into(), other.into()],
+    }
 }
 
 pub fn build_cdylib(cargo: &str, manifest_dir: &str, package: &str, dll: &str) -> std::path::PathBuf {
+    build_cdylib_with_features(cargo, manifest_dir, package, dll, "")
+}
+
+pub fn build_cdylib_with_features(cargo: &str, manifest_dir: &str, package: &str, dll: &str, features: &str) -> std::path::PathBuf {
     static BUILT: std::sync::Mutex<Vec<(String, std::path::PathBuf)>> = std::sync::Mutex::new(Vec::new());
     let mut built = BUILT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, p)) = built.iter().find(|(k, _)| k == package) {
+    let tag = format!("{package}|{features}");
+    if let Some((_, p)) = built.iter().find(|(k, _)| *k == tag) {
         return p.clone();
     }
     let exe = std::env::current_exe().expect("test exe path");
-    let profile = profile_dir_of(&exe).unwrap_or_else(|| panic!("no debug/release directory above {}", exe.display()));
-    let target = profile.parent().unwrap().to_path_buf();
+    let base_profile = profile_dir_of(&exe).unwrap_or_else(|| panic!("no debug/release directory above {}", exe.display()));
+    let base_target = base_profile.parent().unwrap().to_path_buf();
+    let profile_name = base_profile.file_name().unwrap().to_owned();
+    let target = if features.is_empty() { base_target } else { base_target.join(format!("features-{}", features.replace([',', ' '], "-"))) };
+    let profile = target.join(&profile_name);
     let mut cmd = std::process::Command::new(cargo);
     cmd.current_dir(manifest_dir).args(["build", "--offline", "-p", package]).env("CARGO_TARGET_DIR", &target).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
-    if profile.file_name().and_then(|n| n.to_str()) == Some("release") {
-        cmd.arg("--release");
+    if !features.is_empty() {
+        cmd.args(["--features", features]);
     }
+    cmd.args(profile_args(&profile));
     let mut child = cmd.spawn().unwrap_or_else(|e| panic!("spawn {cargo} build -p {package}: {e}"));
     let reader = child.stderr.take().map(|mut e| {
         std::thread::spawn(move || {
@@ -221,7 +247,7 @@ pub fn build_cdylib(cargo: &str, manifest_dir: &str, package: &str, dll: &str) -
     assert!(status.success(), "cargo build -p {package} failed ({status}):\n{err}");
     let p = profile.join(dll);
     assert!(p.is_file(), "cargo build -p {package} succeeded but {} is missing", p.display());
-    built.push((package.to_string(), p.clone()));
+    built.push((tag, p.clone()));
     p
 }
 

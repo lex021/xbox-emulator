@@ -155,6 +155,18 @@ pub(super) unsafe fn try_map_run(s: &mut State, run: &[(usize, Option<u64>)]) ->
     true
 }
 
+#[cfg(test)]
+pub(super) fn reset_breaker() {
+    BROKEN.store(0, Ordering::Relaxed);
+    BROKEN_NS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(super) fn breaker_state(base: usize) -> String {
+    let r = runs();
+    format!("broken={} broken_ns={} fragmented_here={} runs={}", BROKEN.load(Ordering::Relaxed), BROKEN_NS.load(Ordering::Relaxed), r.fragmented.contains(&base), r.runs.len())
+}
+
 pub(super) fn run_range(va: usize) -> Option<(usize, usize)> {
     let r = runs();
     run_of(&r, va).map(|lo| (lo, r.runs[&lo].hi))
@@ -248,6 +260,7 @@ mod tests {
 
     #[test]
     fn contiguous_map_is_one_view_and_partial_remap_keeps_neighbours() {
+        let _g = crate::phys::map_test_guard();
         let va = XMemVirtualAlloc(core::ptr::null_mut(), 34 * XMEM_PAGE, MEM_RESERVE | XMEM_64K_PAGES, 0, PAGE_READWRITE) as usize;
         let mut n = 32usize;
         let mut p = [0u64; 32];
@@ -256,7 +269,7 @@ mod tests {
         let mut q = [0u64; 1];
         assert_eq!(unsafe { XMemAllocatePhysicalPages(XMEM_64K_PAGES as u64, &mut one, q.as_mut_ptr()) }, 1);
         assert_eq!(unsafe { XMemMapPhysicalPages((va + XMEM_PAGE) as *mut c_void, 32, p.as_mut_ptr()) } as usize, va + XMEM_PAGE);
-        assert_eq!(regions(va + XMEM_PAGE, 32 * XMEM_PAGE), 1);
+        assert_eq!(regions(va + XMEM_PAGE, 32 * XMEM_PAGE), 1, "{}", super::breaker_state(va));
         for i in 0..32 {
             unsafe { *((va + (i + 1) * XMEM_PAGE + 8) as *mut u32) = 100 + i as u32 };
         }
@@ -276,7 +289,27 @@ mod tests {
     }
 
     #[test]
+    fn released_check_flags_a_left_behind_placeholder() {
+        let _g = crate::phys::map_test_guard();
+        #[link(name = "kernelbase", kind = "raw-dylib")]
+        extern "system" {
+            fn VirtualAlloc2(process: Handle, base: *mut c_void, size: usize, kind: u32, protect: u32, params: *mut c_void, count: u32) -> *mut c_void;
+        }
+        let p = unsafe { VirtualAlloc2(GetCurrentProcess(), core::ptr::null_mut(), XMEM_PAGE, MEM_RESERVE | 0x4_0000, PAGE_NOACCESS, core::ptr::null_mut(), 0) } as usize;
+        assert_ne!(p, 0);
+        assert!(crate::phys::released(p).is_err());
+        let q = unsafe { VirtualAlloc(core::ptr::null_mut(), XMEM_PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(q, 0);
+        assert_eq!(crate::phys::released(q), Ok(()));
+        unsafe {
+            VirtualFree(p as *mut c_void, 0, MEM_RELEASE);
+            VirtualFree(q as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
     fn release_with_merged_view_frees_region() {
+        let _g = crate::phys::map_test_guard();
         let va = XMemVirtualAlloc(core::ptr::null_mut(), 4 * XMEM_PAGE, MEM_RESERVE | XMEM_64K_PAGES, 0, PAGE_READWRITE) as usize;
         let mut n = 4usize;
         let mut p = [0u64; 4];
@@ -285,9 +318,9 @@ mod tests {
         unsafe { *((va + 3 * XMEM_PAGE) as *mut u32) = 1 };
         let vfree: unsafe extern "system" fn(usize, usize, u32) -> i32 = unsafe { core::mem::transmute(crate::hooks::vfree_wrapper()) };
         assert_eq!(unsafe { vfree(va, 0, MEM_RELEASE) }, 1);
-        let mut info = XMemBasicInformation::default();
-        unsafe { XMemVirtualQuery(GetCurrentProcess(), va as *const c_void, &mut info) };
-        assert_eq!(info.state, 0x1_0000);
+        for i in 0..4 {
+            assert_eq!(crate::phys::released(va + i * XMEM_PAGE), Ok(()));
+        }
         assert_eq!(unsafe { XMemFreePhysicalPages(4, p.as_mut_ptr()) }, 1);
     }
 }

@@ -35,6 +35,8 @@ function Invoke-ShaderPrelaunch {
     if ($kit) { $env:TOMBOX_DXC_DIR = $kit }
   }
   $a = @('--title', $ExeStem, '--name', $Name, '--yes')
+  if (Test-Path $dll) { $a += @('--runtime-dll', $dll) }
+  if ($ExeDir -and $env:TOMBOX_GAME_SCAN -ne '0' -and (Test-Path -LiteralPath $ExeDir)) { $a += @('--game-dir', $ExeDir) }
   if ($NoUi -or $env:TOMBOX_PRELAUNCH_UI -eq '0' -or $env:TOMBOX_HEADLESS -eq '1') { $a += '--no-ui' }
   $sum = Join-Path $LogDir 'shader_prelaunch.txt'
   $a += @('--summary', $sum)
@@ -49,6 +51,6 @@ function Invoke-ShaderPrelaunch {
   } finally {
     if ($null -eq $oldDxc) { Remove-Item Env:TOMBOX_DXC_DIR -EA 0 } else { $env:TOMBOX_DXC_DIR = $oldDxc }
   }
-  $why = switch ($code) { 0 { 'done' } 3 { 'skipped by user; remaining shaders convert at runtime' } 2 { 'setup problem; shaders convert at runtime' } default { "exit $code; shaders convert at runtime" } }
+  $why = switch ($code) { 0 { 'done' } 3 { 'skipped by user; remaining shaders convert at runtime' } 2 { 'setup problem; shaders convert at runtime' } 4 { 'STALE: xshader_prelaunch was built from a different translator than d3d12_xs.dll, nothing converted; rebuild both from the same tree' } default { "exit $code; shaders convert at runtime" } }
   Write-Host ("  shader prelaunch {0} in {1:N1}s (summary {2})" -f $why, $sw.Elapsed.TotalSeconds, $sum) -ForegroundColor DarkGray
 }

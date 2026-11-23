@@ -10,7 +10,7 @@
 //! executable, then the newest `Windows Kits\10\bin\<version>\x64`.
 
 use std::ffi::c_void;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 extern "system" {
@@ -84,7 +84,246 @@ fn create_instance() -> Result<CreateInstance, String> {
 }
 
 pub fn available() -> bool {
+    if host::exe().is_some() {
+        return dll_dir().is_some();
+    }
     create_instance().is_ok()
+}
+
+fn dll_dir() -> Option<PathBuf> {
+    static D: OnceLock<Option<PathBuf>> = OnceLock::new();
+    D.get_or_init(|| candidate_dirs().into_iter().find(|d| d.join("dxcompiler.dll").exists() && d.join("dxil.dll").exists())).clone()
+}
+
+pub fn host_main() -> i32 {
+    let t = std::thread::Builder::new().stack_size(64 << 20).spawn(host::serve);
+    match t.map(|t| t.join()) {
+        Ok(Ok(code)) => code,
+        _ => 1,
+    }
+}
+
+pub mod host {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::windows::process::CommandExt;
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    pub const EXE: &str = "tombox_dxc_host.exe";
+    pub const COMPILE: u8 = 1;
+    pub const DISASSEMBLE: u8 = 2;
+    pub const FOREGROUND: u8 = 0x80;
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x4000;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const IDLE_CAP: usize = 16;
+
+    extern "system" {
+        fn GetCurrentThread() -> *mut c_void;
+        fn SetThreadPriority(t: *mut c_void, p: i32) -> i32;
+    }
+
+    struct Host {
+        child: Child,
+        inp: ChildStdin,
+        out: ChildStdout,
+    }
+
+    impl Drop for Host {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    static IDLE: Mutex<Vec<Host>> = Mutex::new(Vec::new());
+    static OFF: AtomicBool = AtomicBool::new(false);
+    static SPAWNED: AtomicUsize = AtomicUsize::new(0);
+    static FAILED: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn wanted(env: Option<&str>, module: Option<&Path>) -> Option<PathBuf> {
+        match env.map(str::trim) {
+            Some("0") => return None,
+            Some(p) if p.len() > 1 => return Some(PathBuf::from(p)),
+            _ => {}
+        }
+        let m = module?;
+        if !m.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")) {
+            return None;
+        }
+        Some(m.parent()?.join(EXE))
+    }
+
+    pub fn exe() -> Option<PathBuf> {
+        static H: OnceLock<Option<PathBuf>> = OnceLock::new();
+        H.get_or_init(|| {
+            let env = std::env::var("TOMBOX_DXC_HOST").ok();
+            let module = crate::shader_cache::module_path();
+            let p = wanted(env.as_deref(), module.as_deref())?;
+            if p.is_file() {
+                return Some(p);
+            }
+            eprintln!("dxc: no compile host at {}, compiles stay in-process", p.display());
+            None
+        })
+        .clone()
+    }
+
+    pub fn stats() -> (usize, usize) {
+        (SPAWNED.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed))
+    }
+
+    fn spawn(exe: &Path) -> Result<Host, String> {
+        let mut c = Command::new(exe);
+        if let Some(d) = dll_dir() {
+            c.env("TOMBOX_DXC_DIR", d);
+        }
+        c.env_remove("TOMBOX_DXC_HOST");
+        let mut child = c
+            .creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
+        let inp = child.stdin.take().ok_or("no stdin")?;
+        let out = child.stdout.take().ok_or("no stdout")?;
+        SPAWNED.fetch_add(1, Ordering::Relaxed);
+        Ok(Host { child, inp, out })
+    }
+
+    fn put(w: &mut impl Write, b: &[u8]) -> std::io::Result<()> {
+        w.write_all(&(b.len() as u32).to_le_bytes())?;
+        w.write_all(b)
+    }
+
+    fn get(r: &mut impl Read) -> std::io::Result<Vec<u8>> {
+        let mut n = [0u8; 4];
+        r.read_exact(&mut n)?;
+        let mut v = vec![0u8; u32::from_le_bytes(n) as usize];
+        r.read_exact(&mut v)?;
+        Ok(v)
+    }
+
+    pub fn write_request(w: &mut impl Write, op: u8, parts: &[&[u8]]) -> std::io::Result<()> {
+        w.write_all(&[op])?;
+        w.write_all(&(parts.len() as u32).to_le_bytes())?;
+        for p in parts {
+            put(w, p)?;
+        }
+        w.flush()
+    }
+
+    pub fn read_request(r: &mut impl Read) -> std::io::Result<(u8, Vec<Vec<u8>>)> {
+        let mut op = [0u8; 1];
+        r.read_exact(&mut op)?;
+        let mut n = [0u8; 4];
+        r.read_exact(&mut n)?;
+        let n = u32::from_le_bytes(n) as usize;
+        let mut parts = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            parts.push(get(r)?);
+        }
+        Ok((op[0], parts))
+    }
+
+    pub fn write_reply(w: &mut impl Write, r: &Result<Vec<u8>, String>) -> std::io::Result<()> {
+        match r {
+            Ok(b) => {
+                w.write_all(&[1])?;
+                put(w, b)?;
+            }
+            Err(e) => {
+                w.write_all(&[0])?;
+                put(w, e.as_bytes())?;
+            }
+        }
+        w.flush()
+    }
+
+    pub fn read_reply(r: &mut impl Read) -> std::io::Result<Result<Vec<u8>, String>> {
+        let mut ok = [0u8; 1];
+        r.read_exact(&mut ok)?;
+        let b = get(r)?;
+        Ok(if ok[0] == 1 { Ok(b) } else { Err(String::from_utf8_lossy(&b).into_owned()) })
+    }
+
+    pub fn handle(op: u8, parts: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+        match op & !FOREGROUND {
+            COMPILE => {
+                let src = std::str::from_utf8(parts.first().ok_or("no source")?).map_err(|e| e.to_string())?;
+                let args: Vec<&str> = parts[1..].iter().map(|a| std::str::from_utf8(a).unwrap_or("")).collect();
+                compile_local(src, &args)
+            }
+            DISASSEMBLE => disassemble_local(parts.first().ok_or("no code")?).map(String::into_bytes),
+            _ => Err(format!("dxc host: unknown request {op}")),
+        }
+    }
+
+    pub fn serve() -> i32 {
+        let mut i = std::io::stdin().lock();
+        let mut o = std::io::stdout().lock();
+        let mut fg = None;
+        loop {
+            let Ok((op, parts)) = read_request(&mut i) else { return 0 };
+            let want = op & FOREGROUND != 0;
+            if fg != Some(want) {
+                unsafe { SetThreadPriority(GetCurrentThread(), if want { 2 } else { 0 }) };
+                fg = Some(want);
+            }
+            let r = handle(op, &parts);
+            if write_reply(&mut o, &r).is_err() {
+                return 0;
+            }
+        }
+    }
+
+    fn exchange(h: &mut Host, op: u8, parts: &[&[u8]]) -> Result<Result<Vec<u8>, String>, String> {
+        write_request(&mut h.inp, op, parts).map_err(|e| format!("send: {e}"))?;
+        read_reply(&mut h.out).map_err(|e| match h.child.try_wait() {
+            Ok(Some(s)) => format!("host exited ({s}) during the request"),
+            _ => format!("receive: {e}"),
+        })
+    }
+
+    pub fn call(op: u8, parts: &[&[u8]]) -> Option<Result<Vec<u8>, String>> {
+        if OFF.load(Ordering::Relaxed) {
+            return None;
+        }
+        let exe = exe()?;
+        let op = if speculative_allowed() { op | FOREGROUND } else { op };
+        let mut last = String::new();
+        for _ in 0..2 {
+            let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            let mut h = match idle.map(Ok).unwrap_or_else(|| spawn(&exe)) {
+                Ok(h) => h,
+                Err(e) => {
+                    if SPAWNED.load(Ordering::Relaxed) == 0 {
+                        OFF.store(true, Ordering::Relaxed);
+                        eprintln!("dxc: compile host unavailable, compiling in process: {e}");
+                        return None;
+                    }
+                    last = e;
+                    continue;
+                }
+            };
+            match exchange(&mut h, op, parts) {
+                Ok(r) => {
+                    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+                    if idle.len() < IDLE_CAP {
+                        idle.push(h);
+                    }
+                    return Some(r);
+                }
+                Err(e) => {
+                    FAILED.fetch_add(1, Ordering::Relaxed);
+                    last = e;
+                }
+            }
+        }
+        Some(Err(format!("dxc: compile host failed twice: {last}")))
+    }
 }
 
 unsafe fn vt(obj: *mut c_void) -> *const usize {
@@ -152,7 +391,7 @@ pub fn compile_fma(hlsl: &str, profile: &str, fma: crate::shader_cache::Fma, ext
     if minor < 2 {
         return compile_bf(hlsl, bf.as_deref(), profile, &[], &with(true));
     }
-    let early = (profile.starts_with("cs_") && cs_parallel_enabled() && may_need_denorm_any(hlsl)).then(|| {
+    let early = (profile.starts_with("cs_") && cs_parallel_enabled() && speculative_allowed() && may_need_denorm_any(hlsl)).then(|| {
         let (h, b, p) = (hlsl.to_string(), bf.clone(), profile.to_string());
         let args: Vec<String> = with(true).into_iter().map(String::from).collect();
         std::thread::Builder::new()
@@ -171,6 +410,22 @@ pub fn compile_fma(hlsl: &str, profile: &str, fma: crate::shader_cache::Fma, ext
         return compile_bf(hlsl, bf.as_deref(), profile, &["-denorm", "any"], &with(true));
     }
     Ok(code)
+}
+
+thread_local! {
+    static BACKGROUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn set_background(on: bool) {
+    BACKGROUND.with(|b| b.set(on));
+}
+
+pub fn speculative_allowed() -> bool {
+    speculative_for(BACKGROUND.with(|b| b.get()), std::thread::current().name())
+}
+
+fn speculative_for(background: bool, thread_name: Option<&str>) -> bool {
+    !background && !thread_name.is_some_and(|n| n.starts_with("tombox"))
 }
 
 pub fn cs_parallel_enabled() -> bool {
@@ -242,6 +497,13 @@ pub fn has_preserve_unselectable(disasm: &str) -> bool {
 }
 
 pub fn disassemble(code: &[u8]) -> Result<String, String> {
+    if let Some(r) = host::call(host::DISASSEMBLE, &[code]) {
+        return r.map(|b| String::from_utf8_lossy(&b).into_owned());
+    }
+    disassemble_local(code)
+}
+
+fn disassemble_local(code: &[u8]) -> Result<String, String> {
     let create = create_instance()?;
     unsafe {
         let mut compiler: *mut c_void = std::ptr::null_mut();
@@ -274,6 +536,16 @@ pub fn disassemble(code: &[u8]) -> Result<String, String> {
 }
 
 fn compile_args(hlsl: &str, profile: &str, denorm: &[&str], extra: &[&str]) -> Result<Vec<u8>, String> {
+    let all: Vec<&str> = ["-T", profile, "-E", "main"].iter().chain(denorm.iter()).chain(extra.iter()).copied().collect();
+    let mut parts: Vec<&[u8]> = vec![hlsl.as_bytes()];
+    parts.extend(all.iter().map(|a| a.as_bytes()));
+    if let Some(r) = host::call(host::COMPILE, &parts) {
+        return r;
+    }
+    compile_local(hlsl, &all)
+}
+
+fn compile_local(hlsl: &str, all: &[&str]) -> Result<Vec<u8>, String> {
     let create = create_instance()?;
     unsafe {
         let mut compiler: *mut c_void = std::ptr::null_mut();
@@ -281,7 +553,7 @@ fn compile_args(hlsl: &str, profile: &str, denorm: &[&str], extra: &[&str]) -> R
         if hr < 0 || compiler.is_null() {
             return Err(format!("dxc: DxcCreateInstance(IDxcCompiler3) hr={hr:#010x}"));
         }
-        let args_w: Vec<Vec<u16>> = ["-T", profile, "-E", "main"].iter().chain(denorm.iter()).chain(extra.iter()).map(|a| wide(a)).collect();
+        let args_w: Vec<Vec<u16>> = all.iter().map(|a| wide(a)).collect();
         let args: Vec<*const u16> = args_w.iter().map(|a| a.as_ptr()).collect();
         let src = DxcBuffer { ptr: hlsl.as_ptr() as *const c_void, size: hlsl.len(), encoding: 65001 };
         let mut result: *mut c_void = std::ptr::null_mut();
@@ -378,6 +650,47 @@ pub fn cache_load(hlsl: &str, profile: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compile_host_is_used_only_inside_a_dll_unless_named() {
+        let dll = Path::new("D:/x/d3d12_xs.dll");
+        let exe = Path::new("D:/x/xshader.exe");
+        assert_eq!(host::wanted(None, Some(dll)), Some(PathBuf::from("D:/x").join(host::EXE)));
+        assert_eq!(host::wanted(None, Some(exe)), None);
+        assert_eq!(host::wanted(Some("0"), Some(dll)), None);
+        assert_eq!(host::wanted(Some("C:/h.exe"), Some(exe)), Some(PathBuf::from("C:/h.exe")));
+        assert_eq!(host::wanted(None, None), None);
+    }
+
+    #[test]
+    fn compile_host_requests_and_replies_round_trip() {
+        let mut buf = Vec::new();
+        host::write_request(&mut buf, host::COMPILE | host::FOREGROUND, &[b"float4 main() : SV_Target { return 0; }", b"-T", b"ps_6_2", b""]).unwrap();
+        let (op, parts) = host::read_request(&mut &buf[..]).unwrap();
+        assert_eq!(op, host::COMPILE | host::FOREGROUND);
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[2], b"ps_6_2");
+        assert!(parts[3].is_empty());
+        for r in [Ok(vec![1u8, 2, 3]), Err("dxc: bad".to_string())] {
+            let mut b = Vec::new();
+            host::write_reply(&mut b, &r).unwrap();
+            assert_eq!(host::read_reply(&mut &b[..]).unwrap(), r);
+        }
+        assert!(host::read_reply(&mut &[1u8, 9, 0][..]).is_err());
+        assert!(host::handle(0x33, &[]).is_err());
+    }
+
+    #[test]
+    fn speculative_denorm_any_compile_runs_only_on_title_threads() {
+        assert!(speculative_for(false, None));
+        assert!(speculative_for(false, Some("main")));
+        assert!(!speculative_for(true, None));
+        assert!(!speculative_for(false, Some("tombox-shader-prewarm")));
+        assert!(!speculative_for(false, Some("tombox-pso-xrec")));
+        set_background(true);
+        assert!(!speculative_allowed());
+        set_background(false);
+    }
 
     const PRESERVE: &str = "\"fp32-denorm-mode\"=\"preserve\"";
 

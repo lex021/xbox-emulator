@@ -446,16 +446,17 @@ pub unsafe fn sweep(skip: &[Hook], report: &mut Vec<(String, Vec<String>)>) -> u
         return 0;
     }
     for m in patch::loaded_modules() {
-        let path = patch::module_path(m);
-        if !patch::is_title_module(&path, m as usize) || skip_module(&path, m as usize) {
-            continue;
+        let Some(pinned) = patch::pin_module(m) else { continue };
+        let path = patch::module_path(pinned);
+        if !path.is_empty() && patch::is_title_module(&path, pinned as usize) && !skip_module(&path, pinned as usize) && !super::foreign::is_host_injected(&path) {
+            let mut hits = Vec::new();
+            let n = patch_image(pinned as *mut u8, skip, &mut hits);
+            if n > 0 {
+                total += n;
+                report.push((path.rsplit('\\').next().unwrap_or(&path).to_string(), hits));
+            }
         }
-        let mut hits = Vec::new();
-        let n = patch_image(m as *mut u8, skip, &mut hits);
-        if n > 0 {
-            total += n;
-            report.push((path.rsplit('\\').next().unwrap_or(&path).to_string(), hits));
-        }
+        patch::unpin_module(pinned);
     }
     total
 }

@@ -5,6 +5,16 @@ here = os.path.dirname(os.path.abspath(__file__))
 root = os.path.normpath(os.path.join(here, "..", ".."))
 dat = os.path.join(here, "data")
 img = os.path.join(root, "docs", "img")
+
+
+def om_name(m):
+    return m["name"] if isinstance(m, dict) else m
+
+
+def om_state(m):
+    return m.get("state", "not reached") if isinstance(m, dict) else "not reached"
+
+
 CONFIG = sys.argv[sys.argv.index("--config") + 1] if "--config" in sys.argv else os.path.join(here, "progress.json")
 cfg = json.load(open(CONFIG, encoding="utf-8"))
 _emu = {k.lower(): {**v, "functions": dict(v.get("functions", {})), "notes": dict(v.get("notes", {}))} for k, v in cfg["emulator"].items()}
@@ -700,14 +710,14 @@ def library_map(summary, libs):
         w("")
         w("</details>")
         w("")
-    w("## Verified on this machine (Fortnite)")
+    w("## Verified on this machine (running titles)")
     w("")
     w("| Milestone | Evidence |")
     w("|---|---|")
     for m in cfg["verified_milestones"]:
         w(f"| {m['name']} | `{m['evidence']}` |")
     for m in cfg["open_milestones"]:
-        w(f"| {m} | not reached |")
+        w(f"| {om_name(m)} | {om_state(m)} |")
     w("")
     w("## Unverified")
     w("")
@@ -851,11 +861,11 @@ with open(os.path.join(root, "docs", "MILESTONES.md"), "w", encoding="utf-8") as
     f.write("## Mapping\n\n| Milestone | Progress | State |\n|---|---|---|\n")
     for name, dn, tn in map_ms:
         f.write(f"| {name} | {dn}/{tn} | {'reached' if dn == tn else 'open'} |\n")
-    f.write("\n## Running titles (Fortnite)\n\n| Milestone | Evidence |\n|---|---|\n")
+    f.write("\n## Running titles\n\n| Milestone | Evidence |\n|---|---|\n")
     for vm_ in cfg["verified_milestones"]:
         f.write(f"| {vm_['name']} | `{vm_['evidence']}` |\n")
     for om in cfg["open_milestones"]:
-        f.write(f"| {om} | not reached |\n")
+        f.write(f"| {om_name(om)} | {om_state(om)} |\n")
 badge("imports", "system functions*", f"{100 * a_done / a_n:.2f}%", pct_colour(100 * a_done / a_n))
 badge("d3d12x", "Direct3D 12.x methods", f"{100 * b_done / b_n:.2f}%", pct_colour(100 * b_done / b_n))
 badge("instructions", "RDNA2 instructions", f"{100 * c_done / c_n:.2f}%", pct_colour(100 * c_done / c_n))

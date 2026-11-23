@@ -401,7 +401,8 @@ pub unsafe fn create(real: *mut c_void, desc: &[u8], num_ext: u32, pext: *const 
     let s = stream(desc, &ext, &p);
     let sd: [usize; 2] = [s.len(), s.as_ptr() as usize];
     let f: unsafe extern "system" fn(*mut c_void, *const [usize; 2], *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(slot(dev2, DEV2_CREATE_PIPELINE_STATE)) };
-    let hr = unsafe { f(dev2, &sd, riid, ppv) };
+    let extra = format!("{ext:?} depth_bounds={} per_face={}", p.depth_bounds, p.per_face);
+    let hr = unsafe { crate::pso_lib::stream(real, desc, &extra, &sd, riid, ppv, &|| f(dev2, &sd, riid, ppv)) };
     let rel: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(slot(dev2, 2)) };
     unsafe { rel(dev2) };
     if note || hr < 0 {

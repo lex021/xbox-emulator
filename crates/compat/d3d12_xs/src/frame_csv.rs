@@ -50,8 +50,28 @@ struct Csv {
     wait_ticks: i64,
     snap: [(u64, u64); 2],
     qpc_last: i64,
+    last_flush: i64,
 }
 unsafe impl Send for Csv {}
+
+impl Csv {
+    fn wrote_row(&mut self, now: i64) {
+        self.rows += 1;
+        if self.rows % 240 == 0 || self.rows <= 2 || now - self.last_flush >= qpf() / 4 {
+            let _ = self.out.flush();
+            self.last_flush = now;
+        }
+    }
+}
+
+fn open_file(p: &std::path::Path) -> Result<Csv, String> {
+    let f = std::fs::File::create(p).map_err(|e| format!("create {}: {e}", p.display()))?;
+    let mut out = std::io::BufWriter::with_capacity(64 * 1024, f);
+    let _ = writeln!(out, "frame,t_ms,present_interval_ms,present_cpu_ms,fence_wait_ms,gpu_frame_ms,gpu_present_list_us{}", crate::frame_ev::header());
+    let _ = out.flush();
+    let now = qpc();
+    Ok(Csv { out, path: p.display().to_string(), qheap: 0, rb: 0, map: core::ptr::null(), freq: 0, pending: [Pending::default(); 2], last_gpu_start: 0, start_qpc: now, last_present: 0, rows: 0, wait_ticks: 0, snap: [(0, 0); 2], qpc_last: 0, last_flush: now })
+}
 
 static CSV: Mutex<Option<Csv>> = Mutex::new(None);
 static FAILED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -63,9 +83,7 @@ fn path() -> std::path::PathBuf {
 
 unsafe fn open(device: usize, freq: u64) -> Result<Csv, String> {
     let p = path();
-    let f = std::fs::File::create(&p).map_err(|e| format!("create {}: {e}", p.display()))?;
-    let mut out = std::io::BufWriter::with_capacity(64 * 1024, f);
-    let _ = writeln!(out, "frame,t_ms,present_interval_ms,present_cpu_ms,fence_wait_ms,gpu_frame_ms,gpu_present_list_us{}", crate::frame_ev::header());
+    let mut c = open_file(&p)?;
     let qd: [u32; 3] = [1, 4, 0];
     let mut qheap = 0usize;
     let mut rb = 0usize;
@@ -92,9 +110,9 @@ unsafe fn open(device: usize, freq: u64) -> Result<Csv, String> {
         }
     }
     record("d3d12_xs", "[frame_csv]", &format!("writing {} (gpu timestamps {})", p.display(), if qheap != 0 { "on" } else { "off" }));
-    let now = qpc();
     crate::frame_ev::set_active(true);
-    Ok(Csv { out, path: p.display().to_string(), qheap, rb, map, freq, pending: [Pending::default(); 2], last_gpu_start: 0, start_qpc: now, last_present: 0, rows: 0, wait_ticks: 0, snap: [(0, 0); 2], qpc_last: 0 })
+    (c.qheap, c.rb, c.map, c.freq) = (qheap, rb, map, freq);
+    Ok(c)
 }
 
 pub fn on() -> bool {
@@ -129,7 +147,7 @@ pub unsafe fn list_begin(device: *mut c_void, list: *mut c_void, frame: u64, fre
         }
     }
     let c = g.as_mut().unwrap();
-    if c.qheap != 0 {
+    if c.qheap != 0 && !crate::dred::removed() {
         let slot = (frame % 2) as u32;
         let i = slot as usize;
         c.snap[i] = unsafe { (core::ptr::read_volatile(c.map.add(i * 2)), core::ptr::read_volatile(c.map.add(i * 2 + 1))) };
@@ -140,7 +158,7 @@ pub unsafe fn list_begin(device: *mut c_void, list: *mut c_void, frame: u64, fre
 pub unsafe fn list_end(list: *mut c_void, frame: u64) {
     let g = CSV.lock().unwrap();
     let Some(c) = g.as_ref() else { return };
-    if c.qheap != 0 {
+    if c.qheap != 0 && !crate::dred::removed() {
         let slot = (frame % 2) as u32;
         unsafe {
             vc!(list, 53, fn(usize, u32, u32) -> (), c.qheap, 2, slot * 2 + 1);
@@ -157,6 +175,28 @@ pub fn add_wait(ticks: i64) {
     }
 }
 
+pub fn present_skipped(entry: i64) {
+    let mut g = CSV.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(c) = g.as_mut() else { return };
+    let now = qpc();
+    let f = qpf() as f64;
+    let ms = |t: i64| t as f64 * 1000.0 / f;
+    if c.last_present == 0 {
+        c.start_qpc = entry;
+    }
+    let interval = if c.last_present != 0 { ms(entry - c.last_present) } else { 0.0 };
+    c.last_present = entry;
+    crate::frame_ev::note_present_thread();
+    let ev = crate::frame_ev::take();
+    let game_dt = crate::frame_ev::game_dt_ms(c.qpc_last, &ev);
+    if ev.qpc_last != 0 {
+        c.qpc_last = ev.qpc_last;
+    }
+    let _ = writeln!(c.out, "0,{:.3},{interval:.3},{:.3},{:.3},,{}", ms(entry - c.start_qpc), ms(now - entry), ms(c.wait_ticks), crate::frame_ev::row(&ev, game_dt));
+    c.wait_ticks = 0;
+    c.wrote_row(now);
+}
+
 pub fn present_done(frame: u64, entry: i64) {
     let mut g = CSV.lock().unwrap();
     let Some(c) = g.as_mut() else { return };
@@ -166,7 +206,7 @@ pub fn present_done(frame: u64, entry: i64) {
     let slot = (frame % 2) as usize;
     let old = c.pending[slot];
     let (mut gpu_frame, mut gpu_list) = (String::new(), String::new());
-    if old.valid && c.qheap != 0 {
+    if old.valid && c.qheap != 0 && !crate::dred::removed() {
         let (a, z) = c.snap[slot];
         if z >= a && a != 0 {
             gpu_list = format!("{:.1}", (z - a) as f64 * 1e6 / c.freq as f64);
@@ -178,10 +218,7 @@ pub fn present_done(frame: u64, entry: i64) {
     }
     if old.valid {
         let _ = writeln!(c.out, "{},{:.3},{:.3},{:.3},{:.3},{gpu_frame},{gpu_list}{}", old.frame, old.t_ms, old.interval_ms, old.cpu_ms, old.wait_ms, crate::frame_ev::row(&old.ev, old.game_dt));
-        c.rows += 1;
-        if c.rows % 240 == 0 {
-            let _ = c.out.flush();
-        }
+        c.wrote_row(now);
     }
     if c.last_present == 0 {
         c.start_qpc = entry;
@@ -196,4 +233,34 @@ pub fn present_done(frame: u64, entry: i64) {
     }
     c.pending[slot] = Pending { frame, t_ms: ms(entry - c.start_qpc), interval_ms: interval, cpu_ms: ms(now - entry), wait_ms: ms(c.wait_ticks), valid: true, ev, game_dt };
     c.wait_ticks = 0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_title_present_reaches_the_file_without_a_clean_exit() {
+        let p = std::env::temp_dir().join(format!("tombox_frames_test_{}.csv", std::process::id()));
+        *CSV.lock().unwrap() = Some(open_file(&p).unwrap());
+        let header = std::fs::read_to_string(&p).unwrap();
+        assert!(header.starts_with("frame,t_ms,present_interval_ms") && header.ends_with('\n'));
+        let t = qpc();
+        present_done(1, t);
+        present_done(2, t + 10);
+        assert_eq!(CSV.lock().unwrap().as_ref().unwrap().rows, 0);
+        present_done(3, t + 20);
+        present_skipped(t + 30);
+        let rows = CSV.lock().unwrap().as_ref().unwrap().rows;
+        let body = std::fs::read_to_string(&p).unwrap();
+        *CSV.lock().unwrap() = None;
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(rows, 2);
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 3, "{body}");
+        assert!(lines[1].starts_with("1,"));
+        assert!(lines[2].starts_with("0,"));
+        assert_eq!(lines[1].split(',').count(), lines[0].split(',').count());
+        assert_eq!(lines[2].split(',').count(), lines[0].split(',').count());
+    }
 }

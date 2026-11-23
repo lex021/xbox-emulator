@@ -34,7 +34,7 @@ pub(super) fn layout(ex: &ShaderExtract) -> Result<Option<Vec<(u32, u32)>>, Stri
         return Err(format!("durango user data: {} root parameters exceed the table id space", out.len()));
     }
     let d = crate::gcn::parse(&ex.fssm)?;
-    let w: Vec<u32> = d.tail.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let w: Vec<u32> = d.data.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
     let mut i = 0;
     while i + 5 <= w.len() && (w[i] != 0 || w[i + 1] != 0) && i < 5 * 64 {
         let (b, c) = (w[i + 1], w[i + 2]);

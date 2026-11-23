@@ -1,4 +1,4 @@
-use compat_common::{record, E_NOTIMPL, S_OK};
+use compat_common::{record, S_OK};
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -16,6 +16,10 @@ pub const XDSP_E_TOO_MANY_ACTIVATIONS: i32 = 0x8AC8_10A6u32 as i32;
 pub const XDSP_E_IR_SIZE: i32 = 0x8AC8_10A7u32 as i32;
 
 const IR_METADATA_MARKER: u32 = 0xFFFF_ACE1;
+pub const KIND_CONVOLUTION: u32 = 1;
+pub const KIND_FFT: u32 = 2;
+pub const KIND_IFFT: u32 = 3;
+pub const OPT_POLAR: u32 = 4;
 const MAX_CLIENTS: u32 = 8;
 const MAX_ACTIVATIONS: u32 = 0x80;
 const MAX_CONTEXTS: u32 = 0x100;
@@ -121,6 +125,20 @@ fn unpack_inverse(fft: &Fft, spec: &[C32], work: &mut [C32]) {
     }
 }
 
+fn to_polar(spec: &mut [C32]) {
+    for c in spec.iter_mut().skip(1) {
+        let (m, a) = ((c.re as f64).hypot(c.im as f64), (c.im as f64).atan2(c.re as f64));
+        *c = C32 { re: m as f32, im: a as f32 };
+    }
+}
+
+fn from_polar(spec: &mut [C32]) {
+    for c in spec.iter_mut().skip(1) {
+        let (m, a) = (c.re as f64, c.im as f64);
+        *c = C32 { re: (m * a.cos()) as f32, im: (m * a.sin()) as f32 };
+    }
+}
+
 fn spectral_mac(acc: &mut [C32], x: &[C32], h: &[C32], g: f32) {
     acc[0].re += x[0].re * h[0].re * g;
     acc[0].im += x[0].im * h[0].im * g;
@@ -138,6 +156,8 @@ struct Channel {
 pub struct Context {
     status: [u32; 4],
     client: *mut Client,
+    kind: u32,
+    polar: bool,
     block: usize,
     partitions: usize,
     irs: Vec<Vec<Vec<C32>>>,
@@ -185,6 +205,8 @@ impl Context {
         Context {
             status: [0; 4],
             client,
+            kind: KIND_CONVOLUTION,
+            polar: false,
             block,
             partitions: used,
             irs,
@@ -196,6 +218,55 @@ impl Context {
             envelope_count: partitions,
             envelope: None,
             group: 0,
+        }
+    }
+
+    fn new_transform(client: *mut Client, kind: u32, block: usize, polar: bool) -> Context {
+        Context {
+            status: [0; 4],
+            client,
+            kind,
+            polar,
+            block,
+            partitions: 0,
+            irs: Vec::new(),
+            chans: Vec::new(),
+            pos: 0,
+            fft: Fft::new(block),
+            work: vec![C32 { re: 0.0, im: 0.0 }; block],
+            acc: vec![C32 { re: 0.0, im: 0.0 }; block / 2],
+            envelope_count: 0,
+            envelope: None,
+            group: 0,
+        }
+    }
+
+    fn transform(&mut self, input: *const f32, mult: *const f32, output: *mut f32) {
+        let n = self.block;
+        let rd = |p: *const f32, i: usize| unsafe { core::ptr::read_unaligned(p.add(i)) };
+        if self.kind == KIND_FFT {
+            let t: Vec<f32> = (0..n).map(|i| sanitize(if mult.is_null() { rd(input, i) } else { rd(input, i) * rd(mult, i) })).collect();
+            pack_forward(&self.fft, &t, &mut self.work, &mut self.acc);
+            if self.polar {
+                to_polar(&mut self.acc);
+            }
+            for (k, c) in self.acc.iter().enumerate() {
+                unsafe {
+                    core::ptr::write_unaligned(output.add(2 * k), c.re);
+                    core::ptr::write_unaligned(output.add(2 * k + 1), c.im);
+                }
+            }
+        } else {
+            for k in 0..n / 2 {
+                self.acc[k] = C32 { re: sanitize(rd(input, 2 * k)), im: sanitize(rd(input, 2 * k + 1)) };
+            }
+            if self.polar {
+                from_polar(&mut self.acc);
+            }
+            unpack_inverse(&self.fft, &self.acc, &mut self.work);
+            for i in 0..n {
+                unsafe { core::ptr::write_unaligned(output.add(i), sanitize(self.work[i].re)) };
+            }
         }
     }
 
@@ -311,9 +382,19 @@ pub extern "system" fn XDspActivate(client: *mut Client, desc: *const u8, status
     if !block_ok {
         return E_INVALIDARG;
     }
-    if kind != 1 {
-        record(M, "XDspActivate", &format!("type={kind} not implemented -> E_NOTIMPL"));
-        return E_NOTIMPL;
+    if kind != KIND_CONVOLUTION {
+        let cl = unsafe { &mut *client };
+        if cl.active >= cl.max_act || cl.active >= MAX_CONTEXTS {
+            return XDSP_E_TOO_MANY_CONTEXTS;
+        }
+        let ctx = Box::into_raw(Box::new(Context::new_transform(client, kind, block as usize, flags & OPT_POLAR != 0)));
+        cl.active += 1;
+        unsafe {
+            *ctx_out = ctx;
+            *status_out = (*ctx).status.as_mut_ptr();
+        }
+        record(M, "XDspActivate", &format!("{} block={block} polar={} -> {ctx:p}", if kind == KIND_FFT { "fft" } else { "ifft" }, flags & OPT_POLAR != 0));
+        return S_OK;
     }
     let partitions = (len / 2 / block) as usize;
     let fdl = (partitions + 7) & !7;
@@ -366,13 +447,32 @@ fn submit(ctx: *mut Context, cmd: *const u8, envelope: *const f32, out_seq: *mut
     let g1 = unsafe { core::ptr::read_unaligned(cmd.add(4) as *const f32) };
     let input = unsafe { core::ptr::read_unaligned(cmd.add(8) as *const usize) } as *const f32;
     let output = unsafe { core::ptr::read_unaligned(cmd.add(0x10) as *const usize) } as *mut f32;
+    let mult = unsafe { core::ptr::read_unaligned(cmd.add(0x18) as *const usize) } as *const f32;
+    let (mem, size) = unsafe { ((*c.client).mem, (*c.client).mem_size) };
+    let inside = |p: usize| p >= mem && p - mem < size;
+    if c.kind != KIND_CONVOLUTION {
+        if !inside(input as usize) || !inside(output as usize) || (c.kind == KIND_FFT && !mult.is_null() && !inside(mult as usize)) {
+            return E_INVALIDARG;
+        }
+        c.status[0] = c.status[0].wrapping_add(1);
+        c.transform(input, if c.kind == KIND_FFT { mult } else { core::ptr::null() }, output);
+        c.status[1] = c.status[0];
+        if !out_seq.is_null() {
+            unsafe { *out_seq = c.status[0] };
+        }
+        if LOG.fetch_add(1, Ordering::Relaxed) < 4 {
+            record(M, name, &format!("seq={} {} -> S_OK", c.status[0], if c.kind == KIND_FFT { "fft" } else { "ifft" }));
+        }
+        return S_OK;
+    }
+    if !inside(input as usize) || !inside(output as usize) {
+        return E_INVALIDARG;
+    }
     if c.group == 0 {
         if envelope.is_null() {
             c.envelope = None;
         } else {
-            let (mem, size) = unsafe { ((*c.client).mem, (*c.client).mem_size) };
-            let a = envelope as usize;
-            if a < mem || a - mem >= size {
+            if !inside(envelope as usize) {
                 return E_INVALIDARG;
             }
             let n = ((c.envelope_count + 3) & !3) * (c.irs.len() - 1) + c.envelope_count;
@@ -451,25 +551,220 @@ mod tests {
         c
     }
 
+    fn tdesc(kind: u32, flags: u32, block: u32, ch: u32) -> [u8; 0x20] {
+        let mut d = desc(flags, block, ch, 0, core::ptr::null());
+        d[0..4].copy_from_slice(&kind.to_le_bytes());
+        d
+    }
+
+    fn fcmd(inp: *const f32, out: *mut f32, mult: *const f32) -> [u8; 32] {
+        let mut c = cmd(inp, out);
+        c[24..32].copy_from_slice(&(mult as u64).to_le_bytes());
+        c
+    }
+
+    fn dft(x: &[f32]) -> Vec<(f64, f64)> {
+        let n = x.len();
+        (0..=n / 2)
+            .map(|k| {
+                let (mut re, mut im) = (0.0f64, 0.0f64);
+                for (t, &v) in x.iter().enumerate() {
+                    let a = -2.0 * core::f64::consts::PI * (k * t % n) as f64 / n as f64;
+                    re += v as f64 * a.cos();
+                    im += v as f64 * a.sin();
+                }
+                (re, im)
+            })
+            .collect()
+    }
+
     #[test]
-    fn fft_and_ifft_streams_validate_then_report_blocked() {
+    fn fft_and_ifft_streams_activate_with_console_checks() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let mut buf = vec![0u8; 0x10000];
+        let mut mem = vec![0.0f32; 0x4000];
         let mut cl: *mut Client = core::ptr::null_mut();
-        assert_eq!(XDspConnect(buf.as_mut_ptr() as *mut c_void, buf.len() as u32, 4, &mut cl), S_OK);
-        for kind in [2u32, 3] {
-            let mut d = desc(0, 0x400, 1, 0, core::ptr::null());
-            d[0..4].copy_from_slice(&kind.to_le_bytes());
+        assert_eq!(XDspConnect(mem.as_mut_ptr() as *mut c_void, 0x10000, 3, &mut cl), S_OK);
+        let junk = [1.0f32; 4];
+        let mut ctxs = Vec::new();
+        for kind in [KIND_FFT, KIND_IFFT] {
             let (mut st, mut ctx) = (core::ptr::null_mut(), core::ptr::null_mut());
-            assert_eq!(XDspActivate(cl, d.as_ptr(), &mut st, &mut ctx), E_NOTIMPL, "type {kind}");
-            assert!(ctx.is_null());
-            let mut bad = d;
-            bad[12..16].copy_from_slice(&2u32.to_le_bytes());
-            assert_eq!(XDspActivate(cl, bad.as_ptr(), &mut st, &mut ctx), E_INVALIDARG, "type {kind} stereo");
+            for (flags, block, ch) in [(0u32, 0x400u32, 2u32), (0, 0x300, 1), (2, 0x400, 1), (8, 0x400, 1), (0, 0x1000, 1)] {
+                assert_eq!(XDspActivate(cl, tdesc(kind, flags, block, ch).as_ptr(), &mut st, &mut ctx), E_INVALIDARG, "kind {kind} flags {flags} block {block} ch {ch}");
+                assert!(ctx.is_null());
+            }
+            let mut d = tdesc(kind, OPT_POLAR, 0x800, 1);
+            d[16..20].copy_from_slice(&7u32.to_le_bytes());
+            d[20..28].copy_from_slice(&(junk.as_ptr() as u64).to_le_bytes());
+            assert_eq!(XDspActivate(cl, d.as_ptr(), &mut st, &mut ctx), S_OK, "kind {kind}");
+            assert!(!ctx.is_null() && !st.is_null());
+            ctxs.push(ctx);
+        }
+        let mut x: *mut Context = core::ptr::null_mut();
+        let mut st: *mut u32 = core::ptr::null_mut();
+        assert_eq!(XDspActivate(cl, tdesc(KIND_FFT, 0, 0x200, 1).as_ptr(), &mut st, &mut x), S_OK);
+        ctxs.push(x);
+        assert_eq!(XDspActivate(cl, tdesc(KIND_FFT, 0, 0x200, 1).as_ptr(), &mut st, &mut x), XDSP_E_TOO_MANY_CONTEXTS);
+        assert_eq!(XDspDisconnect(cl), XDSP_E_CONTEXTS_ACTIVE);
+        for c in ctxs {
+            assert_eq!(XDspDeactivate(c), S_OK);
         }
         assert_eq!(XDspDisconnect(cl), S_OK);
-        let row = include_str!("../exports.txt").lines().find(|l| l.split_whitespace().nth(1) == Some("XDspActivate")).unwrap();
-        assert_eq!(row.split_whitespace().nth(2), Some("stub"), "XDspActivate must stay labelled stub while FFT/IFFT are blocked");
+    }
+
+    #[test]
+    fn forward_fft_packs_like_convolution_ir_and_matches_dft() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        for n in [0x200usize, 0x400, 0x800] {
+            let mut mem = vec![0.0f32; 0x4000];
+            let mut cl: *mut Client = core::ptr::null_mut();
+            assert_eq!(XDspConnect(mem.as_mut_ptr() as *mut c_void, 0x10000, 2, &mut cl), S_OK);
+            let (mut st, mut fx) = (core::ptr::null_mut(), core::ptr::null_mut());
+            assert_eq!(XDspActivate(cl, tdesc(KIND_FFT, 0, n as u32, 1).as_ptr(), &mut st, &mut fx), S_OK);
+            let x: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.31).sin() + 0.25 * ((i * 37 % 11) as f32 - 5.0) / 5.0).collect();
+            mem[..n].copy_from_slice(&x);
+            let base = mem.as_mut_ptr();
+            let mut seq = 0;
+            assert_eq!(XDspSubmitCommand(fx, fcmd(base, unsafe { base.add(0x1000) }, core::ptr::null()).as_ptr(), &mut seq), S_OK);
+            assert_eq!(seq, 1);
+            unsafe { assert_eq!((*st, *st.add(1)), (1, 1)) };
+            let out = &mem[0x1000..0x1000 + n];
+            let want = dft(&x);
+            let tol = 2e-3 * n as f64;
+            assert!((out[0] as f64 - want[0].0).abs() < tol);
+            assert!((out[1] as f64 - want[n / 2].0).abs() < tol);
+            for k in 1..n / 2 {
+                assert!((out[2 * k] as f64 - want[k].0).abs() < tol && (out[2 * k + 1] as f64 - want[k].1).abs() < tol, "n {n} bin {k}");
+            }
+            let spec = out.to_vec();
+            let (mut st2, mut ix) = (core::ptr::null_mut(), core::ptr::null_mut());
+            assert_eq!(XDspActivate(cl, tdesc(KIND_IFFT, 0, n as u32, 1).as_ptr(), &mut st2, &mut ix), S_OK);
+            mem[0x2000..0x2000 + n].copy_from_slice(&spec);
+            let base = mem.as_mut_ptr();
+            let junk = vec![9.0f32; n];
+            assert_eq!(XDspSubmitCommand(ix, fcmd(unsafe { base.add(0x2000) }, base, junk.as_ptr()).as_ptr(), &mut seq), S_OK);
+            for i in 0..n {
+                assert!((mem[i] - x[i]).abs() < 1e-4, "n {n} sample {i}");
+            }
+            assert_eq!(XDspDeactivate(fx), S_OK);
+            assert_eq!(XDspDeactivate(ix), S_OK);
+            assert_eq!(XDspDisconnect(cl), S_OK);
+        }
+    }
+
+    #[test]
+    fn polar_format_roundtrips_and_holds_magnitude_phase() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let n = 0x400usize;
+        let mut mem = vec![0.0f32; 0x4000];
+        let mut cl: *mut Client = core::ptr::null_mut();
+        assert_eq!(XDspConnect(mem.as_mut_ptr() as *mut c_void, 0x10000, 2, &mut cl), S_OK);
+        let (mut st, mut fx, mut ix) = (core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut());
+        assert_eq!(XDspActivate(cl, tdesc(KIND_FFT, OPT_POLAR, n as u32, 1).as_ptr(), &mut st, &mut fx), S_OK);
+        assert_eq!(XDspActivate(cl, tdesc(KIND_IFFT, OPT_POLAR, n as u32, 1).as_ptr(), &mut st, &mut ix), S_OK);
+        let x: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.05).cos() * 0.7 - ((i as f32) * 0.9).sin() * 0.2).collect();
+        mem[..n].copy_from_slice(&x);
+        let base = mem.as_mut_ptr();
+        assert_eq!(XDspSubmitCommand(fx, fcmd(base, unsafe { base.add(0x1000) }, core::ptr::null()).as_ptr(), core::ptr::null_mut()), S_OK);
+        let want = dft(&x);
+        let tol = 2e-3 * n as f64;
+        assert!((mem[0x1000] as f64 - want[0].0).abs() < tol);
+        assert!((mem[0x1001] as f64 - want[n / 2].0).abs() < tol);
+        for k in 1..n / 2 {
+            let (m, a) = (mem[0x1000 + 2 * k] as f64, mem[0x1000 + 2 * k + 1] as f64);
+            assert!((m - want[k].0.hypot(want[k].1)).abs() < tol, "bin {k}");
+            assert!(m >= 0.0 && a.abs() <= core::f64::consts::PI + 1e-6);
+            if m > 1.0 {
+                assert!(((a - want[k].1.atan2(want[k].0) + 3.0 * core::f64::consts::PI) % (2.0 * core::f64::consts::PI) - core::f64::consts::PI).abs() < 1e-3, "bin {k}");
+            }
+        }
+        let base = mem.as_mut_ptr();
+        assert_eq!(XDspSubmitCommand(ix, fcmd(unsafe { base.add(0x1000) }, unsafe { base.add(0x2000) }, core::ptr::null()).as_ptr(), core::ptr::null_mut()), S_OK);
+        for i in 0..n {
+            assert!((mem[0x2000 + i] - x[i]).abs() < 1e-4, "sample {i}");
+        }
+        assert_eq!(XDspDeactivate(fx), S_OK);
+        assert_eq!(XDspDeactivate(ix), S_OK);
+        assert_eq!(XDspDisconnect(cl), S_OK);
+    }
+
+    #[test]
+    fn forward_multiplier_and_buffer_translation_follow_console() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let n = 0x200usize;
+        let mut mem = vec![0.0f32; 0x4000];
+        let mut cl: *mut Client = core::ptr::null_mut();
+        assert_eq!(XDspConnect(mem.as_mut_ptr() as *mut c_void, 0x10000, 2, &mut cl), S_OK);
+        let (mut st, mut fx, mut ix) = (core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut());
+        assert_eq!(XDspActivate(cl, tdesc(KIND_FFT, 0, n as u32, 1).as_ptr(), &mut st, &mut fx), S_OK);
+        assert_eq!(XDspActivate(cl, tdesc(KIND_IFFT, 0, n as u32, 1).as_ptr(), &mut st, &mut ix), S_OK);
+        let x: Vec<f32> = (0..n).map(|i| ((i * 13 % 7) as f32) - 3.0).collect();
+        let w: Vec<f32> = (0..n).map(|i| 0.5 - 0.5 * (2.0 * core::f32::consts::PI * i as f32 / n as f32).cos()).collect();
+        mem[..n].copy_from_slice(&x);
+        mem[0x400..0x400 + n].copy_from_slice(&w);
+        let base = mem.as_mut_ptr();
+        let outside = vec![0.0f32; n];
+        assert_eq!(XDspSubmitCommand(fx, fcmd(base, unsafe { base.add(0x1000) }, outside.as_ptr()).as_ptr(), core::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(XDspSubmitCommand(fx, fcmd(outside.as_ptr(), unsafe { base.add(0x1000) }, core::ptr::null()).as_ptr(), core::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(XDspSubmitCommand(fx, fcmd(base, outside.as_ptr() as *mut f32, core::ptr::null()).as_ptr(), core::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(XDspSubmitCommand(fx, fcmd(core::ptr::null(), unsafe { base.add(0x1000) }, core::ptr::null()).as_ptr(), core::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(XDspSubmitCommandWithEnvelope(fx, fcmd(base, unsafe { base.add(0x1000) }, unsafe { base.add(0x400) }).as_ptr(), outside.as_ptr(), core::ptr::null_mut()), S_OK);
+        let xw: Vec<f32> = x.iter().zip(&w).map(|(a, b)| a * b).collect();
+        let want = dft(&xw);
+        let tol = 1e-3 * n as f64;
+        for k in 1..n / 2 {
+            assert!((mem[0x1000 + 2 * k] as f64 - want[k].0).abs() < tol && (mem[0x1000 + 2 * k + 1] as f64 - want[k].1).abs() < tol, "bin {k}");
+        }
+        let base = mem.as_mut_ptr();
+        assert_eq!(XDspSubmitCommand(ix, fcmd(unsafe { base.add(0x1000) }, unsafe { base.add(0x2000) }, outside.as_ptr()).as_ptr(), core::ptr::null_mut()), S_OK);
+        for i in 0..n {
+            assert!((mem[0x2000 + i] - xw[i]).abs() < 1e-4, "sample {i}");
+        }
+        for _ in 0..20 {
+            let base = mem.as_mut_ptr();
+            assert_eq!(XDspSubmitCommand(fx, fcmd(base, unsafe { base.add(0x1000) }, core::ptr::null()).as_ptr(), core::ptr::null_mut()), S_OK);
+        }
+        unsafe { assert_eq!((*st, *st.add(1)), (1, 1)) };
+        assert_eq!(XDspDeactivate(fx), S_OK);
+        assert_eq!(XDspDeactivate(ix), S_OK);
+        assert_eq!(XDspDisconnect(cl), S_OK);
+    }
+
+    #[test]
+    fn fft_stream_output_is_a_valid_convolution_impulse_response() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let b = 0x200usize;
+        let parts = 9usize;
+        let mut mem = vec![0.0f32; 0x10000];
+        let mut cl: *mut Client = core::ptr::null_mut();
+        assert_eq!(XDspConnect(mem.as_mut_ptr() as *mut c_void, 0x40000, 2, &mut cl), S_OK);
+        let (mut st, mut fx) = (core::ptr::null_mut(), core::ptr::null_mut());
+        assert_eq!(XDspActivate(cl, tdesc(KIND_FFT, 0, (2 * b) as u32, 1).as_ptr(), &mut st, &mut fx), S_OK);
+        let h: Vec<f32> = (0..b * 4 + 33).map(|i| ((i as f32) * 0.21).sin() * (-(i as f32) / 500.0).exp()).collect();
+        let mut ir = Vec::new();
+        for p in 0..parts {
+            for i in 0..2 * b {
+                mem[i] = if i < b { *h.get(p * b + i).unwrap_or(&0.0) } else { 0.0 };
+            }
+            let base = mem.as_mut_ptr();
+            assert_eq!(XDspSubmitCommand(fx, fcmd(base, unsafe { base.add(0x1000) }, core::ptr::null()).as_ptr(), core::ptr::null_mut()), S_OK);
+            ir.extend_from_slice(&mem[0x1000..0x1000 + 2 * b]);
+        }
+        assert_eq!(ir, ir_from_time(&h, b, parts));
+        let mut cx: *mut Context = core::ptr::null_mut();
+        assert_eq!(XDspActivate(cl, desc(0, b as u32, 1, (2 * b * parts) as u32, ir.as_ptr()).as_ptr(), &mut st, &mut cx), S_OK);
+        let blocks = 8;
+        let input: Vec<f32> = (0..b * blocks).map(|i| ((i * 104729 % 997) as f32 / 498.5) - 1.0).collect();
+        mem[0x4000..0x4000 + b * blocks].copy_from_slice(&input);
+        let base = mem.as_mut_ptr();
+        for k in 0..blocks {
+            assert_eq!(XDspSubmitCommand(cx, cmd(unsafe { base.add(0x4000 + k * b) }, unsafe { base.add(0x8000 + k * b) }).as_ptr(), core::ptr::null_mut()), S_OK);
+        }
+        let want = reference(&input, &h);
+        let err = mem[0x8000..0x8000 + b * blocks].iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(err < 1e-3, "max err {err}");
+        assert_eq!(XDspDeactivate(fx), S_OK);
+        assert_eq!(XDspDeactivate(cx), S_OK);
+        assert_eq!(XDspDisconnect(cl), S_OK);
     }
 
     #[test]
@@ -560,24 +855,30 @@ mod tests {
         meta[0] = f32::from_bits(IR_METADATA_MARKER);
         meta[1] = f32::NAN;
         ir.extend_from_slice(&meta);
-        let mut buf = vec![0u8; 0x10000];
+        let mut mem = vec![0.0f32; 0x10000];
         let mut c: *mut Client = core::ptr::null_mut();
-        assert_eq!(XDspConnect(buf.as_mut_ptr() as _, 0x10000, 1, &mut c), S_OK);
+        assert_eq!(XDspConnect(mem.as_mut_ptr() as _, 0x40000, 1, &mut c), S_OK);
         let mut st: *mut u32 = core::ptr::null_mut();
         let mut x: *mut Context = core::ptr::null_mut();
         assert_eq!(XDspActivate(c, desc(0, b as u32, 1, (2 * b * parts) as u32, ir.as_ptr()).as_ptr(), &mut st, &mut x), S_OK);
         let blocks = 6;
         let input: Vec<f32> = (0..b * blocks).map(|i| ((i * 7919 % 1000) as f32 / 500.0) - 1.0).collect();
-        let mut output = vec![0.0f32; b * blocks];
+        mem[..b * blocks].copy_from_slice(&input);
+        let outside = vec![0.0f32; b];
+        assert_eq!(XDspSubmitCommand(x, cmd(input.as_ptr(), mem[0x8000..].as_mut_ptr()).as_ptr(), core::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(XDspSubmitCommand(x, cmd(mem.as_ptr(), outside.as_ptr() as *mut f32).as_ptr(), core::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(unsafe { *st }, 0);
+        let base = mem.as_mut_ptr();
         for k in 0..blocks {
             let mut seq = 0;
-            assert_eq!(XDspSubmitCommand(x, cmd(input[k * b..].as_ptr(), output[k * b..].as_mut_ptr()).as_ptr(), &mut seq), S_OK);
+            assert_eq!(XDspSubmitCommand(x, cmd(unsafe { base.add(k * b) }, unsafe { base.add(0x8000 + k * b) }).as_ptr(), &mut seq), S_OK);
             assert_eq!(seq, k as u32 + 1);
             unsafe {
                 assert_eq!(*st, k as u32 + 1);
                 assert_eq!(*st.add(1), k as u32 + 1);
             }
         }
+        let output = mem[0x8000..0x8000 + b * blocks].to_vec();
         let want = reference(&input, &h);
         let err = output.iter().zip(want.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(err < 1e-3, "max err {err}");
@@ -597,17 +898,17 @@ mod tests {
         h1[3] = 0.5;
         let mut ir = ir_from_time(&h0, b, parts);
         ir.extend(ir_from_time(&h1, b, parts));
-        let mut buf = vec![0u8; 0x10000];
+        let mut mem = vec![0.0f32; 0x4000];
         let mut c: *mut Client = core::ptr::null_mut();
-        assert_eq!(XDspConnect(buf.as_mut_ptr() as _, 0x10000, 1, &mut c), S_OK);
+        assert_eq!(XDspConnect(mem.as_mut_ptr() as _, 0x10000, 1, &mut c), S_OK);
         let mut st: *mut u32 = core::ptr::null_mut();
         let mut x: *mut Context = core::ptr::null_mut();
         assert_eq!(XDspActivate(c, desc(0xA, b as u32, 2, (2 * b * parts) as u32, ir.as_ptr()).as_ptr(), &mut st, &mut x), S_OK);
-        let mut input = vec![0.0f32; 2 * b];
-        input[10] = 1.0;
-        input[b + 10] = 1.0;
-        let mut out = vec![0.0f32; 2 * b];
-        assert_eq!(XDspSubmitCommand(x, cmd(input.as_ptr(), out.as_mut_ptr()).as_ptr(), core::ptr::null_mut()), S_OK);
+        mem[10] = 1.0;
+        mem[b + 10] = 1.0;
+        let base = mem.as_mut_ptr();
+        assert_eq!(XDspSubmitCommand(x, cmd(base, unsafe { base.add(0x2000) }).as_ptr(), core::ptr::null_mut()), S_OK);
+        let out = mem[0x2000..0x2000 + 2 * b].to_vec();
         assert!((out[10] - 1.0).abs() < 1e-4);
         assert!((out[b + 13] - 0.5).abs() < 1e-4);
         assert!(out[b + 10].abs() < 1e-4);
@@ -631,32 +932,34 @@ mod tests {
         let mut st: *mut u32 = core::ptr::null_mut();
         let mut x: *mut Context = core::ptr::null_mut();
         assert_eq!(XDspActivate(c, desc(0, b as u32, 1, (2 * b * parts) as u32, ir.as_ptr()).as_ptr(), &mut st, &mut x), S_OK);
+        let base = mem.as_mut_ptr();
+        let (inp, out, env) = (0x1000usize, 0x2000usize, 0usize);
         let outside = vec![1.0f32; 16];
-        let input = vec![0.0f32; b * 3];
-        let mut output = vec![0.0f32; b * 3];
-        assert_eq!(XDspSubmitCommandWithEnvelope(x, cmd(input.as_ptr(), output.as_mut_ptr()).as_ptr(), outside.as_ptr(), core::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(XDspSubmitCommandWithEnvelope(x, cmd(unsafe { base.add(inp) }, unsafe { base.add(out) }).as_ptr(), outside.as_ptr(), core::ptr::null_mut()), E_INVALIDARG);
         assert_eq!(unsafe { *st }, 0);
         for (k, g) in [2.0f32, 0.0, 4.0].iter().enumerate() {
-            mem[k] = *g;
+            mem[env + k] = *g;
         }
-        let mut input = vec![0.0f32; b * 3];
-        input[1] = 1.0;
+        mem[inp + 1] = 1.0;
+        let base = mem.as_mut_ptr();
         for k in 0..3 {
             let mut seq = 0;
-            assert_eq!(XDspSubmitCommandWithEnvelope(x, cmd(input[k * b..].as_ptr(), output[k * b..].as_mut_ptr()).as_ptr(), mem.as_ptr(), &mut seq), S_OK);
+            assert_eq!(XDspSubmitCommandWithEnvelope(x, cmd(unsafe { base.add(inp + k * b) }, unsafe { base.add(out + k * b) }).as_ptr(), unsafe { base.add(env) }, &mut seq), S_OK);
             assert_eq!(seq, k as u32 + 1);
         }
+        let output = mem[out..out + 3 * b].to_vec();
         assert!((output[1] - 2.0).abs() < 1e-4, "{}", output[1]);
         assert!(output[b + 6].abs() < 1e-4, "{}", output[b + 6]);
         assert!((output[2 * b + 8] - 1.0).abs() < 1e-4, "{}", output[2 * b + 8]);
+        let base = mem.as_mut_ptr();
         for _ in 3..8 {
-            assert_eq!(XDspSubmitCommand(x, cmd(input.as_ptr(), output.as_mut_ptr()).as_ptr(), core::ptr::null_mut()), S_OK);
+            assert_eq!(XDspSubmitCommand(x, cmd(unsafe { base.add(inp) }, unsafe { base.add(out) }).as_ptr(), core::ptr::null_mut()), S_OK);
         }
-        let mut fresh = vec![0.0f32; b];
-        let mut one = vec![0.0f32; b];
-        one[1] = 1.0;
-        assert_eq!(XDspSubmitCommand(x, cmd(one.as_ptr(), fresh.as_mut_ptr()).as_ptr(), core::ptr::null_mut()), S_OK);
-        assert!((fresh[1] - 1.0).abs() < 1e-4, "{}", fresh[1]);
+        mem[inp..inp + b].iter_mut().for_each(|v| *v = 0.0);
+        mem[inp + 1] = 1.0;
+        let base = mem.as_mut_ptr();
+        assert_eq!(XDspSubmitCommand(x, cmd(unsafe { base.add(inp) }, unsafe { base.add(out) }).as_ptr(), core::ptr::null_mut()), S_OK);
+        assert!((mem[out + 1] - 1.0).abs() < 1e-4, "{}", mem[out + 1]);
         assert_eq!(XDspDeactivate(x), S_OK);
         assert_eq!(XDspDisconnect(c), S_OK);
     }

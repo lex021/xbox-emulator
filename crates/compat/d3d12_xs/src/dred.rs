@@ -49,18 +49,51 @@ pub fn requested() -> bool {
 static DEVICE: AtomicUsize = AtomicUsize::new(0);
 static DRED: AtomicUsize = AtomicUsize::new(0);
 static REPORTED: AtomicBool = AtomicBool::new(false);
+static REMOVED: AtomicBool = AtomicBool::new(false);
 
 pub fn is_removal(hr: i32) -> bool {
     matches!(hr as u32, 0x887A_0005 | 0x887A_0006 | 0x887A_0007 | 0x887A_0020)
 }
 
+#[cfg(test)]
+thread_local! {
+    static T_REMOVED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+#[cfg(not(test))]
+pub fn removed() -> bool {
+    REMOVED.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+pub fn removed() -> bool {
+    T_REMOVED.with(|c| c.get())
+}
+
+#[cfg(not(test))]
+pub fn mark_removed() {
+    REMOVED.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+pub fn mark_removed() {
+    T_REMOVED.with(|c| c.set(true));
+}
+
+#[cfg(test)]
+pub fn clear_removed_for_test() {
+    T_REMOVED.with(|c| c.set(false));
+}
+
 pub fn on_failure(hr: i32, site: &str) {
     if is_removal(hr) {
+        mark_removed();
         report_once(site, Some(hr));
     }
 }
 
 pub fn report_once(site: &str, hr: Option<i32>) -> bool {
+    mark_removed();
     let dev = DEVICE.load(Ordering::Acquire) as *mut c_void;
     if dev.is_null() || REPORTED.swap(true, Ordering::AcqRel) {
         return false;
@@ -68,7 +101,52 @@ pub fn report_once(site: &str, hr: Option<i32>) -> bool {
     let what = hr.map_or(String::new(), |h| format!(" returned {h:#010x} ({})", removed_reason_name(h)));
     record(M, "dred.removed", &format!("first device-removal sign: {site}{what}"));
     unsafe { report(dev, DRED.load(Ordering::Acquire) as *mut c_void) };
+    crate::hang_cap::dump_on_removal();
+    schedule_exit(hr);
     true
+}
+
+extern "system" {
+    fn ExitProcess(code: u32) -> !;
+}
+
+pub fn exit_delay_ms(v: Option<&str>) -> Option<u64> {
+    match v.map(str::trim) {
+        None | Some("") => Some(3000),
+        Some("off") | Some("0") => None,
+        Some(s) => s.parse().ok().or(Some(3000)),
+    }
+}
+
+pub fn exit_code(hr: Option<i32>) -> u32 {
+    hr.filter(|h| is_removal(*h)).map_or(0x887A_0006, |h| h as u32)
+}
+
+#[cfg(test)]
+static TEST_EXIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn schedule_exit(hr: Option<i32>) {
+    let Some(ms) = exit_delay_ms(std::env::var("TOMBOX_REMOVED_EXIT_MS").ok().as_deref()) else { return };
+    let code = exit_code(hr);
+    #[cfg(test)]
+    {
+        let _ = ms;
+        TEST_EXIT.store(code, Ordering::Release);
+        record(M, "dred.removed", &format!("test build: would exit with code {code:#010x}; the test process keeps running"));
+    }
+    #[cfg(not(test))]
+    exit_after(ms, code);
+}
+
+#[cfg(not(test))]
+fn exit_after(ms: u64, code: u32) {
+    let log = std::env::var("TOMBOX_LOG").unwrap_or_else(|_| "tombox_compat.log".into());
+    record(M, "dred.removed", &format!("the GPU device is lost ({}); the process exits with code {code:#010x} in {ms} ms instead of letting the title run on a dead device. DRED summary: dred.* lines in {log}; hang captures in {}", removed_reason_name(code as i32), crate::hang_cap::dump_dir().display()));
+    let _ = std::thread::Builder::new().name("tombox-removed-exit".into()).spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        record(M, "dred.removed", &format!("exiting now with code {code:#010x} (device removed)"));
+        unsafe { ExitProcess(code) }
+    });
 }
 
 unsafe fn slot(obj: *mut c_void, i: usize) -> usize {
@@ -436,6 +514,28 @@ pub unsafe fn format_page_fault(pf: *const u8) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn removed_exit_delay_and_code() {
+        assert_eq!(exit_delay_ms(None), Some(3000));
+        assert_eq!(exit_delay_ms(Some("off")), None);
+        assert_eq!(exit_delay_ms(Some("0")), None);
+        assert_eq!(exit_delay_ms(Some("750")), Some(750));
+        assert_eq!(exit_code(Some(0x887A_0006u32 as i32)), 0x887A_0006);
+        assert_eq!(exit_code(Some(0x887A_0005u32 as i32)), 0x887A_0005);
+        assert_eq!(exit_code(None), 0x887A_0006);
+        assert_eq!(exit_code(Some(0x8007_0057u32 as i32)), 0x887A_0006);
+    }
+
+    #[test]
+    fn removed_flag_is_set_by_a_removal_failure_only() {
+        clear_removed_for_test();
+        on_failure(0x8007_0057u32 as i32, "test");
+        assert!(!removed());
+        on_failure(0x887A_0006u32 as i32, "test");
+        assert!(removed());
+        clear_removed_for_test();
+    }
+
     #[repr(C)]
     struct Node {
         la: *const u8,
@@ -575,8 +675,11 @@ mod tests {
 
     #[test]
     fn report_is_one_shot_and_needs_an_armed_device() {
-        let _ = report_once("test", None);
+        let first = report_once("test", None);
         assert!(!report_once("test", None));
+        if first {
+            assert_eq!(TEST_EXIT.load(Ordering::Acquire), 0x887A_0006, "a report arms the exit, which a test build records instead of exiting");
+        }
     }
 
     #[test]

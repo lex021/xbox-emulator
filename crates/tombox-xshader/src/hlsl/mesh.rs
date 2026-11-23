@@ -36,7 +36,11 @@ impl<'a> Emitter<'a> {
 
     fn ms_threads(&self) -> Result<u32, String> {
         let m = self.mesh_info()?;
-        crate::meta::mesh_thread_count(m.num_threads)
+        crate::meta::mesh_thread_count_for(m.stage, m.num_threads)
+    }
+
+    fn ms_gi_expr(&self) -> Result<&'static str, String> {
+        Ok(if self.ms_threads()? > 128 { "tb_gi" } else { "gi" })
     }
 
     pub(super) fn mesh_mbcnt(&self, ins: &Insn, b: String) -> Result<String, String> {
@@ -44,10 +48,11 @@ impl<'a> Emitter<'a> {
             return Err(format!("{} with a mask other than all lanes in a mesh shader at {:#x}", ins.mnemonic, ins.offset));
         }
         let w = wave_size(&self.insns);
+        let gi = self.ms_gi_expr()?;
         Ok(match (ins.mnemonic.as_str(), w) {
-            ("v_mbcnt_lo_u32_b32", 64) => format!("(min(gi & 63u, 32u) + {b})"),
-            ("v_mbcnt_lo_u32_b32", _) => format!("((gi & 31u) + {b})"),
-            ("v_mbcnt_hi_u32_b32", 64) => format!("(max(gi & 63u, 32u) - 32u + {b})"),
+            ("v_mbcnt_lo_u32_b32", 64) => format!("(min({gi} & 63u, 32u) + {b})"),
+            ("v_mbcnt_lo_u32_b32", _) => format!("(({gi} & 31u) + {b})"),
+            ("v_mbcnt_hi_u32_b32", 64) => format!("(max({gi} & 63u, 32u) - 32u + {b})"),
             _ => b,
         })
     }
@@ -61,7 +66,8 @@ impl<'a> Emitter<'a> {
             return Ok(None);
         }
         let w = wave_size(&self.insns);
-        Ok(Some(format!("(gid.x * {}u + (gi & {:#x}u))", self.ms_threads()?, !(w - 1))))
+        let gi = self.ms_gi_expr()?;
+        Ok(Some(format!("(gid.x * {}u + ({gi} & {:#x}u))", self.ms_threads()?, !(w - 1))))
     }
 
     fn uniform_entry_allocation(&self) -> bool {
@@ -150,12 +156,20 @@ impl<'a> Emitter<'a> {
         Ok(true)
     }
 
-    pub(super) fn finish_mesh(&mut self, mut h: String) -> Result<String, String> {
+    pub(super) fn finish_mesh(&mut self, mut h: String, static_init: &str) -> Result<String, String> {
         let m = self.mesh_info()?;
         let n = self.ms_threads()?;
-        if m.prim_vectors != 0 {
-            return Err("mesh shader with per-primitive outputs unsupported".into());
+        let passes: u32 = if n > 128 { 2 } else { 1 };
+        if passes > 1 && self.uses_lds {
+            return Err(format!("mesh shader with {n} threads and LDS unsupported"));
         }
+        if m.prim_vectors != 0 && self.ex.prim_sig.is_empty() {
+            return Err("mesh shader with per-primitive outputs unsupported without PSG1".into());
+        }
+        if self.ex.prim_sig.iter().any(|e| e.sysval != 0) {
+            return Err("mesh shader with per-primitive system values unsupported".into());
+        }
+        let has_prim_attrs = !self.ex.prim_sig.is_empty();
         let pl = if m.payload_bytes != 0 { Some(self.amp_ms_payload(m.payload_bytes)?) } else { None };
         let (topo, idx_ty, nidx) = match m.topology {
             1 => ("line", "uint2", 2usize),
@@ -211,8 +225,19 @@ impl<'a> Emitter<'a> {
             }
         }
         let _ = writeln!(h, "}};");
-        let _ = writeln!(h, "struct SPrim {{ bool cull : SV_CullPrimitive; }};");
-        let [tx, ty_, tz] = m.num_threads;
+        if !has_prim_attrs {
+            let _ = writeln!(h, "struct SPrim {{ bool cull : SV_CullPrimitive; }};");
+        } else {
+            let _ = writeln!(h, "struct SPrim {{");
+            let _ = writeln!(h, "    bool cull : SV_CullPrimitive;");
+            for (ei, e) in self.ex.prim_sig.iter().enumerate() {
+                let (ty, _) = sig_type(e);
+                let _ = writeln!(h, "    {ty} p{ei} : {};", semantic(e));
+            }
+            let _ = writeln!(h, "}};");
+        }
+        let pc_n = n / passes;
+        let [tx, ty_, tz] = if passes == 1 { m.num_threads } else { [pc_n, 1, 1] };
         let _ = writeln!(h, "[numthreads({tx}, {ty_}, {tz})]");
         let _ = writeln!(h, "[outputtopology(\"{topo}\")]");
         let _ = writeln!(
@@ -220,35 +245,102 @@ impl<'a> Emitter<'a> {
             "void main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID{}, out vertices SOut verts[{mv}], out indices {idx_ty} tris[{mp}], out primitives SPrim prims[{mp}]) {{",
             if pl.is_some() { ", in payload TbPayload tb_pl" } else { "" }
         );
-        let _ = writeln!(h, "    uint exec_lo = 1u, exec_hi = 0u, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
         for reg in ["v5", "s3"] {
             self.regs.insert(reg.to_string());
         }
         if pl.is_some() {
             self.amp_ms_regs();
         }
-        let _ = writeln!(h, "{}", self.reg_decls());
         let w = wave_size(&self.insns);
-        let _ = writeln!(h, "    SOut o = (SOut)0; uint tb_prim = 0u;");
-        if local_counts {
-            let _ = writeln!(h, "    uint tb_mscnt = 0u;");
+        let prim_indices = |expr: &str| {
+            let parts = [format!("{expr} & 0x1ffu"), format!("({expr} >> 10) & 0x1ffu"), format!("({expr} >> 20) & 0x1ffu")];
+            parts[..nidx].join(", ")
+        };
+        if passes == 1 {
+            let _ = writeln!(h, "    uint exec_lo = 1u, exec_hi = 0u, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
+            let _ = writeln!(h, "{}", self.reg_decls());
+            h.push_str(&self.ud_init());
+            h.push_str(static_init);
+            if has_prim_attrs {
+                let _ = writeln!(h, "    SOut o = (SOut)0; uint tb_prim = 0u; SPrim tb_pout = (SPrim)0;");
+            } else {
+                let _ = writeln!(h, "    SOut o = (SOut)0; uint tb_prim = 0u;");
+            }
+            if local_counts {
+                let _ = writeln!(h, "    uint tb_mscnt = 0u;");
+            } else {
+                let _ = writeln!(h, "    if (gi == 0u) tb_mscnt = 0u;");
+                let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
+            }
+            let _ = writeln!(h, "    v5 = gid.x * {n}u + gi; s3 = (gi / {w}u) << 24;");
+            if pl.is_some() {
+                h.push_str(&self.amp_ms_prologue(m.payload_bytes));
+            }
+            h.push_str(&self.body);
+            if !local_counts {
+                let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
+            }
+            let _ = writeln!(h, "    uint tb_nv = tb_mscnt & 0xfffu, tb_np = (tb_mscnt >> 12) & 0xfffu;");
+            let _ = writeln!(h, "    SetMeshOutputCounts(tb_nv, tb_np);");
+            let _ = writeln!(h, "    if (gi < tb_nv) verts[gi] = o;");
+            if has_prim_attrs {
+                let _ = writeln!(h, "    if (gi < tb_np) {{ tris[gi] = {idx_ty}({}); prims[gi] = tb_pout; prims[gi].cull = (tb_prim >> 31) != 0u; }}", prim_indices("tb_prim"));
+            } else {
+                let _ = writeln!(h, "    if (gi < tb_np) {{ tris[gi] = {idx_ty}({}); prims[gi].cull = (tb_prim >> 31) != 0u; }}", prim_indices("tb_prim"));
+            }
         } else {
-            let _ = writeln!(h, "    if (gi == 0u) tb_mscnt = 0u;");
-            let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
+            let _ = writeln!(h, "    SOut tb_vo[2]; uint tb_pr[2];");
+            if has_prim_attrs {
+                let _ = writeln!(h, "    SPrim tb_po[2];");
+            }
+            if local_counts {
+                let _ = writeln!(h, "    uint tb_mscnt = 0u;");
+            } else {
+                let _ = writeln!(h, "    if (gi == 0u) tb_mscnt = 0u;");
+                let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
+            }
+            let _ = writeln!(h, "    for (uint tb_iter = 0u; tb_iter < 2u; tb_iter++) {{");
+            let _ = writeln!(h, "        uint tb_gi = gi + tb_iter * {pc_n}u;");
+            let _ = writeln!(h, "        uint exec_lo = 1u, exec_hi = 0u, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
+            let _ = writeln!(h, "{}", self.reg_decls());
+            h.push_str(&self.ud_init());
+            h.push_str(static_init);
+            if has_prim_attrs {
+                let _ = writeln!(h, "        SOut o = (SOut)0; uint tb_prim = 0u; SPrim tb_pout = (SPrim)0;");
+            } else {
+                let _ = writeln!(h, "        SOut o = (SOut)0; uint tb_prim = 0u;");
+            }
+            let _ = writeln!(h, "        v5 = gid.x * {n}u + tb_gi; s3 = (tb_gi / {w}u) << 24;");
+            if pl.is_some() {
+                h.push_str(&self.amp_ms_prologue(m.payload_bytes));
+            }
+            h.push_str(&self.body);
+            let _ = writeln!(h, "        tb_vo[tb_iter] = o; tb_pr[tb_iter] = tb_prim;");
+            if has_prim_attrs {
+                let _ = writeln!(h, "        tb_po[tb_iter] = tb_pout;");
+            }
+            let _ = writeln!(h, "    }}");
+            if !local_counts {
+                let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
+            }
+            let _ = writeln!(h, "    uint tb_nv = tb_mscnt & 0xfffu, tb_np = (tb_mscnt >> 12) & 0xfffu;");
+            let _ = writeln!(h, "    SetMeshOutputCounts(tb_nv, tb_np);");
+            let _ = writeln!(h, "    if (gi < tb_nv) verts[gi] = tb_vo[0];");
+            if mv > pc_n {
+                let _ = writeln!(h, "    if (gi + {pc_n}u < tb_nv) verts[gi + {pc_n}u] = tb_vo[1];");
+            }
+            if has_prim_attrs {
+                let _ = writeln!(h, "    if (gi < tb_np) {{ tris[gi] = {idx_ty}({}); prims[gi] = tb_po[0]; prims[gi].cull = (tb_pr[0] >> 31) != 0u; }}", prim_indices("tb_pr[0]"));
+                if mp > pc_n {
+                    let _ = writeln!(h, "    if (gi + {pc_n}u < tb_np) {{ tris[gi + {pc_n}u] = {idx_ty}({}); prims[gi + {pc_n}u] = tb_po[1]; prims[gi + {pc_n}u].cull = (tb_pr[1] >> 31) != 0u; }}", prim_indices("tb_pr[1]"));
+                }
+            } else {
+                let _ = writeln!(h, "    if (gi < tb_np) {{ tris[gi] = {idx_ty}({}); prims[gi].cull = (tb_pr[0] >> 31) != 0u; }}", prim_indices("tb_pr[0]"));
+                if mp > pc_n {
+                    let _ = writeln!(h, "    if (gi + {pc_n}u < tb_np) {{ tris[gi + {pc_n}u] = {idx_ty}({}); prims[gi + {pc_n}u].cull = (tb_pr[1] >> 31) != 0u; }}", prim_indices("tb_pr[1]"));
+                }
+            }
         }
-        let _ = writeln!(h, "    v5 = gid.x * {n}u + gi; s3 = (gi / {w}u) << 24;");
-        if pl.is_some() {
-            h.push_str(&self.amp_ms_prologue(m.payload_bytes));
-        }
-        h.push_str(&self.body);
-        if !local_counts {
-            let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
-        }
-        let _ = writeln!(h, "    uint tb_nv = tb_mscnt & 0xfffu, tb_np = (tb_mscnt >> 12) & 0xfffu;");
-        let _ = writeln!(h, "    SetMeshOutputCounts(tb_nv, tb_np);");
-        let _ = writeln!(h, "    if (gi < tb_nv) verts[gi] = o;");
-        let idx: Vec<&str> = ["tb_prim & 0x1ffu", "(tb_prim >> 10) & 0x1ffu", "(tb_prim >> 20) & 0x1ffu"][..nidx].to_vec();
-        let _ = writeln!(h, "    if (gi < tb_np) {{ tris[gi] = {idx_ty}({}); prims[gi].cull = (tb_prim >> 31) != 0u; }}", idx.join(", "));
         h.push_str("}\n");
         Ok(h)
     }

@@ -185,7 +185,7 @@ fn constants_of(s: &ListState) -> Constants {
 unsafe fn push(list: *mut c_void, s: &ListState) {
     let Some(idx) = root_index(s.rs) else { return };
     let c = constants_of(s);
-    let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32) = unsafe { core::mem::transmute(vslot(list, PC_SET_GRAPHICS_ROOT_CONSTANTS)) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32) = unsafe { core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_GRAPHICS_ROOT_CONSTANTS)) };
     unsafe { f(list, idx, TB_CENTROID_ROOT_DWORDS, c.as_ptr(), 0) };
 }
 

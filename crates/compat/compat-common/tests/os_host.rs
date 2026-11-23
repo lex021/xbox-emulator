@@ -334,7 +334,8 @@ fn windows_modules_are_never_patched() {
 #[test]
 fn late_load_notification_patches_a_title_module() {
     let mut img = synthetic_pe();
-    let path: Vec<u16> = "G:\\Data\\Plugins\\Fake.dll".encode_utf16().collect();
+    let game = std::env::current_exe().unwrap().parent().unwrap().to_string_lossy().into_owned();
+    let path: Vec<u16> = format!("{game}\\Data\\Plugins\\Fake.dll").encode_utf16().collect();
     let mut us = [0u8; 16];
     us[0..2].copy_from_slice(&((path.len() * 2) as u16).to_le_bytes());
     us[2..4].copy_from_slice(&((path.len() * 2) as u16).to_le_bytes());
@@ -361,6 +362,15 @@ fn late_load_notification_patches_a_title_module() {
     unsafe { compat_common::os_host::dll_loaded(1, data.as_ptr(), core::ptr::null_mut()) };
     assert_eq!(rd(&sys, 0x500), 0);
     assert_eq!(rd(&sys, 0x800), 0x1234);
+    let mut overlay = synthetic_pe();
+    let opath: Vec<u16> = "C:\\Users\\someone\\AppData\\Local\\Discord\\app-1.0.9\\modules\\discord_hook\\DiscordHook64.dll".encode_utf16().collect();
+    us[0..2].copy_from_slice(&((opath.len() * 2) as u16).to_le_bytes());
+    us[2..4].copy_from_slice(&((opath.len() * 2) as u16).to_le_bytes());
+    us[8..16].copy_from_slice(&(opath.as_ptr() as u64).to_le_bytes());
+    data[24..32].copy_from_slice(&(overlay.as_mut_ptr() as u64).to_le_bytes());
+    unsafe { compat_common::os_host::dll_loaded(1, data.as_ptr(), core::ptr::null_mut()) };
+    assert_eq!(rd(&overlay, 0x500), 0, "a host-injected overlay keeps its native imports");
+    assert_eq!(rd(&overlay, 0x800), 0x1234);
 }
 
 #[test]

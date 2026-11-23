@@ -450,9 +450,11 @@ extern "system" {
 #[link_section = ".CRT$XCU"]
 pub static EARLY_INIT: extern "C" fn() = early_init;
 
+pub static EARLY_INIT_OPT_OUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 extern "C" fn early_init() {
     let _ = std::panic::catch_unwind(|| {
-        if setting("gdk_early").as_deref() != Some("0") {
+        if !EARLY_INIT_OPT_OUT.load(std::sync::atomic::Ordering::SeqCst) && setting("gdk_early").as_deref() != Some("0") {
             install();
         }
     });

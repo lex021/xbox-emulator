@@ -222,6 +222,7 @@ fn dispatch_mut(code: u32, input: &mut [u8], output: &mut [u8], device_type: u32
         }
         IOCTL_PAGE_POOL => page_pool_ioctl(input),
         gpu_clock::IOCTL_CLOCK_CALIBRATION => gpu_clock::calibration_ioctl(input),
+        gpu_clock::IOCTL_TIMESTAMP_PAIR => gpu_clock::timestamp_pair_ioctl(output),
         _ => match ported::dispatch(code, input, output) {
             Some(r) => r,
             None => {

@@ -177,17 +177,90 @@ unsafe extern "system" fn wndproc(h: *mut c_void, msg: u32, w: usize, l: isize) 
     DefWindowProcW(h, msg, w, l)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientRectMode {
+    Window,
+    BackBuffer,
+}
+
+fn parse_client_rect_mode(val: Option<&str>) -> Result<ClientRectMode, String> {
+    match val.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("window") => Ok(ClientRectMode::Window),
+        Some("backbuffer") => Ok(ClientRectMode::BackBuffer),
+        Some(other) => Err(format!("invalid client_rect={other:?} (expected 'window' or 'backbuffer'); using 'window'")),
+    }
+}
+
+fn configured_client_rect_mode() -> ClientRectMode {
+    static MODE: std::sync::OnceLock<ClientRectMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let raw = compat_common::cfg("client_rect");
+        match parse_client_rect_mode(raw.as_deref()) {
+            Ok(m) => m,
+            Err(msg) => {
+                record("d3d12_xs", "window", &msg);
+                ClientRectMode::Window
+            }
+        }
+    })
+}
+
 static TITLE_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static TITLE_HWND: AtomicUsize = AtomicUsize::new(0);
+static OUTPUT_SIZE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn output_size() -> Option<(i32, i32)> {
+    let v = OUTPUT_SIZE.load(Ordering::Relaxed);
+    (v != 0).then(|| ((v >> 32) as i32, v as u32 as i32))
+}
+
+unsafe extern "system" fn title_get_client_rect(h: *mut c_void, r: *mut [i32; 4]) -> i32 {
+    let ok = GetClientRect(h, r);
+    if ok != 0 && !r.is_null() && h as usize == TITLE_HWND.load(Ordering::Relaxed) {
+        if let Some((w, hgt)) = output_size() {
+            *r = [0, 0, w, hgt];
+        }
+    }
+    ok
+}
+
+fn scale_point(x: i32, y: i32, client: (i32, i32), out: (i32, i32)) -> (i32, i32) {
+    let sx = if client.0 > 0 { (x as i64 * out.0 as i64 / client.0 as i64) as i32 } else { x };
+    let sy = if client.1 > 0 { (y as i64 * out.1 as i64 / client.1 as i64) as i32 } else { y };
+    (sx, sy)
+}
+
+fn translate_message(msg: u32, w: usize, l: isize, client: (i32, i32), out: (i32, i32)) -> isize {
+    const WM_SIZE: u32 = 0x0005;
+    const SIZE_MINIMIZED: usize = 1;
+    match msg {
+        WM_SIZE if w != SIZE_MINIMIZED => ((out.1 as isize & 0xffff) << 16) | (out.0 as isize & 0xffff),
+        0x0200..=0x020e if msg != 0x020a && msg != 0x020e => {
+            let (x, y) = ((l & 0xffff) as i16 as i32, ((l >> 16) & 0xffff) as i16 as i32);
+            let (x, y) = scale_point(x, y, client, out);
+            (((y as isize) & 0xffff) << 16) | ((x as isize) & 0xffff)
+        }
+        _ => l,
+    }
+}
 
 unsafe extern "system" fn title_wndproc(h: *mut c_void, msg: u32, w: usize, l: isize) -> isize {
     if msg == WM_CLOSE {
         end_title_on_close();
     }
-    CallWindowProcW(TITLE_WNDPROC.load(std::sync::atomic::Ordering::Relaxed), h, msg, w, l)
+    let mut l = l;
+    if let Some(out) = output_size() {
+        if (msg == 0x0005 || (0x0200..=0x020e).contains(&msg)) && h as usize == TITLE_HWND.load(Ordering::Relaxed) {
+            let mut r = [0i32; 4];
+            GetClientRect(h, &mut r);
+            l = translate_message(msg, w, l, (r[2] - r[0], r[3] - r[1]), out);
+        }
+    }
+    CallWindowProcW(TITLE_WNDPROC.load(Ordering::Relaxed), h, msg, w, l)
 }
 
 unsafe fn close_ends_title(hwnd: usize) {
-    if TITLE_WNDPROC.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+    if TITLE_WNDPROC.load(Ordering::Relaxed) != 0 {
         return;
     }
     const GWLP_WNDPROC: i32 = -4;
@@ -196,7 +269,24 @@ unsafe fn close_ends_title(hwnd: usize) {
         record("d3d12_xs", "window", "could not hook the title window's close button");
         return;
     }
-    TITLE_WNDPROC.store(prev, std::sync::atomic::Ordering::Relaxed);
+    TITLE_WNDPROC.store(prev, Ordering::Relaxed);
+}
+
+unsafe fn fix_output_size(hwnd: usize, width: u64, height: u32) {
+    OUTPUT_SIZE.store((width << 32) | height as u64, Ordering::Relaxed);
+    TITLE_HWND.store(hwnd, Ordering::Relaxed);
+    const GWLP_WNDPROC: i32 = -4;
+    if TITLE_WNDPROC.load(Ordering::Relaxed) == 0 {
+        let prev = SetWindowLongPtrW(hwnd as *mut c_void, GWLP_WNDPROC, title_wndproc as *const () as isize);
+        if prev != 0 {
+            TITLE_WNDPROC.store(prev, Ordering::Relaxed);
+        }
+    }
+    let user32 = LoadLibraryA(b"user32.dll\0".as_ptr());
+    let real = GetProcAddress(user32, b"GetClientRect\0".as_ptr()) as usize;
+    let n = compat_common::iat::redirect_main_module(real, title_get_client_rect as *const () as usize);
+    record("d3d12_xs", "window", &format!(
+        "client_rect=backbuffer: title window reports {width}x{height} ({n} GetClientRect import slot(s); WM_SIZE and mouse coordinates translated)"));
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -336,6 +426,9 @@ unsafe fn init(queue: *mut c_void, src: *mut c_void) -> Result<State, String> {
     let own = std::env::var("TOMBOX_OWN_WINDOW").map(|v| v == "1").unwrap_or(false);
     let mut hwnd = if own { 0 } else { find_title_window() };
     if hwnd != 0 {
+        if configured_client_rect_mode() == ClientRectMode::BackBuffer {
+            fix_output_size(hwnd, width, height);
+        }
         (cw, ch) = fit_window_to_aspect(hwnd, width, height);
         close_ends_title(hwnd);
         let mut cls = [0u16; 128];
@@ -535,6 +628,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
     vcall!(st.alloc, 8, fn() -> i32); // allocator Reset
     vcall!(st.list, 10, fn(*mut c_void, *mut c_void) -> i32, st.alloc, core::ptr::null_mut());
     crate::frame_csv::list_begin(st.device, st.list, st.frames + 1, ts_freq(queue));
+    crate::gpuprof::own_begin(st.list, crate::gpuprof::TAG_PRESENT);
     let pre = [barrier(src, COMMON, COPY_SOURCE), barrier(dst, COMMON, COPY_DEST)];
     vcall!(st.list, 26, fn(u32, *const [u64; 4]) -> (), 2, pre.as_ptr());
     vcall!(st.list, 17, fn(*mut c_void, *mut c_void) -> (), dst, src); // CopyResource
@@ -560,6 +654,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
     let post = [barrier(src, COPY_SOURCE, COMMON), barrier(dst, dst_after, COMMON)];
     vcall!(st.list, 26, fn(u32, *const [u64; 4]) -> (), 2, post.as_ptr());
     crate::frame_csv::list_end(st.list, st.frames + 1);
+    crate::gpuprof::own_close(st.list);
     let hr = vcall!(st.list, 9, fn() -> i32);
     if let Some((rb_src, rb_dst)) = snaps {
         if hr >= 0 {
@@ -634,6 +729,16 @@ unsafe fn ts_freq(queue: *mut c_void) -> u64 {
 unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
     static CALLS: AtomicUsize = AtomicUsize::new(0);
     let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    let entry = crate::frame::qpc();
+    let mut presented = false;
+    let r = present_x_body(queue, plane_count, planes, n, entry, &mut presented);
+    if !presented && crate::frame_csv::on() {
+        crate::frame_csv::present_skipped(entry);
+    }
+    r
+}
+
+unsafe fn present_x_body(queue: *mut c_void, plane_count: u32, planes: *const u8, n: usize, entry: i64, shown: &mut bool) -> i32 {
     if plane_count != 0 && !planes.is_null() {
         // The frame identified by this token counts as flipped from here on (the title's
         // flip tracking keys off it), even if the host-side present below fails.
@@ -652,12 +757,13 @@ unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes
         return 0;
     }
     let src = *pp;
-    let entry = crate::frame::qpc();
     crate::perf::on_present();
     crate::qwait::poll();
     crate::gpuprof::on_present();
+    crate::firstuse::on_present();
     crate::hot_reload::on_present();
     crate::present_probe::on_present(src, plane_count, planes);
+    crate::passcap::on_present(queue, src, plane_count, planes);
     crate::upload::register_direct_queue(queue);
     crate::slowcall::time("PresentX upload pump", || crate::frame_ev::time(crate::frame_ev::UPLOAD, || crate::perf::timed(crate::perf::UPLOAD, || crate::upload::pump(queue))));
     crate::slowcall::time("PresentX replay/rtcap", || crate::perf::timed(crate::perf::RTCAP, || {
@@ -691,6 +797,8 @@ unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes
             if crate::frame_csv::on() {
                 crate::frame_csv::present_done(st.frames, entry);
             }
+            *shown = true;
+            crate::pso_lib::on_present();
         }
         Err(e) => {
             if n < 8 {
@@ -780,6 +888,7 @@ qthunks!(
 unsafe extern "system" fn signal_x(queue: *mut c_void, fence: *mut c_void, value: u64, _flags: u32) -> i32 {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> i32 =
         core::mem::transmute(REAL_QVT[14].load(Ordering::Relaxed));
+    crate::hang_cap::note_signal(queue, fence, value, "title SignalX");
     let hr = crate::slowcall::time("queue SignalX", || f(queue, fence, value));
     static N: AtomicUsize = AtomicUsize::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 3 {
@@ -834,6 +943,7 @@ qlow!((l8,8),(l9,9),(l10,10),(l11,11),(l12,12),(l13,13),(l14,14),(l15,15),(l16,1
 /// Title-side ExecuteCommandLists (PC slot 10): the title passes command-list *shims*
 /// (see cmdlist_wrap); translate them to the real lists before submitting.
 unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const *mut c_void) {
+    let _ours = crate::gpuprof_q::ours_scope();
     let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) =
         core::mem::transmute(REAL_QVT[10].load(Ordering::Relaxed));
     if lists.is_null() || n == 0 {
@@ -844,20 +954,30 @@ unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const
     let before = crate::ecl_probe::removed_reason(queue);
     let real: Vec<*mut c_void> =
         (0..n as usize).map(|i| crate::cmdlist_wrap::unwrap(*lists.add(i))).collect();
+    if crate::passcap::on() {
+        crate::passcap::note_submit(queue as usize, &crate::list_split::expand(&real));
+    }
     let mut real = crate::cl2_state::skip_presubmitted(crate::list_split::expand(&real));
     crate::indirect_bundle::resolve(&mut real);
     let real = crate::ecl_probe::refuse_failed(real);
     if real.is_empty() {
         return;
     }
+    crate::upload::submit_hook(queue);
     crate::sys_ts::note_queue(queue, REAL_QVT[16].load(Ordering::Relaxed), REAL_QVT[17].load(Ordering::Relaxed));
+    crate::rtcap::note_submit(queue as usize, &title, &real);
     let split = crate::cl2_state::before_execute(queue, &real);
     crate::title_heap::sync_for_execute(&real);
     crate::title_shadow::before_execute();
     crate::slowcall::time("queue ExecuteCommandLists replay hook", || crate::replay::on_execute(queue, &real));
-    crate::slowcall::time("queue ExecuteCommandLists", || crate::gpu_wait::submit(queue, &real, f, REAL_QVT[14].load(Ordering::Relaxed), REAL_QVT[15].load(Ordering::Relaxed)));
+    crate::hang_cap::note_exec(queue, &title, &real);
+    crate::placed_offset::before_submit(queue, &real, f as usize, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)));
+    crate::gpuprof::ecl_begin(queue, f);
+    crate::slowcall::time("queue ExecuteCommandLists", || crate::gpu_wait::submit(queue, &real, f, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)), crate::hang_cap::wait_fn(REAL_QVT[15].load(Ordering::Relaxed))));
+    crate::gpuprof::ecl_end(queue, f);
+    crate::placed_offset::after_submit(queue, &real, f as usize, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)));
     crate::ecl_probe::check("ExecuteCommandLists", queue, REAL_QVT[18].load(Ordering::Relaxed), &title, &real, before);
-    crate::title_shadow::after_execute(queue, REAL_QVT[14].load(Ordering::Relaxed), REAL_QVT[15].load(Ordering::Relaxed));
+    crate::title_shadow::after_execute(queue, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)), crate::hang_cap::wait_fn(REAL_QVT[15].load(Ordering::Relaxed)));
     crate::list_split::after_submit(queue, &real);
     crate::cl2_state::note_executed(queue, &real);
     crate::cl2_state::after_execute(queue, &split);
@@ -941,11 +1061,13 @@ pub fn apply_queue_vtable(queue: *mut c_void) {
                 // which would have read the same memory through the original vtable anyway.
                 REAL_QVT[i].store(*real_vt.add(i), Ordering::Relaxed);
             }
+            crate::gpuprof_q::install(&REAL_QVT);
             for i in 0..PC_QUEUE_SLOTS {
                 QUEUE_VT[i].store(*real_vt.add(i), Ordering::Relaxed);
             }
             install_qthunks();
             install_qlow();
+            crate::hang_cap::install_queue(&QUEUE_VT, &|i| REAL_QVT[i].load(Ordering::Relaxed));
             QUEUE_VT[10].store(q_exec_dispatch as usize, Ordering::Relaxed);
             QUEUE_VT[16].store(q_freq_dispatch as usize, Ordering::Relaxed);
             QUEUE_VT[17].store(q_calib_dispatch as usize, Ordering::Relaxed);
@@ -1049,5 +1171,55 @@ mod close_tests {
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert_eq!(out.status.code(), Some(0), "child exit; stdout: {stdout}");
         assert!(!stdout.contains("test result"), "child finished normally: {stdout}");
+    }
+}
+
+#[cfg(test)]
+mod output_size_tests {
+    use super::*;
+
+    fn lp(x: i32, y: i32) -> isize {
+        (((y as isize) & 0xffff) << 16) | ((x as isize) & 0xffff)
+    }
+
+    #[test]
+    fn client_rect_config_validates_values() {
+        assert_eq!(parse_client_rect_mode(None).unwrap(), ClientRectMode::Window);
+        assert_eq!(parse_client_rect_mode(Some("")).unwrap(), ClientRectMode::Window);
+        assert_eq!(parse_client_rect_mode(Some("window")).unwrap(), ClientRectMode::Window);
+        assert_eq!(parse_client_rect_mode(Some("WINDOW")).unwrap(), ClientRectMode::Window);
+        assert_eq!(parse_client_rect_mode(Some("backbuffer")).unwrap(), ClientRectMode::BackBuffer);
+        assert_eq!(parse_client_rect_mode(Some(" BackBuffer ")).unwrap(), ClientRectMode::BackBuffer);
+        let err = parse_client_rect_mode(Some("stretched")).unwrap_err();
+        assert!(err.contains("client_rect"), "{err}");
+    }
+
+    #[test]
+    fn wm_size_reports_the_output_size_unless_minimized() {
+        let (client, out) = ((1600, 874), (1904, 1041));
+        assert_eq!(translate_message(0x0005, 0, lp(1600, 874), client, out), lp(1904, 1041));
+        assert_eq!(translate_message(0x0005, 2, lp(1920, 1009), client, out), lp(1904, 1041), "maximized");
+        assert_eq!(translate_message(0x0005, 1, 0, client, out), 0, "minimized stays 0x0");
+    }
+
+    #[test]
+    fn client_mouse_coordinates_scale_to_the_output() {
+        let (client, out) = ((1600, 874), (1904, 1041));
+        assert_eq!(translate_message(0x0200, 0, lp(800, 437), client, out), lp(952, 520));
+        assert_eq!(translate_message(0x0201, 0, lp(1599, 873), client, out), lp(1902, 1039));
+        assert_eq!(translate_message(0x0200, 0, lp(-16, -8), client, out), lp(-19, -9));
+    }
+
+    #[test]
+    fn wheel_and_other_messages_are_untouched() {
+        let (client, out) = ((1600, 874), (1904, 1041));
+        for msg in [0x020a, 0x020e, 0x0100, 0x0010] {
+            assert_eq!(translate_message(msg, 0, lp(100, 200), client, out), lp(100, 200), "msg {msg:#x}");
+        }
+    }
+
+    #[test]
+    fn zero_client_area_leaves_coordinates() {
+        assert_eq!(scale_point(5, 7, (0, 0), (1904, 1041)), (5, 7));
     }
 }

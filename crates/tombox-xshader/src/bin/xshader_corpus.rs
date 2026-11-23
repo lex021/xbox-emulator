@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-use tombox_xshader::{dxc, extract, hlsl, parse_root_signature, runtime_hlsl, shader_cache, Stage};
+use tombox_xshader::{dxc, extract, parse_root_signature, runtime_hlsl, shader_cache, Stage};
 
 fn stage_name(s: &Stage) -> &'static str {
     match s {
@@ -311,23 +311,22 @@ fn main() -> ExitCode {
                     if let Some(root) = root.as_ref().filter(|_| !ex.has_root_sig) {
                         ex.root_sig = Some(parse_root_signature(root).map_err(|e| ("extract", st.clone(), format!("pipeline root signature: {e}"), None))?);
                     }
-                    let mut t = hlsl::translate(&ex).map_err(|e| ("translate", st.clone(), format!("translate: {e}"), None))?;
-                    if tombox_xshader::gcn::is_durango(&ex.fssm) {
-                        t.hlsl = tombox_xshader::cbv_raw_hlsl::rewrite_hlsl(&t.hlsl).map_err(|e| ("translate", st.clone(), format!("bind: {e}"), None))?;
-                    }
-                    let src = runtime_hlsl::finalize(&t.hlsl, &it.rt, loop_grad);
+                    let durango = tombox_xshader::gcn::is_durango(&ex.fssm);
+                    let pk = tombox_xshader::pack_key::Mode { cbv_raw: tombox_xshader::pack_key::CbvRaw::of(durango, durango), loop_grad, fma: fma.unwrap_or_default() };
+                    let t = tombox_xshader::pack_key::translate(&ex, None, pk.cbv_raw).map_err(|e| ("translate", st.clone(), e, None))?;
+                    let src = tombox_xshader::pack_key::finalize(&t.hlsl, &it.rt, &pk);
                     if mode == Mode::TranslateOnly {
                         return Ok((st, 0, Some(src)));
                     }
                     let Some(fma) = fma else { return Ok((st, 0, Some(src))) };
                     let profile = dxc::profile_for(t.profile);
-                    let k = shader_cache::key(&src, &profile, fma, "");
+                    let k = tombox_xshader::pack_key::key(&src, &profile, &pk, &[]);
                     if !recompile && shader_cache::contains(k) {
                         return Ok((st, 1, Some(src)));
                     }
                     let t_dxc = std::time::Instant::now();
                     let res = if mode == Mode::Fill && !recompile {
-                        shader_cache::compile_cached(&src, &profile, fma, &[]).map(|_| ())
+                        shader_cache::compile_cached_with(&src, &profile, fma, &tombox_xshader::pack_key::extra(&pk, &[]), || dxc::compile_fma(&src, &profile, fma, &[])).map(|_| ())
                     } else {
                         dxc::compile_fma(&src, &profile, fma, &[]).map(|_| ())
                     };

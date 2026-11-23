@@ -1267,3 +1267,86 @@ mod cl_fw_hw;
 
 #[path = "device_place_hw.rs"]
 mod device_place_hw;
+
+#[path = "upload_ww_hw.rs"]
+mod upload_ww_hw;
+
+#[test]
+#[ignore = "needs a D3D12 device; run: cargo test -p d3d12_xs --lib hw_ -- --ignored --test-threads=1 (TOMBOX_HW_ADAPTER=warp for WARP)"]
+fn hw_gpuprof_times_a_cross_queue_wait_and_the_submissions_around_it() {
+    let g = gpu();
+    unsafe {
+        let mk = |ty: u32| -> *mut c_void {
+            let desc: [u32; 4] = [ty, 0, 0, 0];
+            let mut q: *mut c_void = core::ptr::null_mut();
+            assert!(call!(g.dev, 8, (*const u32, *const Guid, *mut *mut c_void) -> i32, desc.as_ptr(), &IID_QUEUE, &mut q) >= 0 && !q.is_null());
+            q
+        };
+        let (dq, cq, kq) = (mk(0), mk(2), mk(3));
+        type Exec = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+        crate::gpuprof_q::set_real_for_test(vs(cq, 14), vs(cq, 15));
+        let exec: Exec = core::mem::transmute(vs(cq, 10));
+        let settle = |n: usize| {
+            let t = Instant::now();
+            while crate::gpuprof_q::current().len() < n && t.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let who = if g.warp { "WARP" } else { "hardware" };
+        let f = fence(g.dev);
+        crate::gpuprof_q::arm();
+        let s0 = crate::gpuprof::test_stamp(cq, exec, 2).expect("compute begin stamp");
+        crate::gpuprof_q::q_wait(cq, f, 1);
+        let s1 = crate::gpuprof::test_stamp(cq, exec, 2).expect("compute end stamp");
+        std::thread::sleep(Duration::from_millis(60));
+        crate::gpuprof_q::q_signal(dq, f, 1);
+        let (pf, pv) = crate::gpuprof::test_fence();
+        assert!(reached(pf as *mut c_void, pv, Duration::from_secs(5)), "{who}: stamp fence never reached {pv}");
+        settle(1);
+        let d = crate::gpuprof_q::current();
+        assert_eq!(d.len(), 1, "{who}: {d:?}");
+        assert_eq!(d[0].ty, 2);
+        assert!(d[0].ms >= 50.0 && d[0].ms < 3000.0, "{who}: cross-queue wait measured {} ms across a 60 ms sleep", d[0].ms);
+        crate::gpuprof_q::q_wait(cq, f, 1);
+        let mut freq = 0u64;
+        assert!(call!(cq, 16, (*mut u64) -> i32, &mut freq) >= 0 && freq != 0);
+        let tk = crate::gpuprof::test_ticks(&[s0, s1]);
+        assert!(tk.len() == 2 && tk[0] != 0 && tk[1] >= tk[0], "{who}: compute stamps {tk:?}");
+        let span = (tk[1] - tk[0]) as f64 * 1000.0 / freq as f64;
+        assert!(span >= 50.0, "{who}: compute submission span {span} ms does not cover the 60 ms cross-queue wait");
+        let f2 = fence(g.dev);
+        crate::gpuprof_q::name_fence(f2, "upload");
+        crate::gpuprof_q::q_wait(dq, f2, 1);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(call!(f2, 10, (u64) -> i32, 1) >= 0);
+        settle(3);
+        let line = crate::gpuprof_q::report_line();
+        assert!(line.contains("direct waits on upload fences n=1 already-reached=0"), "{who}: {line}");
+        assert!(line.contains("compute waits on title fences n=2 already-reached=1"), "{who}: {line}");
+        assert!(line.contains("queue signals: direct 1"), "{who}: {line}");
+        let (pf, pv) = crate::gpuprof::test_fence();
+        assert!(reached(pf as *mut c_void, pv, Duration::from_secs(5)));
+        let before = crate::gpuprof::test_pool();
+        for _ in 0..40 {
+            assert!(crate::gpuprof::test_stamp(cq, exec, 2).is_some());
+            let (pf, pv) = crate::gpuprof::test_fence();
+            assert!(reached(pf as *mut c_void, pv, Duration::from_secs(5)));
+        }
+        assert!(crate::gpuprof::test_pool() <= before + 1, "{who}: stamp lists were not reused ({} -> {})", before, crate::gpuprof::test_pool());
+        if crate::gpuprof::test_has_copy_heap() {
+            let kexec: Exec = core::mem::transmute(vs(kq, 10));
+            let a = crate::gpuprof::test_stamp(kq, kexec, 3).expect("copy begin stamp");
+            let b = crate::gpuprof::test_stamp(kq, kexec, 3).expect("copy end stamp");
+            let (pf, pv) = crate::gpuprof::test_fence();
+            assert!(reached(pf as *mut c_void, pv, Duration::from_secs(5)));
+            let tk = crate::gpuprof::test_ticks(&[a, b]);
+            assert!(tk.len() == 2 && tk[0] != 0 && tk[1] >= tk[0], "{who}: copy-queue stamps {tk:?}");
+        } else {
+            eprintln!("{who}: no copy-queue timestamp heap; copy spans untested");
+        }
+        crate::gpuprof_q::disarm();
+        for o in [f, f2, dq, cq, kq] {
+            call!(o, 2, () -> u32);
+        }
+    }
+}

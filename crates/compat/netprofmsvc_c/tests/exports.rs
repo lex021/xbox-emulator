@@ -80,3 +80,57 @@ fn loading_the_dll_runs_dll_main_and_unloading_tears_it_down() {
     }
     assert_eq!((instances(&NETWORK_PROFILE), instances(&AGGREGATE)), before);
 }
+
+fn import_dlls(pe: &[u8]) -> Vec<String> {
+    let rd16 = |o: usize| u16::from_le_bytes([pe[o], pe[o + 1]]) as usize;
+    let rd32 = |o: usize| u32::from_le_bytes(pe[o..o + 4].try_into().unwrap()) as usize;
+    let nt = rd32(0x3c);
+    let sections = rd16(nt + 6);
+    let opt = nt + 24;
+    let sec0 = opt + rd16(nt + 20);
+    let to_off = |rva: usize| {
+        (0..sections).map(|i| sec0 + i * 40).find(|&s| rva >= rd32(s + 12) && rva < rd32(s + 12) + rd32(s + 8).max(rd32(s + 16))).map(|s| rva - rd32(s + 12) + rd32(s + 20))
+    };
+    let imp = rd32(opt + 112 + 8);
+    let mut out = Vec::new();
+    let Some(mut d) = to_off(imp) else { return out };
+    while rd32(d + 12) != 0 {
+        let n = to_off(rd32(d + 12)).unwrap();
+        let end = pe[n..].iter().position(|b| *b == 0).unwrap();
+        out.push(String::from_utf8_lossy(&pe[n..n + end]).into_owned());
+        d += 20;
+    }
+    out
+}
+
+#[test]
+fn service_build_dll_main_registers_only_its_own_providers_and_unloads() {
+    let p = xone_exports::build_cdylib_with_features(env!("CARGO"), env!("CARGO_MANIFEST_DIR"), "netprofmsvc_c", "netprofmsvc_c.dll", "service");
+    let bytes = std::fs::read(&p).unwrap();
+    let rows: Vec<(u16, String)> = rows().into_iter().filter(|e| e.status != "missing").map(|e| (e.ordinal, e.name)).collect();
+    assert_eq!(xone_exports::pe_exports(&bytes).unwrap(), rows);
+    let deps = import_dlls(&bytes);
+    assert!(deps.iter().any(|d| d.eq_ignore_ascii_case("WINHTTP.dll")));
+    let mut held = Vec::new();
+    for d in &deps {
+        let w: Vec<u16> = d.encode_utf16().chain(Some(0)).collect();
+        let h = unsafe { LoadLibraryW(w.as_ptr()) };
+        assert!(!h.is_null(), "{d}");
+        held.push(h);
+    }
+    let owner_before = std::env::var("TOMBOX_GDK_OWNER").ok();
+    let before = (instances(&NETWORK_PROFILE), instances(&AGGREGATE));
+    let w: Vec<u16> = p.to_str().unwrap().encode_utf16().chain(Some(0)).collect();
+    let h = unsafe { LoadLibraryW(w.as_ptr()) };
+    assert!(!h.is_null());
+    assert_eq!((instances(&NETWORK_PROFILE), instances(&AGGREGATE)), (before.0 + 1, before.1 + 1));
+    assert_eq!(std::env::var("TOMBOX_GDK_OWNER").ok(), owner_before);
+    unsafe {
+        assert!(GetProcAddress(h, b"ServiceMain\0".as_ptr()).is_null());
+        assert_ne!(FreeLibrary(h), 0);
+    }
+    assert_eq!((instances(&NETWORK_PROFILE), instances(&AGGREGATE)), before);
+    for h in held {
+        unsafe { FreeLibrary(h) };
+    }
+}

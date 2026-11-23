@@ -139,13 +139,68 @@ impl Emitter<'_> {
             return Err(format!("s_load at {:#x}: unaligned root-memory offset {off:#x}", ins.offset));
         }
         let n = 1u32 << ins.op;
+        let base = ins.dst.first().and_then(sreg_num).ok_or("s_load: bad dst")? as u32;
         for k in 0..n {
-            if self.rm_param(off / 4 + k).is_none() {
-                return Err(format!("s_load at {:#x}: root-memory dword {} is outside the root signature", ins.offset, off / 4 + k));
+            if self.rm_param(off / 4 + k).is_none() && !self.sgpr_dead_after(idx, base + k) {
+                return Err(format!("s_load at {:#x}: root-memory dword {} is outside the root signature and s{} is read before it is rewritten", ins.offset, off / 4 + k, base + k));
             }
         }
         self.rm_loads.insert(idx, off);
         Ok(())
+    }
+
+    pub(super) fn sgpr_dead_after(&self, idx: usize, r: u32) -> bool {
+        let reads = |ins: &Insn| {
+            let span = match ins.enc {
+                Enc::Smem | Enc::Mubuf | Enc::Mtbuf => 4,
+                Enc::Mimg => 8,
+                Enc::Vop1 | Enc::Vop2 | Enc::Vopc | Enc::Sop1 | Enc::Sop2 | Enc::Sopc | Enc::Sopk if !ins.mnemonic.contains("64") => 1,
+                _ => 2,
+            };
+            ins.src.iter().any(|o| matches!(o, Opnd::Sgpr(n) if (*n as u32..*n as u32 + span).contains(&r)))
+        };
+        let writes = |ins: &Insn| {
+            let extra = match ins.enc {
+                Enc::Smem if ins.op <= 4 => (1u32 << ins.op) - 1,
+                _ if ins.mnemonic.ends_with("_b64") => 1,
+                _ => 0,
+            };
+            ins.dst.iter().any(|o| matches!(o, Opnd::Sgpr(n) if (*n as u32..=*n as u32 + extra).contains(&r)))
+        };
+        let at: std::collections::HashMap<usize, usize> = self.insns.iter().enumerate().map(|(i, x)| (x.offset, i)).collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut todo = vec![idx + 1];
+        while let Some(i) = todo.pop() {
+            if !seen.insert(i) {
+                continue;
+            }
+            let Some(ins) = self.insns.get(i) else { return false };
+            if reads(ins) {
+                return false;
+            }
+            if ins.mnemonic.starts_with("s_setpc") || ins.mnemonic.starts_with("s_swappc") || ins.mnemonic.starts_with("s_call") {
+                return false;
+            }
+            let jump = ins.enc == Enc::Sopp && (ins.mnemonic == "s_branch" || ins.mnemonic.starts_with("s_cbranch"));
+            if jump {
+                let simm = (ins.raw.first().copied().unwrap_or(0) & 0xffff) as u16 as i16 as i64;
+                let target = ins.offset as i64 + 4 + simm * 4;
+                let Some(&t) = usize::try_from(target).ok().and_then(|t| at.get(&t)) else { return false };
+                todo.push(t);
+                if ins.mnemonic != "s_branch" {
+                    todo.push(i + 1);
+                }
+                continue;
+            }
+            if ins.enc == Enc::Sopp && ins.mnemonic == "s_endpgm" {
+                continue;
+            }
+            if writes(ins) {
+                continue;
+            }
+            todo.push(i + 1);
+        }
+        true
     }
 
     pub(super) fn emit_rm_load(&mut self, idx: usize, ins: &Insn) -> Result<Option<()>, String> {
@@ -153,7 +208,7 @@ impl Emitter<'_> {
         let base = ins.dst.first().and_then(sreg_num).ok_or("s_load: bad dst")?;
         let n = 1u32 << ins.op;
         for k in 0..n {
-            let (p, i) = self.rm_param(off / 4 + k).ok_or("root memory: bad dword")?;
+            let Some((p, i)) = self.rm_param(off / 4 + k) else { continue };
             if let Some(RootParamKind::Constants { .. }) = self.rm_kind_of(p) {
                 self.rm_used.insert(p);
                 self.ws(&sreg_opnd(base + k as u8), &format!("tb_rc{p}_{i}"))?;

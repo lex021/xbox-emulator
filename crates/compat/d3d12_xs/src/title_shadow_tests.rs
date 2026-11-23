@@ -259,7 +259,7 @@ fn shadowed_title_buffer_shares_bytes_both_ways_and_leaves_memory_unpinned() {
         vcall!(a, 2, fn() -> u32);
         vcall!(b, 2, fn() -> u32);
         crate::alias::flush_spans();
-        assert_eq!(map_va(a), None);
+        assert_ne!(map_va(a), Some(va), "the released placement no longer maps the title address; a parallel test may reuse the freed pointer for its own resource");
         assert!(!shadows(|m| m.contains_key(&ma.heap)), "the shadow heap is dropped with its last placement");
         if !hold.is_null() {
             VirtualFree(hold, 0, 0x8000);

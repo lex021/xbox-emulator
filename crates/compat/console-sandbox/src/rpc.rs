@@ -15,7 +15,6 @@ pub const RPC_BHT_OBJECT_UUID_VALID: u32 = 1;
 
 #[link(name = "rpcrt4")]
 extern "system" {
-    fn RpcServerUseProtseqEpW(protseq: *const u16, max: u32, ep: *const u16, sd: *mut c_void) -> i32;
     fn RpcBindingToStringBindingW(b: *mut c_void, out: *mut *mut u16) -> i32;
     fn RpcStringBindingParseW(s: *const u16, obj: *mut *mut u16, protseq: *mut *mut u16, addr: *mut *mut u16, ep: *mut *mut u16, opts: *mut *mut u16) -> i32;
     fn RpcStringFreeW(s: *mut *mut u16) -> i32;
@@ -90,45 +89,19 @@ fn is_lrpc(p: &str) -> bool {
     p.eq_ignore_ascii_case("ncalrpc")
 }
 
-fn known_protseq(p: &str) -> bool {
-    ["ncalrpc", "ncacn_ip_tcp", "ncacn_np", "ncacn_http", "ncadg_ip_udp", "ncacn_hvsocket"].iter().any(|k| k.eq_ignore_ascii_case(p))
-}
-
 pub unsafe extern "system" fn rpc_server_use_protseq_w(protseq: *const u16, max: u32, sd: *mut c_void) -> i32 {
     let p = from_ptr(protseq);
-    if !known_protseq(&p) {
-        return RPC_S_INVALID_RPC_PROTSEQ;
-    }
-    if !is_lrpc(&p) {
-        note(format!("RpcServerUseProtseqW {p} refused: the emulator is offline"));
-        return RPC_S_PROTSEQ_NOT_SUPPORTED;
-    }
-    if map().dynamic_listening {
-        return RPC_S_OK;
-    }
-    let ep = wide(&dynamic_endpoint());
-    let r = RpcServerUseProtseqEpW(protseq, max, ep.as_ptr(), sd);
-    if r == RPC_S_OK || r == RPC_S_DUPLICATE_ENDPOINT {
+    let r = crate::rpcsrv::rpc_server_use_protseq_w(protseq, max, sd);
+    note(format!("RpcServerUseProtseqW {p} = {r} (in-process)"));
+    if r == RPC_S_OK && is_lrpc(&p) {
         map().dynamic_listening = true;
-        note(format!("RpcServerUseProtseqW ncalrpc -> {}", dynamic_endpoint()));
-        return RPC_S_OK;
     }
     r
 }
 
 pub unsafe extern "system" fn rpc_server_use_protseq_ep_w(protseq: *const u16, max: u32, ep: *const u16, sd: *mut c_void) -> i32 {
-    let p = from_ptr(protseq);
-    if !known_protseq(&p) {
-        return RPC_S_INVALID_RPC_PROTSEQ;
-    }
-    if !is_lrpc(&p) {
-        note(format!("RpcServerUseProtseqEpW {p} refused: the emulator is offline"));
-        return RPC_S_PROTSEQ_NOT_SUPPORTED;
-    }
-    let e = from_ptr(ep);
-    let n = wide(&namespaced(&e));
-    let r = RpcServerUseProtseqEpW(protseq, max, n.as_ptr(), sd);
-    note(format!("RpcServerUseProtseqEpW ncalrpc {e} -> {} = {r}", namespaced(&e)));
+    let r = crate::rpcsrv::rpc_server_use_protseq_ep_w(protseq, max, ep, sd);
+    note(format!("RpcServerUseProtseqEpW {} {} = {r} (in-process)", from_ptr(protseq), from_ptr(ep)));
     r
 }
 
@@ -146,6 +119,9 @@ unsafe fn interface_of(ifspec: *const c_void) -> ([u8; 16], u16, u16) {
 }
 
 unsafe fn binding_parts(b: *mut c_void) -> Option<(String, String)> {
+    if let Some((ps, ep, _)) = crate::rpcsrv::binding_parts(b as usize) {
+        return Some((ps, ep));
+    }
     let mut s: *mut u16 = core::ptr::null_mut();
     if RpcBindingToStringBindingW(b, &mut s) != RPC_S_OK {
         return None;

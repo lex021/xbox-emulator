@@ -26,23 +26,23 @@ Upstream's metric set (same definitions as upstream `tools/progress/gen.py`, For
 | Metric | Done | Total | % |
 |---|---|---|---|
 | system_functions | 671 | 671 | 100.0 |
-| d3d12x_methods | 194 | 200 | 97.0 |
-| rdna2_instructions | 776 | 783 | 99.11 |
+| d3d12x_methods | 200 | 200 | 100.0 |
+| rdna2_instructions | 810 | 820 | 98.78 |
 | shaders_translated | 105506 | 105506 | 100.0 |
 | shader_stages | 0 | 8 | 0.0 |
-| milestones | 9 | 18 | 50.0 |
+| milestones | 13 | 18 | 72.22 |
 | titles_examined | 6 | - | - |
-| console_exports | 2142 | 2155 | 99.4 |
+| console_exports | 2147 | 2155 | 99.63 |
 | shader_compile_lobby_frame | 139 | 139 | 100.0 |
 | shader_compile_fixtures | 25 | 25 | 100.0 |
 | shader_compile_full_sweep | not published | 105506 | - |
-| milestones_verified_this_machine | 7 | 12 | 58.33 |
+| milestones_verified_this_machine | 10 | 12 | 83.33 |
 | title_imports_Fortnite | 50 | 50 | 100.0 |
-| title_imports_XDefiant | 50 | 52 | 96.15 |
+| title_imports_XDefiant | 52 | 52 | 100.0 |
 | title_imports_Terraria | 61 | 61 | 100.0 |
 | title_imports_Trackmania | 48 | 48 | 100.0 |
-| title_imports_Minecraft | 34 | 35 | 97.14 |
-| console_exports_targeted | 2142 | 2154 | 99.44 |
+| title_imports_Minecraft | 35 | 35 | 100.0 |
+| console_exports_targeted | 2147 | 2154 | 99.68 |
 | console_exports_not_targeted | not published | 1 | - |
 
 Shader compile: all 139 shaders of the lobby frame compile with DXC (TomBox `docs/DEVELOPMENT_LOG.md:894`); 25/25 fixtures compile (`:672`). The full-library compile sweep (`:706`) has no published final count, so no compile badge is shown.
@@ -260,24 +260,24 @@ Listed: imports from Xbox console libraries only. Not listed: 1218 imports a PC 
 
 </details>
 
-<details><summary><b>chad.dll</b>: 5 functions; implemented 4, stub 1</summary>
+<details><summary><b>chad.dll</b>: 5 functions; implemented 5</summary>
 
 | Function | Status | Implemented in / evidence |
 |---|---|---|
-| `XDspActivate` | stub | [crates/compat/chad/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/chad/src/lib.rs) (type 1 convolution (XDefiant) runs on the host with the console validation; types 2 (FFT) and 3 (IFFT) pass the console descriptor checks and then return E_NOTIMPL: their DSP microcode and buffer layout are not in any dump (see docs/BLOCKERS.md, chad FFT/IFFT streams)) |
-| `XDspSubmitCommand` | implemented | [crates/compat/chad/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/chad/src/lib.rs) |
+| `XDspActivate` | implemented | [crates/compat/chad/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/chad/src/lib.rs) (all three XDspProcessType values run: 1 convolution (XDefiant) and 2/3 forward/inverse FFT streams, with the console descriptor checks of chad.dll 0x1efc (XDefiant build: mono only for FFT/IFFT, block 0x200/0x400/0x800, Deinterleaved/StereoImpulseResponse need stereo, EnablePolarFormat rejected for convolution, impulseResponse not read for FFT/IFFT); submit follows console 0x254c: input/output (and for FFT a non-NULL blockBufferMultiplier) must translate into the XDspConnect memory or E_INVALIDARG, multiplier ignored for IFFT, envelope and 8-command group only for convolution (Trackmania build 0x2524). FFT layout: N real samples in, N floats out (docs.xbox.com xdspcommand and the FFT/IFFT walkthrough: blockFrameCount floats per block) as N/2 Cartesian (re,im) pairs (xdspactivationparameters: complex values are real/imaginary float pairs), unscaled forward and 1/N inverse; per docs.xbox.com xdsp-overview the hardware time-to-frequency output equals the IR conversion tool output, so the FFT stream reuses the convolution IR partition format of this crate (bin 0 = DC/Nyquist pair); that packing is inherited from the convolution port and not verified against title IR data (XDefiant's IRs sit inside compressed sdf archives); docs say impulseResponse must be NULL/0 for FFT/IFFT but chad.dll 0x1efc never reads it, so it is ignored like the console; tests forward_fft_packs_like_convolution_ir_and_matches_dft, fft_stream_output_is_a_valid_convolution_impulse_response, forward_multiplier_and_buffer_translation_follow_console, fft_and_ifft_streams_activate_with_console_checks, polar_format_roundtrips_and_holds_magnitude_phase (12/12 chad tests pass). Polar order (magnitude, phase in radians, bin 0 left as DC/Nyquist) is inferred, see docs/BLOCKERS.md chad EnablePolarFormat) |
+| `XDspSubmitCommand` | implemented | [crates/compat/chad/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/chad/src/lib.rs) (console 0x254c: inputBlockBuffer and outputBlockBuffer must translate into the XDspConnect memory (0x18d0) or E_INVALIDARG, for every stream type; convolution, FFT and IFFT run on the host) |
 | `XDspConnect` | implemented | [crates/compat/chad/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/chad/src/lib.rs) |
 | `XDspDeactivate` | implemented | [crates/compat/chad/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/chad/src/lib.rs) |
 | `XDspDisconnect` | implemented | [crates/compat/chad/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/chad/src/lib.rs) |
 
 </details>
 
-<details><summary><b>xapu.dll</b>: 5 functions; implemented 4, stub 1</summary>
+<details><summary><b>xapu.dll</b>: 5 functions; implemented 5</summary>
 
 | Function | Status | Implemented in / evidence |
 |---|---|---|
 | `XApuGetResultCount` | implemented | [crates/compat/xapu/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/xapu/src/lib.rs) (counts committed results) |
-| `XApuConnect` | stub | [crates/compat/xapu/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/xapu/src/lib.rs) (processType 2 (Opus) decodes on the host with the console validation; processTypes 1 and 3 pass the console parameter checks and then return E_NOTIMPL: the codecs are not identified in xapu.dll or any title (see docs/BLOCKERS.md, xapu processTypes 1 and 3)) |
+| `XApuConnect` | implemented | [crates/compat/xapu/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/xapu/src/lib.rs) (all three XApuProcessType values run (docs.xbox.com xapuprocesstype: 1 DecodeOpus, 2 DecodeConvertOpus, 3 ConvertPCM) with the xapu.dll 0x14f0 parameter checks (frame 0x80..0x400 even only for types 2/3) and options 2 DeinterleavedInput / 4 DeinterleavedOutput / 8 EnableResultReadyEvent (XDefiant passes 4 at its call into the XApuConnect thunk); activate follows console 0x1d28: types 2/3 return XAPU_E_BUFFER_TOO_SMALL only when processingBufferLength - ch*frame*4 is in [0, ch*1920) (signed compare), type 1 has no buffer check; type 1 writes the whole decoded packet (interleaved or left then right at outputFrameCount); types 2/3 run a real pitch sample-rate converter (windowed sinc, 5-frame group delay as documented, pitch clamped to 1/8..8, per-output-frame ramp toward targetPitch, ramp magnitude clamped to 2^-18..8) that emits maxFrameCountPerOutput blocks, partial blocks only on Flush, with OutputReady/NeedMoreInput/MoreOutputAvailable/OutputSaturation state, documented stateData u16s, currentPitch, totalExecutionTime in us; ConvertPCM validates frameCount (4..960 step 4, interleaved stereo step 8) and inputDataLength; Reset restores startPitch and clears the converter, option 4 also resets the decoder; bad packets report XAPU_E_BAD_OPUS_PACKET; tests decode_opus_type1_matches_libopus_in_both_layouts, convert_pcm_unity_pitch_is_delayed_identity, convert_pcm_pitch_changes_rate_and_validates, reset_restores_start_pitch_and_clears_converter, activation_buffer_check_follows_console_signed_compare, opus_stream_decodes_like_libopus (12/12 xapu tests pass). The converter filter is not the console HSRC filter, see docs/BLOCKERS.md xapu HSRC) |
 | `XApuDequeueResult` | implemented | [crates/compat/xapu/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/xapu/src/lib.rs) (results commit in submission order, result event signalled on commit) |
 | `XApuDisconnect` | implemented | [crates/compat/xapu/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/xapu/src/lib.rs) (waits for in-flight host decodes, then frees) |
 | `XApuEnqueueCommand` | implemented | [crates/compat/xapu/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/xapu/src/lib.rs) (async like the console submit ring: commands go to a host worker pool, per-stream order kept) |
@@ -426,16 +426,7 @@ Listed: imports from Xbox console libraries only. Not listed: 1218 imports a PC 
 
 </details>
 
-XDefiant console-library import totals (11 binaries): implemented 40, forwarded 5, hooked 5, stub 2.
-
-<details><summary><b>XDefiant: imports not covered</b> (2; status not implemented / forwarded / hooked / pc / title)</summary>
-
-| Binary | Module | Function | Status | Also imported by |
-|---|---|---|---|---|
-| Rogue_scarlett_rtx.exe | chad.dll | `XDspActivate` | stub | only XDefiant |
-| Rogue_scarlett_rtx.exe | xapu.dll | `XApuConnect` | stub | Minecraft |
-
-</details>
+XDefiant console-library import totals (11 binaries): implemented 42, forwarded 5, hooked 5.
 
 XDefiant console OS 10.0.22000.4429, 87 console libraries with console-only exports; vs Fortnite (OS 10.0.19041.3948): 6 DLLs only here, 0 DLLs only there, 102 exports only here in shared DLLs; vs Terraria (OS 10.0.22000.4429, same build): 0 DLLs only here, 0 DLLs only there, 0 exports only here in shared DLLs; vs Trackmania (OS 10.0.22621.1852): 0 DLLs only here, 0 DLLs only there, 19 exports only here in shared DLLs.
 
@@ -999,11 +990,11 @@ Listed: imports from Xbox console libraries only. Not listed: 2086 imports a PC 
 
 </details>
 
-<details><summary><b>xapu.dll</b>: 4 functions; implemented 3, stub 1</summary>
+<details><summary><b>xapu.dll</b>: 4 functions; implemented 4</summary>
 
 | Function | Status | Implemented in / evidence |
 |---|---|---|
-| `XApuConnect` | stub | [crates/compat/xapu/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/xapu/src/lib.rs) (processType 2 (Opus) decodes on the host with the console validation; processTypes 1 and 3 pass the console parameter checks and then return E_NOTIMPL: the codecs are not identified in xapu.dll or any title (see docs/BLOCKERS.md, xapu processTypes 1 and 3)) |
+| `XApuConnect` | implemented | [crates/compat/xapu/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/xapu/src/lib.rs) (all three XApuProcessType values run (docs.xbox.com xapuprocesstype: 1 DecodeOpus, 2 DecodeConvertOpus, 3 ConvertPCM) with the xapu.dll 0x14f0 parameter checks (frame 0x80..0x400 even only for types 2/3) and options 2 DeinterleavedInput / 4 DeinterleavedOutput / 8 EnableResultReadyEvent (XDefiant passes 4 at its call into the XApuConnect thunk); activate follows console 0x1d28: types 2/3 return XAPU_E_BUFFER_TOO_SMALL only when processingBufferLength - ch*frame*4 is in [0, ch*1920) (signed compare), type 1 has no buffer check; type 1 writes the whole decoded packet (interleaved or left then right at outputFrameCount); types 2/3 run a real pitch sample-rate converter (windowed sinc, 5-frame group delay as documented, pitch clamped to 1/8..8, per-output-frame ramp toward targetPitch, ramp magnitude clamped to 2^-18..8) that emits maxFrameCountPerOutput blocks, partial blocks only on Flush, with OutputReady/NeedMoreInput/MoreOutputAvailable/OutputSaturation state, documented stateData u16s, currentPitch, totalExecutionTime in us; ConvertPCM validates frameCount (4..960 step 4, interleaved stereo step 8) and inputDataLength; Reset restores startPitch and clears the converter, option 4 also resets the decoder; bad packets report XAPU_E_BAD_OPUS_PACKET; tests decode_opus_type1_matches_libopus_in_both_layouts, convert_pcm_unity_pitch_is_delayed_identity, convert_pcm_pitch_changes_rate_and_validates, reset_restores_start_pitch_and_clears_converter, activation_buffer_check_follows_console_signed_compare, opus_stream_decodes_like_libopus (12/12 xapu tests pass). The converter filter is not the console HSRC filter, see docs/BLOCKERS.md xapu HSRC) |
 | `XApuEnqueueCommand` | implemented | [crates/compat/xapu/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/xapu/src/lib.rs) (async like the console submit ring: commands go to a host worker pool, per-stream order kept) |
 | `XApuDequeueResult` | implemented | [crates/compat/xapu/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/xapu/src/lib.rs) (results commit in submission order, result event signalled on commit) |
 | `XApuDisconnect` | implemented | [crates/compat/xapu/src/lib.rs](https://github.com/drycheetah84/TomBox/blob/master/crates/compat/xapu/src/lib.rs) (waits for in-flight host decodes, then frees) |
@@ -1021,15 +1012,7 @@ Listed: imports from Xbox console libraries only. Not listed: 2086 imports a PC 
 
 </details>
 
-Minecraft console-library import totals (22 binaries): implemented 27, forwarded 6, hooked 1, stub 1.
-
-<details><summary><b>Minecraft: imports not covered</b> (1; status not implemented / forwarded / hooked / pc / title)</summary>
-
-| Binary | Module | Function | Status | Also imported by |
-|---|---|---|---|---|
-| fmod.dll | xapu.dll | `XApuConnect` | stub | XDefiant |
-
-</details>
+Minecraft console-library import totals (22 binaries): implemented 28, forwarded 6, hooked 1.
 
 Minecraft: no EmbeddedXvd extracted, so no console OS export table of its own; per-build emulator tables and API-set hosts use build 22000 (from 10.0.22000.3160, not a console OS version).
 
@@ -1044,7 +1027,7 @@ Console-related exports of the DLLs in each title's EmbeddedXvd `Windows\System3
 | advapi32legacy.dll | System32 | no | 207 | 6 | 201 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 1 | 1 | 1 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | AudioHALWrapper.dll | System32 | no | 32 | 32 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 30 | 0 | 14 | 30 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | bootshsvc.dll | System32 | no | 2 | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
-| chad.dll | System32 | no | 7 | 6 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 5 | 0 | 0 | 0 | XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
+| chad.dll | System32 | no | 7 | 7 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 5 | 0 | 0 | 0 | XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | ConIoSrv.dll | System32 | no | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | ConnectedStorageService.ProxyStub.dll | System32 | no | 5 | 5 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | d3d12_x.dll | System32 | no | 54 | 52 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 4 | 5 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
@@ -1093,7 +1076,7 @@ Console-related exports of the DLLs in each title's EmbeddedXvd `Windows\System3
 | MFH264Enc.dll | System32 | yes | 2 | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite None; XDefiant None; Terraria None; Trackmania None |
 | mfhevcdec.dll | System32 | no | 5 | 5 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite None; XDefiant None; Terraria None; Trackmania None |
 | mflnmhelp.dll | System32 | no | 15 | 15 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite None; XDefiant None; Terraria None; Trackmania None |
-| mfplat.dll | System32 | yes | 8 | 6 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 0 | Fortnite None; XDefiant None; Terraria None; Trackmania None |
+| mfplat.dll | System32 | yes | 8 | 7 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 0 | Fortnite None; XDefiant None; Terraria None; Trackmania None |
 | minappmodelx.dll | System32 | no | 4 | 4 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 4 | 4 | 4 | 4 | 4 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | minuserx.dll | System32 | no | 74 | 40 | 34 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 9 | 10 | 12 | 13 | 15 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | msave64xgs.dll | System32 | no | 24 | 24 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
@@ -1118,7 +1101,7 @@ Console-related exports of the DLLs in each title's EmbeddedXvd `Windows\System3
 | wdbase.dll | System32 | no | 29 | 29 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | WerXboxGc.dll | System32 | no | 19 | 19 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | wldp.dll | System32 | yes | 13 | 13 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
-| xapu.dll | System32 | no | 6 | 5 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 5 | 0 | 0 | 4 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
+| xapu.dll | System32 | no | 6 | 6 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 5 | 0 | 0 | 4 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xbsc_xs.dll | System32 | no | 41 | 17 | 24 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 2020.11015.12200.10000; XDefiant 2206.2209.12105.11142; Terraria 2206.2209.12105.11142; Trackmania 2210.2210.12006.15549 |
 | xbthunk.dll | System32 | no | 11 | 11 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xbtp.dll | System32 | no | 133 | 131 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
@@ -1129,7 +1112,7 @@ Console-related exports of the DLLs in each title's EmbeddedXvd `Windows\System3
 | xfp_gc.dll | System32 | no | 8 | 8 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xfrontpaneldisplay.dll | System32 | no | 8 | 8 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 6 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xg_x.dll | System32 | no | 21 | 21 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 4 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
-| xg_xs.dll | System32 | no | 23 | 21 | 0 | 0 | 0 | 0 | 0 | 2 | 0 | 0 | 0 | 1 | 1 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
+| xg_xs.dll | System32 | no | 23 | 23 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 1 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xgs12.dll | System32 | no | 17 | 17 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xgs12_10.dll | System32 | no | 21 | 21 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xgs12_10d.dll | System32 | no | 21 | 21 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
@@ -1143,8 +1126,8 @@ Console-related exports of the DLLs in each title's EmbeddedXvd `Windows\System3
 | xtfbaseservices.dll | System32 | no | 60 | 60 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xtfconsolecontrol.dll | System32 | no | 2 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xtfdebugmonitor.dll | System32 | no | 2 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
-| xtfdiaginfo.dll | System32 | no | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 2 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
-| xtfeventserver.dll | System32 | no | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
+| xtfdiaginfo.dll | System32 | no | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
+| xtfeventserver.dll | System32 | no | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xtffileio.dll | System32 | no | 2 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xtfpix.dll | System32 | no | 9 | 9 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xtfremoterun.dll | System32 | no | 2 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
@@ -1152,7 +1135,7 @@ Console-related exports of the DLLs in each title's EmbeddedXvd `Windows\System3
 
 ### Not targeted (no analysed title references them)
 
-The console-library total above (2155 exports in 110 libraries) keeps every console-only export in the denominator, including devkit, tools and OS service DLLs that no analysed title imports. 109 libraries (2154 exports) are imported by at least one title, directly or through API-set host attribution, or are emulator-provided; the 1 below (1 exports) are not targeted: no title EXE or shipped DLL imports any of their exports and the emulator does not provide them. They stay `missing` in the headline instead of being dropped from it, so the percentage is not inflated; a library moves out of this list as soon as a title imports it or an emulator crate exports it. The earlier Xbox-only figure (2078 exports) counted only DLLs with no same-named PC DLL and is kept in `summary.json` under `all_including_pc`. Coverage inside the 109 targeted libraries alone: 2142/2154.
+The console-library total above (2155 exports in 110 libraries) keeps every console-only export in the denominator, including devkit, tools and OS service DLLs that no analysed title imports. 109 libraries (2154 exports) are imported by at least one title, directly or through API-set host attribution, or are emulator-provided; the 1 below (1 exports) are not targeted: no title EXE or shipped DLL imports any of their exports and the emulator does not provide them. They stay `missing` in the headline instead of being dropped from it, so the percentage is not inflated; a library moves out of this list as soon as a title imports it or an emulator crate exports it. The earlier Xbox-only figure (2078 exports) counted only DLLs with no same-named PC DLL and is kept in `summary.json` under `all_including_pc`. Coverage inside the 109 targeted libraries alone: 2147/2154.
 
 | Library | Folder | Same-named PC DLL | Console-only exports | Present in |
 |---|---|---|---|---|
@@ -1888,17 +1871,17 @@ No PC DLL is named advapi32legacy.dll; it is emulated by its compat crate, so no
 
 </details>
 
-<details><summary><b>chad.dll</b>: 7 console-only exports, 6 covered</summary>
+<details><summary><b>chad.dll</b>: 7 console-only exports, 7 covered</summary>
 
 | Function | Status | Imported by | Present in |
 |---|---|---|---|
+| `XDspActivate` | implemented | XDefiant | XDefiant, Terraria, Trackmania |
 | `XDspConnect` | implemented | XDefiant | XDefiant, Terraria, Trackmania |
 | `XDspConnectWithMaximumStreamLimit` | implemented |  | Trackmania |
 | `XDspDeactivate` | implemented | XDefiant | XDefiant, Terraria, Trackmania |
 | `XDspDisconnect` | implemented | XDefiant | XDefiant, Terraria, Trackmania |
 | `XDspSubmitCommand` | implemented | XDefiant | XDefiant, Terraria, Trackmania |
 | `XDspSubmitCommandWithEnvelope` | implemented |  | Trackmania |
-| `XDspActivate` | stub | XDefiant | XDefiant, Terraria, Trackmania |
 
 </details>
 
@@ -3094,12 +3077,12 @@ No PC DLL is named kernel32legacy.dll; it is emulated by its compat crate, so no
 |---|---|---|---|
 | `LFGetGlobalPool` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `MFBlockThread` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
+| `MFGetPlatform` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `MFGetPrivateWorkqueues` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `MFJoinIoPort` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `MFResetDXGIDeviceManagerX` | implemented | Fortnite | Fortnite, XDefiant, Terraria, Trackmania |
 | `MFUnblockThread` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `MFCreateDXGISurfaceBufferX` | forwarded |  | Fortnite, XDefiant, Terraria, Trackmania |
-| `MFGetPlatform` | forwarded |  | Fortnite, XDefiant, Terraria, Trackmania |
 
 </details>
 
@@ -3618,16 +3601,16 @@ No PC DLL is named minuserx.dll; it is emulated by its compat crate, so no row i
 
 </details>
 
-<details><summary><b>xapu.dll</b>: 6 console-only exports, 5 covered</summary>
+<details><summary><b>xapu.dll</b>: 6 console-only exports, 6 covered</summary>
 
 | Function | Status | Imported by | Present in |
 |---|---|---|---|
+| `XApuConnect` | implemented | Minecraft, XDefiant | Fortnite, XDefiant, Terraria, Trackmania |
 | `XApuDequeueResult` | implemented | Minecraft, XDefiant | Fortnite, XDefiant, Terraria, Trackmania |
 | `XApuDisconnect` | implemented | Minecraft, XDefiant | Fortnite, XDefiant, Terraria, Trackmania |
 | `XApuEnqueueCommand` | implemented | Minecraft, XDefiant | Fortnite, XDefiant, Terraria, Trackmania |
 | `XApuGetResultCount` | implemented | XDefiant | Fortnite, XDefiant, Terraria, Trackmania |
 | `XApuGetUtilization` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
-| `XApuConnect` | stub | Minecraft, XDefiant | Fortnite, XDefiant, Terraria, Trackmania |
 
 </details>
 
@@ -4063,7 +4046,7 @@ No PC DLL is named minuserx.dll; it is emulated by its compat crate, so no row i
 
 </details>
 
-<details><summary><b>xg_xs.dll</b>: 23 console-only exports, 21 covered</summary>
+<details><summary><b>xg_xs.dll</b>: 23 console-only exports, 23 covered</summary>
 
 | Function | Status | Imported by | Present in |
 |---|---|---|---|
@@ -4080,7 +4063,9 @@ No PC DLL is named minuserx.dll; it is emulated by its compat crate, so no row i
 | `XGCreateTexture3DComputer` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGCreateTextureComputer` | implemented | Fortnite | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGCreateTextureComputerFromDescriptor` | implemented | XDefiant | Fortnite, XDefiant, Terraria, Trackmania |
+| `XGDecodeDCC` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGEnableExclusiveLocking` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
+| `XGEncodeDCC` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGEnterExclusiveLock` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGInitializeLibrary` | implemented |  | XDefiant, Terraria, Trackmania |
 | `XGLeaveExclusiveLock` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
@@ -4088,8 +4073,6 @@ No PC DLL is named minuserx.dll; it is emulated by its compat crate, so no row i
 | `XGTerminateLibrary` | implemented |  | XDefiant, Terraria, Trackmania |
 | `XGValidateDepthStencilSwizzleMode` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGValidateDescriptor` | implemented |  | XDefiant, Terraria, Trackmania |
-| `XGDecodeDCC` | stub |  | Fortnite, XDefiant, Terraria, Trackmania |
-| `XGEncodeDCC` | stub |  | Fortnite, XDefiant, Terraria, Trackmania |
 
 </details>
 
@@ -4458,12 +4441,12 @@ No PC DLL is named minuserx.dll; it is emulated by its compat crate, so no row i
 
 </details>
 
-<details><summary><b>xtfdiaginfo.dll</b>: 2 console-only exports, 0 covered</summary>
+<details><summary><b>xtfdiaginfo.dll</b>: 2 console-only exports, 1 covered</summary>
 
 | Function | Status | Imported by | Present in |
 |---|---|---|---|
-| `#10` | missing |  | Fortnite, XDefiant, Terraria, Trackmania |
-| `#4` | missing |  | Fortnite, XDefiant, Terraria, Trackmania |
+| `#4` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
+| `#10` | unsupported |  | Fortnite, XDefiant, Terraria, Trackmania |
 
 </details>
 
@@ -4472,7 +4455,7 @@ No PC DLL is named minuserx.dll; it is emulated by its compat crate, so no row i
 | Function | Status | Imported by | Present in |
 |---|---|---|---|
 | `GetEventSourceMap` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
-| `#4` | missing |  | Fortnite, XDefiant, Terraria, Trackmania |
+| `#4` | unsupported |  | Fortnite, XDefiant, Terraria, Trackmania |
 
 </details>
 
@@ -4520,22 +4503,22 @@ No PC DLL is named minuserx.dll; it is emulated by its compat crate, so no row i
 
 </details>
 
-## Verified on this machine (Fortnite)
+## Verified on this machine (running titles)
 
 | Milestone | Evidence |
 |---|---|
-| Boots (process starts, GDK runtime services up) | `%TEMP%\tombox\run.txt:1-4` |
-| First frames (PresentX into the title window) | `%TEMP%\tombox\tombox_compat.log:14540` |
-| Window clamped to the primary monitor | `%TEMP%\tombox\tombox_compat.log:12987` |
-| Login complete (HandleLoginRequestComplete Result=2) | `%TEMP%\tombox\run.txt:5962` |
-| Hotfix check UpdateSuccess | `%TEMP%\tombox\run.txt:3401,6094` |
-| Game-mode select (UI.State.Startup.SubgameSelect) | `%TEMP%\tombox\run.txt:6249` |
-| Battle Royale lobby (UI.State.Athena.Frontend) | `%TEMP%\tombox\run.txt:6496` |
-| 3D scene correct | not reached |
-| Keyboard / controller input | not reached |
-| Audio | not reached |
-| Gameplay | not reached |
-| A second title running | not reached |
+| Fortnite: Boots (process starts, GDK runtime services up) | `%TEMP%\tombox\run.txt:1-4` |
+| Fortnite: First frames (PresentX into the title window) | `%TEMP%\tombox\tombox_compat.log:14540` |
+| Fortnite: Window clamped to the primary monitor | `%TEMP%\tombox\tombox_compat.log:12987` |
+| Fortnite: Login complete (HandleLoginRequestComplete Result=2) | `%TEMP%\tombox\run.txt:5962` |
+| Fortnite: Hotfix check UpdateSuccess | `%TEMP%\tombox\run.txt:3401,6094` |
+| Fortnite: Game-mode select (UI.State.Startup.SubgameSelect) | `%TEMP%\tombox\run.txt:6249` |
+| Fortnite: Battle Royale lobby (UI.State.Athena.Frontend) | `%TEMP%\tombox\run.txt:6496` |
+| Trackmania: keyboard / controller input (host pad and keyboard drive the menus to the campaign map; user session 2026-11-22) | `TomBox tools/dev/batch_runs/user_play_r32b/run.txt (init challenge 'Training - 01', 'Training - 02', 'Spring 2024 - 01')` |
+| Trackmania: gameplay (drives Training - 01 at ~60 fps avg, loads campaign Spring 2024 - 01) | `TomBox tools/dev/batch_runs/fast_20261122_223736_trackmania_r32_batch_control_warm2/result.json; TomBox tools/dev/batch_runs/user_play_r32b/run.txt` |
+| Second title running: Trackmania and Terraria (Terraria reaches its world at 60 fps) | `TomBox tools/dev/batch_runs/fast_20261122_201135_terraria_tr_default_copy2/result.json` |
+| 3D scene correct | not reached: Trackmania renders its races, but video and streamed textures stay black (CPU writes into GPU memory are not mirrored yet) and the stencil-tested lighting passes are dark |
+| Audio | in progress: XAudio2 engine creation and XMA2 source-voice wrapping verified 2026-11-22 (Trackmania); audible output not verified since test runs are muted |
 
 ## Unverified
 

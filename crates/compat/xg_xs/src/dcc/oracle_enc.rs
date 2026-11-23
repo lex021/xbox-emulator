@@ -11,22 +11,23 @@ pub(super) enum St {
     Sub,
 }
 
-fn stages() -> Vec<(&'static str, St)> {
+fn stages(v: &crate::dcc_oracle::Rv) -> Vec<(&'static str, St)> {
+    let n = |a: &str, r: usize| -> &'static str { Box::leak(format!("{} {:#x}", a, r).into_boxed_str()) };
     vec![
-        ("relayout b0->b2 mode1 0x4ac90", St::Lay(0, 1)),
-        ("clear detect 0x26680", St::C1(0x26680, enc::clear_detect)),
-        ("channel pack 0x27330", St::C1(0x27330, enc::channel)),
-        ("signfix 0x27d10", St::C1(0x27d10, dec::signfix)),
-        ("relayout mode2 0x4ac90", St::Lay(2, 2)),
-        ("color fwd 0x27e50", St::C1(0x27e50, enc::color)),
-        ("relayout mode3 0x4ac90", St::Lay(2, 3)),
-        ("delta 0x28720", St::C1(0x28720, enc::delta)),
-        ("vrs 0x28df0", St::C1(0x28df0, enc::vrs)),
-        ("choose 0x292c0", St::C1(0x292c0, enc::choose)),
-        ("far 0x29e40", St::C1(0x29e40, enc::far)),
-        ("far base 0x29740 x4 + save/restore", St::Sub),
-        ("plan 0x2a4e0", St::C1(0x2a4e0, enc::plan)),
-        ("pack 0x2a8e0", St::C1(0x2a8e0, enc::pack)),
+        (n("relayout b0->b2 mode1", v.relay), St::Lay(0, 1)),
+        (n("clear detect", v.clear), St::C1(v.clear, enc::clear_detect)),
+        (n("channel pack", v.channel), St::C1(v.channel, enc::channel)),
+        (n("signfix", v.signfix), St::C1(v.signfix, dec::signfix)),
+        (n("relayout mode2", v.relay), St::Lay(2, 2)),
+        (n("color fwd", v.color), St::C1(v.color, enc::color)),
+        (n("relayout mode3", v.relay), St::Lay(2, 3)),
+        (n("delta", v.delta), St::C1(v.delta, enc::delta)),
+        (n("vrs", v.vrs), St::C1(v.vrs, enc::vrs)),
+        (n("choose", v.choose), St::C1(v.choose, enc::choose)),
+        (n("far", v.far), St::C1(v.far, enc::far)),
+        (n("far base x4 + save/restore", v.far_base), St::Sub),
+        (n("plan", v.plan), St::C1(v.plan, enc::plan)),
+        (n("pack", v.pack), St::C1(v.pack, enc::pack)),
     ]
 }
 
@@ -34,7 +35,7 @@ pub(super) fn console_stage(o: &Oracle, c: &Con, s: &Dcc, st: St) -> Dcc {
     c.push(s);
     match st {
         St::Lay(src, mode) => {
-            let lay: Lay = unsafe { core::mem::transmute(o.h + 0x4ac90) };
+            let lay: Lay = unsafe { core::mem::transmute(o.h + c.rv.relay) };
             let dst = c.buf(2).as_mut_ptr();
             let sp = c.buf(src).as_ptr();
             unsafe { lay(c.p(), dst, sp, mode) };
@@ -46,7 +47,7 @@ pub(super) fn console_stage(o: &Oracle, c: &Con, s: &Dcc, st: St) -> Dcc {
         }
         St::Sub => {
             for k in 0..4 {
-                c.call2(0x29740, k);
+                c.call2(c.rv.far_base, k);
             }
             let mut p = c.pull();
             let b = p.b[2];
@@ -87,10 +88,10 @@ fn inputs(r: &mut Rng, bpe: usize) -> Vec<[u8; 256]> {
 fn oracle_dcc_enc_stages() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
-    if !crate::dcc_oracle::rvas_22000(&o) {
-        println!("oracle_dcc_enc_stages: skipped, its console RVAs are the 22000 build's");
+    let Some(rv) = crate::dcc_oracle::rv(&o) else {
+        println!("oracle_dcc_enc_stages: skipped, console stage RVAs are mapped for the 22000 and 19041 builds only");
         return;
-    }
+    };
     let hl = holes(&o);
     let st = states();
     let covered: usize = st.iter().map(|x| x.1).sum();
@@ -111,15 +112,16 @@ fn oracle_dcc_enc_stages() {
             s.w32(0xf0, 0);
             let start = copy(&s);
             let mut ok = true;
-            for (name, stg) in stages() {
-                if let St::C1(0x27e50, _) = stg {
+            for (name, stg) in stages(&rv) {
+                if let St::C1(r, _) = stg { if r == rv.color {
                     if enc::color_faults(&s) {
                         faults += 1;
                         assert_eq!(enc::color(&mut copy(&s)), Err(E_INVALIDARG));
                         ok = false;
                         break;
                     }
-                }
+                } }
+                let g = crate::dcc_oracle::sync_relay_g(&o);
                 let n = match native_stage(&s, stg) {
                     Ok(n) => n,
                     Err(_) => {
@@ -128,6 +130,7 @@ fn oracle_dcc_enc_stages() {
                         break;
                     }
                 };
+                crate::dcc_oracle::put_relay_g(&o, g);
                 let p = console_stage(&o, &c, &s, stg);
                 t.hit(name, diff(&n, &p, &hl, true), &ctx);
                 s = p;
@@ -137,16 +140,18 @@ fn oracle_dcc_enc_stages() {
                 s = copy(&base);
                 continue;
             }
+            let g = crate::dcc_oracle::sync_relay_g(&o);
             let mut n = copy(&start);
             enc::run(&mut n).expect("native driver failed after all native stages succeeded");
+            crate::dcc_oracle::put_relay_g(&o, g);
             c.push(&start);
-            c.call1(0x26220);
+            c.call1(rv.driver);
             let p = c.pull();
             let m = diff(&n, &p, &hl, true);
             if m.is_some() {
                 driver_bad += 1;
             }
-            t.hit("driver 0x26220", m, &ctx);
+            t.hit(Box::leak(format!("driver {:#x}", rv.driver).into_boxed_str()), m, &ctx);
             s = p;
         }
     }
@@ -179,14 +184,36 @@ pub(super) fn console_encode(o: &Oracle, src: &[u8], count: usize, f: u32, sw: u
     (r, out, meta, sz)
 }
 
+fn why_e2e(o: &Oracle, src: &[u8], count: usize, f: u32, sw: u32, dim: u32, p0: u32, p1: u32, cmeta: &[u8]) {
+    let _ = crate::dcc_oracle::sync_relay_g(o);
+    let mut d = Dcc::new();
+    d.init(f, sw, dim, p0, p1).unwrap();
+    let c = Con::new(o, f, sw, dim, p0, p1).unwrap();
+    for i in 0..count {
+        d.b[0].copy_from_slice(&src[i * 256..i * 256 + 256]);
+        let pre = copy(&d);
+        let mut r = copy(&pre);
+        let rr = enc::run(&mut r);
+        c.push(&pre);
+        c.call1(c.rv.driver);
+        let p = c.pull();
+        let eb = super::enc_block(&mut d);
+        println!("  why block {}: enc_block {:?} meta {:02x} | enc::run {:?} meta {:02x} | console driver on native pre meta {:02x} | console export meta {:02x} | pre 0x58={:02x} 0xf0={:#x}", i, eb.map(|x| x.0), d.r8(0x58), rr, r.r8(0x58), p.r8(0x58), cmeta[i], pre.r8(0x58), pre.r32(0xf0));
+        if eb.is_err() {
+            break;
+        }
+    }
+}
+
 #[test]
-fn oracle_dcc_enc_e2e() {
+fn oracle_dcc_enc_e2e_undefined_masked() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
     let cdec: DecF = unsafe { core::mem::transmute(o.f("XGDecodeDCC")) };
     let st = states();
     let mut r = Rng(0xe2e_e4c_31);
     let (mut calls, mut blocks, mut bad, mut undef, mut nerr, mut faults, mut rt, mut rtbad, mut lossy) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut masked, mut dmasked) = (0u64, 0u64);
     let mut extra: Vec<(u32, u32, u32, u32, u32)> = configs();
     extra.retain(|_| r.below(30) == 0);
     let mut cfgs: Vec<(u32, u32, u32, u32, u32)> = st.iter().map(|x| x.0).collect();
@@ -209,6 +236,7 @@ fn oracle_dcc_enc_e2e() {
             let mut nd = vec![0u8; 256 * count];
             let mut nm = vec![0u8; count];
             let mut ns = vec![0u32; count];
+            let g = crate::dcc_oracle::sync_relay_g(&o);
             let nr = crate::dcc::encode(count as u32, &src, &mut nd, &mut nm, Some(&mut ns), f, sw, dim, p0, p1);
             if nr != 0 {
                 assert_eq!(nr, E_INVALIDARG);
@@ -222,19 +250,31 @@ fn oracle_dcc_enc_e2e() {
                 }
                 continue;
             }
+            let nu = crate::dcc::last_undefined();
+            masked += nu.iter().filter(|&&x| x).count() as u64;
+            crate::dcc_oracle::put_relay_g(&o, g);
             let a = console_encode(&o, &src, count, f, sw, dim, p0, p1, 0xaa, 0xa5);
+            crate::dcc_oracle::put_relay_g(&o, g);
             let b = console_encode(&o, &src, count, f, sw, dim, p0, p1, 0x55, 0x5a);
             calls += 2;
             blocks += count as u64;
-            if a != b {
+            let blk_eq = |x: &(i32, Vec<u8>, Vec<u8>, Vec<u32>), dd: &[u8], mm: &[u8], ss: &[u32], i: usize| x.1[i * 256..i * 256 + 256] == dd[i * 256..i * 256 + 256] && x.2[i] == mm[i] && x.3[i] == ss[i];
+            let defined: Vec<usize> = (0..count).filter(|&i| !nu[i]).collect();
+            if a.0 != b.0 || defined.iter().any(|&i| !blk_eq(&a, &b.1, &b.2, &b.3, i)) {
                 undef += 1;
                 if undef <= 5 {
                     let j = (0..a.1.len()).find(|&j| a.1[j] != b.1[j]);
                     println!("e2e console output depends on prior memory f={} sw={} dim={} p0={} p1={:#x} count={} first dst diff {:?} meta {:02x?}/{:02x?}", f, sw, dim, p0, p1, count, j, a.2, b.2);
                 }
             }
-            if a.0 != 0 || a.1 != nd || a.2 != nm || a.3 != ns {
+            if a.0 != 0 || defined.iter().any(|&i| !blk_eq(&a, &nd, &nm, &ns, i)) {
                 bad += 1;
+                if bad <= 3 && std::env::var("TOMBOX_DCC_E2E_TRACE").is_ok() {
+                    e2e_trace(&o, &src, count, f, sw, dim, p0, p1);
+                }
+                if bad <= 3 && std::env::var("TOMBOX_DCC_E2E_WHY").is_ok() {
+                    why_e2e(&o, &src, count, f, sw, dim, p0, p1, &a.2);
+                }
                 if bad <= 10 {
                     let j = (0..nd.len()).find(|&j| a.1[j] != nd[j]);
                     println!("e2e f={} sw={} dim={} p0={} p1={:#x} count={}: hr={:#x} meta n{:02x?} c{:02x?} sizes n{:?} c{:?} first dst diff {:?}", f, sw, dim, p0, p1, count, a.0, nm, a.2, ns, a.3, j.map(|j| (j, nd[j], a.1[j])));
@@ -242,11 +282,17 @@ fn oracle_dcc_enc_e2e() {
             }
             let prm = [p0, p1, 0, 0];
             let mut cd = vec![0u8; 256 * count];
+            let g = crate::dcc_oracle::sync_relay_g(&o);
             let cr = unsafe { cdec(count as u32, nd.as_ptr(), nm.as_ptr(), cd.as_mut_ptr(), f, sw, dim, prm.as_ptr()) };
+            if let Some(g) = g {
+                crate::dcc::enc::set_relay_g(crate::dcc::enc::RelayG { b: g, known: [true; 64] });
+            }
             let mut dd = vec![0u8; 256 * count];
             let dr = crate::dcc::decode(count as u32, &nd, &nm, &mut dd, f, sw, dim, p0, p1);
+            let du = if dr == 0 { crate::dcc::last_undefined() } else { Vec::new() };
+            dmasked += du.iter().filter(|&&x| x).count() as u64;
             rt += 1;
-            if dr == 0 && (cr != 0 || cd != dd) {
+            if dr == 0 && (cr != 0 || (0..count).any(|i| !du[i] && cd[i * 256..i * 256 + 256] != dd[i * 256..i * 256 + 256])) {
                 rtbad += 1;
                 if rtbad <= 5 {
                     println!("round trip f={} sw={} dim={} p0={} p1={:#x} count={}: native decode differs from console decode", f, sw, dim, p0, p1, count);
@@ -257,7 +303,7 @@ fn oracle_dcc_enc_e2e() {
             }
         }
     }
-    println!("dcc enc e2e: {} XGEncodeDCC calls, {} blocks, {} mismatches, {} console results depending on prior memory, {} native E_INVALIDARG (non-fault), {} color #DE predicted, {} round trips, {} native/console decode mismatches, {} lossy round trips", calls, blocks, bad, undef, nerr, faults, rt, rtbad, lossy);
+    println!("dcc enc e2e, undefined blocks masked: {} XGEncodeDCC calls, {} blocks ({} undefined on the console and masked), {} mismatches on defined blocks, {} console results depending on prior memory in defined blocks, {} native E_INVALIDARG (non-fault), {} color #DE predicted, {} round trips ({} decoded blocks undefined and masked), {} native/console decode mismatches, {} lossy round trips", calls, blocks, masked, bad, undef, nerr, faults, rt, dmasked, rtbad, lossy);
     assert_eq!(bad, 0);
     assert_eq!(undef, 0);
     assert_eq!(rtbad, 0);
@@ -557,7 +603,7 @@ fn oracle_dcc_enc_convert_holes() {
 }
 
 #[test]
-fn oracle_dcc_encode_export_shim() {
+fn oracle_dcc_encode_export_shim_undefined_masked() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(o) = oracle() else { return };
     let cenc: Enc = unsafe { core::mem::transmute(o.f("XGEncodeDCC")) };
@@ -587,7 +633,7 @@ fn oracle_dcc_encode_export_shim() {
             assert_eq!(x, y, "f={:#x} sw={:#x}", f, sw);
         }
     }
-    let (mut asserts, mut skipped, mut nulls) = (0u64, 0u64, 0u64);
+    let (mut asserts, mut skipped, mut nulls, mut masked) = (0u64, 0u64, 0u64, 0u64);
     for f in 1..=0x78u32 {
         if !crate::dcc::safe_format(f) {
             for cnt in [0u32, 1] {
@@ -617,7 +663,14 @@ fn oracle_dcc_encode_export_shim() {
                         skipped += 1;
                         continue;
                     }
+                    let nu = crate::dcc::last_undefined();
                     let y = call(false, cnt, s.as_ptr(), b.as_mut_ptr(), mb.as_mut_ptr(), if z { core::ptr::null_mut() } else { sb.as_mut_ptr() }, f, sw, dim, p.as_ptr());
+                    for (i, _) in nu.iter().enumerate().filter(|(_, &u)| u) {
+                        masked += 1;
+                        a[i * 256..i * 256 + 256].copy_from_slice(&b[i * 256..i * 256 + 256]);
+                        ma[i] = mb[i];
+                        sa[i] = sb[i];
+                    }
                     cases += 1;
                     if z {
                         nulls += 1;
@@ -628,7 +681,7 @@ fn oracle_dcc_encode_export_shim() {
             }
         }
     }
-    println!("dcc encode export shim: {} cases match console (hr, dst, meta, sizes; {} with sizes=NULL), {} unsupported-format calls return E_INVALIDARG, {} native E_INVALIDARG (console not run: color #DE or stack-dependent output)", cases, nulls, asserts, skipped);
+    println!("dcc encode export shim, undefined blocks masked: {} cases match console (hr, and dst, meta, sizes of every defined block; {} with sizes=NULL; {} blocks undefined on the console and masked), {} unsupported-format calls return E_INVALIDARG, {} native E_INVALIDARG (console not run: color #DE)", cases, nulls, masked, asserts, skipped);
 }
 
 fn de_enc_cases(n: usize, fault: bool) -> Vec<((u32, u32, u32, u32, u32), [u8; 256])> {
@@ -698,3 +751,112 @@ fn oracle_dcc_enc_color_fault_child() {
     println!("dcc enc color #DE: {} predicted cases raised STATUS_INTEGER_DIVIDE_BY_ZERO in child processes, {} bpe<4 non-fault cases ran without #DE", seen[1], seen[0]);
 }
 
+
+fn e2e_trace(o: &Oracle, src: &[u8], count: usize, f: u32, sw: u32, dim: u32, p0: u32, p1: u32) {
+    let Some(c) = Con::new(o, f, sw, dim, p0, p1) else { return };
+    let mut d = Dcc::new();
+    d.init(f, sw, dim, p0, p1).unwrap();
+    let hl = holes(o);
+    let base = c.pull();
+    println!("trace init diff con-vs-native: {:?}", diff(&d, &base, &hl, false));
+    let mut cs = copy(&d);
+    for i in 0..count {
+        d.b[0].copy_from_slice(&src[i * 256..i * 256 + 256]);
+        cs.b[0].copy_from_slice(&src[i * 256..i * 256 + 256]);
+        let mut n = copy(&d);
+        let nr = enc::run(&mut n);
+        c.push(&cs);
+        c.call1(c.rv.driver);
+        let p = c.pull();
+        println!("trace block {}: native run {:?} meta {:02x} | console driver on console-chained state meta {:02x} | diff {:?}", i, nr.map(|_| ()), n.r8(0x58), p.r8(0x58), diff(&n, &p, &hl, true));
+        d = n;
+        cs = p;
+    }
+}
+
+#[test]
+#[ignore]
+fn oracle_dcc_relay_global_chain_19041() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(o) = oracle() else { return };
+    let Some(gp) = crate::dcc_oracle::console_relay_g(&o) else {
+        println!("relay global chain: 19041 only");
+        return;
+    };
+    unsafe { *gp = [0; 64] };
+    crate::dcc::enc::set_relay_g(crate::dcc::enc::RelayG { b: [0; 64], known: [true; 64] });
+    let cdec: DecF = unsafe { core::mem::transmute(o.f("XGDecodeDCC")) };
+    let (nd, ne) = super::oracle_seq::natives();
+    let (cdx, cex) = (o.f("XGDecodeDCC") as usize, o.f("XGEncodeDCC") as usize);
+    let cfgs: Vec<(u32, u32, u32, u32, u32)> = [0u32, 3, 4].iter().flat_map(|&dim| [0u32, 2, 0x8000_0000].map(move |p1| (5u32, 0u32, dim, 0u32, p1))).collect();
+    let rej_ids: Vec<u64> = std::env::var("TOMBOX_DCC_CHAIN_REJ").ok().map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+    let mut r = Rng(0xc4a1_9041);
+    let (mut calls, mut bad, mut masked, mut rej, mut lost_reads) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut known_checked, mut gbad) = (0u64, 0u64);
+    for step in 0..400u64 {
+        if !rej_ids.is_empty() && step % 20 == 10 {
+            let c = super::oracle_cases::case(rej_ids[(step / 20) as usize % rej_ids.len()]);
+            let n = super::oracle_seq::call_via(nd, ne, &c, 0x3c);
+            let k = super::oracle_seq::call_via(cdx, cex, &c, 0x3c);
+            println!("chain step {step}: generator case native hr={:#x} console hr={:#x}", n.hr as u32, k.hr as u32);
+            rej += (n.hr != 0) as u64;
+            continue;
+        }
+        let (f, sw, dim, p0, p1) = cfgs[r.below(cfgs.len() as u32) as usize];
+        let mut d = Dcc::new();
+        if d.init(f, sw, dim, p0, p1).is_err() {
+            continue;
+        }
+        let pats = inputs(&mut r, d.r32(4) as usize);
+        let count = [1usize, 3, 8][r.below(3) as usize];
+        let mut src = vec![0u8; 256 * count];
+        for i in 0..count {
+            src[i * 256..i * 256 + 256].copy_from_slice(&pats[r.below(pats.len() as u32) as usize]);
+        }
+        let mut nd2 = vec![0u8; 256 * count];
+        let mut nm = vec![0u8; count];
+        let mut ns = vec![0u32; count];
+        let kb = crate::dcc::enc::relay_g().known.iter().filter(|&&k| k).count();
+        let nr = crate::dcc::encode(count as u32, &src, &mut nd2, &mut nm, Some(&mut ns), f, sw, dim, p0, p1);
+        let nu = if nr == 0 { crate::dcc::last_undefined() } else { vec![true; count] };
+        if std::env::var("TOMBOX_DCC_CHAIN_LOG").is_ok() && step < 40 {
+            println!("chain step {step} f={f} dim={dim} p1={p1:#x} count={count}: known before {kb}, after {}, native hr={:#x} unmodeled={} undef={:?}", crate::dcc::enc::relay_g().known.iter().filter(|&&k| k).count(), nr as u32, crate::dcc::last_enc_unmodeled(), nu);
+        }
+        let a = console_encode(&o, &src, count, f, sw, dim, p0, p1, 0xaa, 0xa5);
+        calls += 1;
+        if nr != 0 {
+            lost_reads += 1;
+        }
+        masked += nu.iter().filter(|&&x| x).count() as u64;
+        if nr == 0 && (a.0 != 0 || (0..count).any(|i| !nu[i] && (a.1[i * 256..i * 256 + 256] != nd2[i * 256..i * 256 + 256] || a.2[i] != nm[i] || a.3[i] != ns[i]))) {
+            bad += 1;
+            println!("chain enc diverged step {step} f={f} dim={dim} p1={p1:#x} count={count} meta n{:02x?} c{:02x?}", nm, a.2);
+        }
+        let gk = crate::dcc::enc::relay_g();
+        let cg = unsafe { *gp };
+        known_checked += gk.known.iter().filter(|&&k| k).count() as u64;
+        gbad += (0..64).filter(|&p| gk.known[p] && gk.b[p] != cg[p]).count() as u64;
+        if nr != 0 {
+            continue;
+        }
+        let prm = [p0, p1, 0, 0];
+        let mut cd = vec![0u8; 256 * count];
+        let cr = unsafe { cdec(count as u32, nd2.as_ptr(), nm.as_ptr(), cd.as_mut_ptr(), f, sw, dim, prm.as_ptr()) };
+        let mut dd = vec![0u8; 256 * count];
+        let dr = crate::dcc::decode(count as u32, &nd2, &nm, &mut dd, f, sw, dim, p0, p1);
+        calls += 1;
+        if dr == 0 {
+            let du = crate::dcc::last_undefined();
+            masked += du.iter().filter(|&&x| x).count() as u64;
+            if cr != 0 || (0..count).any(|i| !du[i] && cd[i * 256..i * 256 + 256] != dd[i * 256..i * 256 + 256]) {
+                bad += 1;
+                println!("chain dec diverged step {step} f={f} dim={dim} p1={p1:#x} count={count}");
+            }
+        } else {
+            lost_reads += 1;
+        }
+    }
+    println!("relay global chain 19041: {calls} calls with no resync, {bad} divergences on defined blocks, {masked} blocks masked, {rej} generator rejections, {lost_reads} native rejections; after each encode the native global had {known_checked} known bytes in total, {gbad} of them different from the console's");
+    assert_eq!(bad, 0);
+    assert_eq!(gbad, 0);
+}

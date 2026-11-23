@@ -92,23 +92,74 @@ impl Emitter<'_> {
         Ok(Some(format!("#define TB_XL_GS 1\ngroupshared uint tb_xl[{n}];\ngroupshared uint tb_xm[{n}];\ngroupshared uint tb_xa[{n}];")))
     }
 
+    pub(super) fn emit_lds_wrxchg2(&mut self, ins: &Insn) -> Result<(), String> {
+        let m = ins.mnemonic.as_str();
+        let (lo, hi) = match ins.dst.first() {
+            Some(Opnd::Vgpr(v)) if *v < 255 => (Opnd::Vgpr(*v), Opnd::Vgpr(*v + 1)),
+            _ => return Err(format!("{m}: bad vdst")),
+        };
+        self.uses_lds = true;
+        self.lds_order(true, true);
+        let off = ins.aux.imm as u32;
+        let step = if m.contains("st64") { 256 } else { 4 };
+        for o in &ins.src[..3] {
+            self.touch(o);
+        }
+        let addr = r(&ins.src[0])?;
+        let at = |o: u32| format!("tb_lds[(({addr} + {:#x}u) >> 2) & 8191u]", o * step);
+        let (x0, x1) = (r(&ins.src[1])?, r(&ins.src[2])?);
+        let t = self.tmp;
+        self.tmp += 1;
+        self.line(&format!(
+            "uint t{t}a = 0u; uint t{t}b = 0u; if (exec_lo & 1u) {{ InterlockedExchange({}, {x0}, t{t}a); InterlockedExchange({}, {x1}, t{t}b); }}",
+            at(off & 0xff),
+            at((off >> 8) & 0xff)
+        ));
+        self.wv(&lo, &format!("t{t}a"))?;
+        self.wv(&hi, &format!("t{t}b"))
+    }
+
     pub(super) fn emit_ds_permute(&mut self, ins: &Insn) -> Result<(), String> {
         self.uses_wave = true;
         let d = *ins.dst.first().ok_or("permute: no vdst")?;
-        let (addr, data) = (ins.src[0], ins.src[1]);
+        let swizzle = ins.mnemonic == "ds_swizzle_b32";
+        let off = ins.aux.imm as u32 & 0xffff;
+        let (addr, data) = if swizzle { (ins.src[0], ins.src[0]) } else { (ins.src[0], ins.src[1]) };
         self.touch(&addr);
         self.touch(&data);
-        let off = ins.aux.imm as u32 & 0xffff;
-        let back = ins.mnemonic == "ds_bpermute_b32";
+        let back = swizzle || ins.mnemonic == "ds_bpermute_b32";
         let t = self.tmp;
         self.tmp += 1;
-        self.line(&format!("uint t{t}m = ((({}) + {off:#x}u) >> 2) & 31u; uint t{t}d = {}; uint t{t};", r(&addr)?, r(&data)?));
+        let source_lane = |lane: String| {
+            let mask = off & 0x1f;
+            if off & 0x8000 == 0 {
+                format!("((({lane} & {mask:#x}u) | {:#x}u) ^ {:#x}u)", (off >> 5) & 0x1f, (off >> 10) & 0x1f)
+            } else if off < 0xc000 {
+                format!("(({lane} & ~3u) | (({:#x}u >> (({lane} & 3u) * 2u)) & 3u))", off & 0xff)
+            } else if off < 0xe000 {
+                let n = (off >> 5) & 0x1f;
+                let amount = if off & 0x400 == 0 { n } else { (32 - n) & 31 };
+                format!("(({lane} & {mask:#x}u) | ((({lane} + {amount}u) & 31u) & {:#x}u))", !mask & 0x1f)
+            } else {
+                let shift = 27 + mask.count_ones();
+                let reversed = if shift >= 32 { "0u".to_string() } else { format!("(reversebits({lane}) >> {shift}u)") };
+                format!("({reversed} | ({lane} & {mask:#x}u))")
+            }
+        };
+        if swizzle {
+            self.line(&format!("uint t{t}m = 0u; uint t{t}d = {}; uint t{t};", r(&data)?));
+        } else {
+            self.line(&format!("uint t{t}m = ((({}) + {off:#x}u) >> 2) & 31u; uint t{t}d = {}; uint t{t};", r(&addr)?, r(&data)?));
+        }
         let shared = self.is_cs && self.brace_depth == 0 && self.loop_depth == 0;
         if shared {
             let (x, y, z) = self.cs_threads();
             let n = x * y * z;
             self.line("#ifdef TB_XL_GS");
             self.line(&format!("{{ uint t{t}f = gtid.x + gtid.y * {x}u + gtid.z * {}u; uint t{t}g = t{t}f & ~31u; uint t{t}j = t{t}f & 31u;", x * y));
+            if swizzle {
+                self.line(&format!("t{t}m = {};", source_lane(format!("t{t}j"))));
+            }
             self.line("GroupMemoryBarrierWithGroupSync();");
             self.line(&format!("tb_xl[t{t}f] = t{t}d; tb_xm[t{t}f] = t{t}m; tb_xa[t{t}f] = exec_lo & 1u;"));
             self.line("GroupMemoryBarrierWithGroupSync();");
@@ -123,6 +174,9 @@ impl Emitter<'_> {
             self.line("#else");
         }
         self.line(&format!("{{ uint t{t}l = WaveGetLaneIndex(); uint t{t}g = t{t}l & ~31u;"));
+        if swizzle {
+            self.line(&format!("t{t}m = {};", source_lane(format!("(t{t}l & 31u)"))));
+        }
         if back {
             self.line(&format!("uint t{t}v = WaveReadLaneAt(t{t}d, t{t}g + t{t}m); t{t} = (WaveReadLaneAt(exec_lo & 1u, t{t}g + t{t}m) != 0u) ? t{t}v : 0u; }}"));
         } else {

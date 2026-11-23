@@ -115,14 +115,14 @@ pub fn check_against_psv0(m: &MeshInfo, p: &EntryStageProps) -> Result<[u32; 3],
             p.max_vertices, p.max_primitives, p.topology, m.max_vertices, m.max_primitives, m.topology
         ));
     }
-    crate::meta::mesh_thread_count(p.num_threads)?;
+    crate::meta::mesh_thread_count_for(m.stage, p.num_threads)?;
     Ok(p.num_threads)
 }
 
 pub fn fill_num_threads(gs: &mut Option<GsInfo>, disasm: impl FnOnce() -> Option<String>) -> Result<bool, String> {
     let Some(m) = gs.as_mut().and_then(|g| g.mesh.as_mut()) else { return Ok(false) };
     if m.num_threads != [0; 3] {
-        crate::meta::mesh_thread_count(m.num_threads)?;
+        crate::meta::mesh_thread_count_for(m.stage, m.num_threads)?;
         return Ok(false);
     }
     let Some(p) = disasm().as_deref().and_then(parse_entry_stage_props) else { return Ok(false) };

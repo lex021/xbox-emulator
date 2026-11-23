@@ -1,4 +1,4 @@
-use super::{d64, f, hi64, name, r, Emitter};
+use super::{d64, f, f16_inline_val, hi64, name, r, Emitter};
 use crate::rdna2::{Enc, Insn, Opnd};
 use std::collections::BTreeSet;
 
@@ -9,7 +9,8 @@ float tb_hz(float x) { return (abs(x) < 6.103515625e-05) ? asfloat(asuint(x) & 0
 uint tb_hzb(uint b) { return ((b & 0x7c00u) == 0u) ? (b & 0x8000u) : b; }
 "#;
 
-pub(super) const MODE_HELPERS: &str = r#"float tb_dz(float x) { return ((asuint(x) & 0x7f800000u) == 0u) ? asfloat(asuint(x) & 0x80000000u) : x; }
+pub(super) const MODE_HELPERS: &str = r#"float tb_om0(float x) { return asfloat((asuint(x) == 0x80000000u) ? 0u : asuint(x)); }
+float tb_dz(float x) { return ((asuint(x) & 0x7f800000u) == 0u) ? asfloat(asuint(x) & 0x80000000u) : x; }
 float tb_din(float x, uint m) { return ((m & 0x10u) != 0u) ? x : tb_dz(x); }
 float tb_dout(float x, uint m) { return ((m & 0x20u) != 0u) ? x : tb_dz(x); }
 float tb_hin(float x, uint m) { return ((m & 0x40u) != 0u || !(abs(x) < 6.103515625e-05)) ? x : asfloat(asuint(x) & 0x80000000u); }
@@ -429,7 +430,7 @@ impl Emitter<'_> {
     fn hval(&self, ins: &Insn, i: usize, sel: Option<u32>) -> Result<String, String> {
         let o = ins.src.get(i).ok_or("missing operand")?;
         let base = match o {
-            Opnd::ConstF32(_) => f(o)?,
+            Opnd::ConstF32(x) => f16_inline_val(*x, sel.unwrap_or_else(|| hsel(ins, i)) == 2),
             Opnd::Literal(v) => format!("f16tof32({:#x}u)", v & 0xffff),
             _ => {
                 let hi = sel.unwrap_or_else(|| hsel(ins, i)) == 2;
@@ -457,12 +458,15 @@ impl Emitter<'_> {
             return bits;
         }
         let mut e = format!("f16tof32({bits})");
-        e = match ins.aux.imm2 {
-            1 => format!("(({e}) * 2.0)"),
-            2 => format!("(({e}) * 4.0)"),
-            3 => format!("(({e}) * 0.5)"),
-            _ => e,
+        let k = match ins.aux.imm2 {
+            1 => Some("2.0"),
+            2 => Some("4.0"),
+            3 => Some("0.5"),
+            _ => None,
         };
+        if let Some(k) = k {
+            e = format!("(((tb_hw1 & 0x2c0u) == 0u) ? tb_om0(({e}) * {k}) : ({e}))");
+        }
         if ins.aux.imm != 0 {
             e = format!("saturate({e})");
         }

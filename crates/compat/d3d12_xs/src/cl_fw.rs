@@ -99,10 +99,19 @@ unsafe fn pc_set_predication(list: *mut c_void, res: usize, offset: u64, op: u32
     unsafe { f(list, res as *mut c_void, offset, op) };
 }
 
+static FIRST_SET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static FIRST_ADVANCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 unsafe fn apply(list: *mut c_void, c: Cursor, what: &str) {
     let addr = c.address();
+    let first = if what == "AdvancePredicationX" { &FIRST_ADVANCE } else { &FIRST_SET };
     match resolve(addr) {
-        Target::Buffer { res, offset } => unsafe { pc_set_predication(list, res, offset, PREDICATION_OP_EQUAL_ZERO) },
+        Target::Buffer { res, offset } => {
+            unsafe { pc_set_predication(list, res, offset, PREDICATION_OP_EQUAL_ZERO) };
+            if !first.swap(true, Ordering::Relaxed) {
+                record("d3d12_xs", "cl_fw", &format!("first call {what} on list {list:p}: predicate {addr:#x} (buffer {:#x} + offset {:#x}) -> PC SetPredication(res {res:#x}, offset {offset:#x}, EQUAL_ZERO)", c.va, c.offset));
+            }
+        }
         t => {
             unsafe { pc_set_predication(list, 0, 0, 0) };
             if once() {
@@ -125,6 +134,9 @@ pub unsafe fn set_predication_buffer(list: *mut c_void, desc: *const Predication
     if desc.is_null() {
         store(key, None);
         unsafe { pc_set_predication(list, 0, 0, 0) };
+        if !FIRST_SET.swap(true, Ordering::Relaxed) {
+            record("d3d12_xs", "cl_fw", &format!("first call {W}(NULL) on list {list:p}: predication cleared"));
+        }
         return;
     }
     let d = unsafe { *desc };

@@ -4,6 +4,52 @@ use crate::oracle::{oracle, Oracle, SERIAL};
 pub(crate) struct Con {
     pub(crate) mem: Vec<u64>,
     pub(crate) h: usize,
+    pub(crate) rv: Rv,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Rv {
+    pub(crate) ctor: usize,
+    pub(crate) init: usize,
+    pub(crate) driver: usize,
+    pub(crate) relay: usize,
+    pub(crate) log: usize,
+    pub(crate) clear: usize,
+    pub(crate) channel: usize,
+    pub(crate) signfix: usize,
+    pub(crate) color: usize,
+    pub(crate) delta: usize,
+    pub(crate) vrs: usize,
+    pub(crate) choose: usize,
+    pub(crate) far: usize,
+    pub(crate) far_base: usize,
+    pub(crate) plan: usize,
+    pub(crate) pack: usize,
+}
+
+pub(crate) fn console_relay_g(o: &Oracle) -> Option<*mut [u8; 64]> {
+    (o.f("XGEncodeDCC") as usize - o.h == 0x70a0).then(|| (o.h + 0x80bf0) as *mut [u8; 64])
+}
+
+pub(crate) fn sync_relay_g(o: &Oracle) -> Option<[u8; 64]> {
+    let p = console_relay_g(o)?;
+    let g = unsafe { *p };
+    crate::dcc::enc::set_relay_g(crate::dcc::enc::RelayG { b: g, known: [true; 64] });
+    Some(g)
+}
+
+pub(crate) fn put_relay_g(o: &Oracle, g: Option<[u8; 64]>) {
+    if let (Some(p), Some(g)) = (console_relay_g(o), g) {
+        unsafe { *p = g };
+    }
+}
+
+pub(crate) fn rv(o: &Oracle) -> Option<Rv> {
+    match o.f("XGEncodeDCC") as usize - o.h {
+        0xa960 => Some(Rv { ctor: 0x2cdc0, init: 0xa600, driver: 0x26220, relay: 0x4ac90, log: 0x2d790, clear: 0x26680, channel: 0x27330, signfix: 0x27d10, color: 0x27e50, delta: 0x28720, vrs: 0x28df0, choose: 0x292c0, far: 0x29e40, far_base: 0x29740, plan: 0x2a4e0, pack: 0x2a8e0 }),
+        0x70a0 => Some(Rv { ctor: 0x32260, init: 0x6c20, driver: 0x2bf10, relay: 0x4b440, log: 0x32b00, clear: 0x2c300, channel: 0x2cf20, signfix: 0x2d960, color: 0x2daa0, delta: 0x2e3c0, vrs: 0x2ea60, choose: 0x2efa0, far: 0x2fb50, far_base: 0x2f450, plan: 0x300a0, pack: 0x30560 }),
+        _ => None,
+    }
 }
 
 pub(crate) type F1 = unsafe extern "system" fn(*mut u8) -> u64;
@@ -15,9 +61,10 @@ impl Con {
         self.mem.as_ptr() as *mut u8
     }
     pub(crate) fn raw(o: &Oracle, fill: u8) -> Con {
-        let mut c = Con { mem: vec![u64::from_ne_bytes([fill; 8]); (OBJ + 0x100) / 8], h: o.h };
+        let rv = rv(o).expect("console harness RVAs are known only for the 22000 and 19041 builds");
+        let mut c = Con { mem: vec![u64::from_ne_bytes([fill; 8]); (OBJ + 0x100) / 8], h: o.h, rv };
         unsafe {
-            let f: Ctor = core::mem::transmute(o.h + 0x2cdc0);
+            let f: Ctor = core::mem::transmute(o.h + rv.ctor);
             f(c.p());
         }
         let _ = &mut c;
@@ -26,7 +73,7 @@ impl Con {
     pub(crate) fn init(&mut self, fmt: u32, sw: u32, dim: u32, p0: u32, p1: u32) -> i32 {
         let prm = [p0, p1, 0, 0];
         unsafe {
-            let f: Init = core::mem::transmute(self.h + 0xa600);
+            let f: Init = core::mem::transmute(self.h + self.rv.init);
             f(self.p(), fmt, sw, dim, prm.as_ptr())
         }
     }

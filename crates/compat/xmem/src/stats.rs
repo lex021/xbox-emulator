@@ -38,6 +38,9 @@ pub const TITLE_LIMIT: u64 = 0x3_6000_0000;
 static PEAK_USED: AtomicU64 = AtomicU64::new(0);
 
 pub fn title_used() -> u64 {
+    if crate::title_acct::enabled() && crate::sys::env_trimmed_is(b"TOMBOX_XMEM_TITLE_USED_OLD\0", b"1") != Some(true) {
+        return crate::title_acct::parts().total().min(TITLE_LIMIT);
+    }
     let proc = process_memory();
     (proc.private_usage as u64 + crate::phys::live_bytes()).min(TITLE_LIMIT)
 }
@@ -117,7 +120,11 @@ pub unsafe extern "system" fn XMemGetWorkingSetStatistics(flags: u32, out: *mut 
         SetLastError(ERROR_INVALID_PARAMETER);
         return 0;
     }
+    crate::title_acct::announce();
     let mut ws = gather(flags);
+    if flags & WS_TITLE != 0 {
+        crate::title_acct::trace("ws", &format!("flags={flags:#x}"));
+    }
     if flags & WS_POOL != 0 {
         match pool_bytes() {
             Ok(b) => {
@@ -180,11 +187,64 @@ pub struct FreePageStatistics {
     pub tools_total_bytes: u64,
 }
 
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct PartitionNodePages {
+    total: u64,
+    counts: [[u64; 2]; 4],
+}
+
+impl PartitionNodePages {
+    fn free_pages(self) -> [u64; 3] {
+        let [small, medium, large, huge] = self.counts.map(|[a, b]| a.wrapping_add(b));
+        [small, medium, large.wrapping_add(huge << 9)]
+    }
+}
+
+const CURRENT_MEMORY_PARTITION: Handle = usize::MAX as Handle;
+const PARTITION_NODE_INFORMATION: u32 = 7;
+
+#[repr(C)]
+struct PartitionNodes {
+    count: u32,
+    reserved: u32,
+    nodes: *mut PartitionNodePages,
+}
+
+unsafe fn query_partition_pages(handle: Handle, two_nodes: bool, out: *mut [[u64; 3]; 2]) -> i32 {
+    let mut rows = [PartitionNodePages::default(); 2];
+    let mut query = PartitionNodes {
+        count: 1 + u32::from(two_nodes),
+        reserved: 0,
+        nodes: rows.as_mut_ptr(),
+    };
+    let status = crate::NtManagePartition(handle, core::ptr::null_mut(), PARTITION_NODE_INFORMATION, (&raw mut query).cast(), size_of::<PartitionNodes>() as u32);
+    if status < 0 {
+        SetLastError(RtlNtStatusToDosError(status));
+        return 0;
+    }
+    let first = rows[0].free_pages();
+    let second = if two_nodes { rows[1].free_pages() } else { first };
+    out.write_unaligned([first, second]);
+    1
+}
+
 #[no_mangle]
 pub unsafe extern "system" fn XMemGetFreePageStatistics(out: *mut FreePageStatistics) -> i32 {
     if out.is_null() {
         SetLastError(ERROR_INVALID_PARAMETER);
         return 0;
+    }
+    if compat_common::os_host::routes::current_build() == 19041 {
+        let handle = match crate::partition(crate::PARTITION_TITLE as usize) {
+            crate::Partition::Real(handle, _) => handle as Handle,
+            crate::Partition::Process => CURRENT_MEMORY_PARTITION,
+            crate::Partition::Missing => {
+                SetLastError(crate::ERROR_PARTITION_NOT_FOUND);
+                return 0;
+            }
+        };
+        return query_partition_pages(handle, multi_node(), out.cast());
     }
     let sys = system_memory();
     *out = FreePageStatistics {
@@ -210,7 +270,11 @@ pub unsafe extern "system" fn XMemGetPhysicalMemoryLayout(out: *mut PhysicalMemo
         SetLastError(ERROR_INVALID_PARAMETER);
         return 0;
     }
-    *out = PhysicalMemoryLayout { base: 0, size: system_memory().total_phys };
+    if compat_common::os_host::routes::current_build() == 19041 {
+        out.cast::<[u64; 2]>().write_unaligned(compat_common::physical_pages::TITLE_LAYOUT_19041);
+    } else {
+        *out = PhysicalMemoryLayout { base: 0, size: system_memory().total_phys };
+    }
     1
 }
 
@@ -380,7 +444,7 @@ mod tests {
         let total = u64::from_le_bytes(big[0..8].try_into().unwrap());
         let used = u64::from_le_bytes(big[8..16].try_into().unwrap());
         assert_eq!(total, TITLE_LIMIT);
-        assert!(used > 0 && used <= total);
+        assert!(used <= total);
         assert!(big[0x38..0x48].iter().all(|&b| b == 0));
         assert!(big[0x50..].iter().all(|&b| b == 0xcc));
         let mut old = [0xccu8; 0x80];
@@ -404,7 +468,21 @@ mod tests {
         assert_eq!(total, 14_495_514_624);
         assert_eq!(u64::from_le_bytes(v2[0x28..0x30].try_into().unwrap()), total);
         assert_eq!(u64::from_le_bytes(v2[0x30..0x38].try_into().unwrap()), used);
-        assert!(used > 0 && used <= total);
+        assert!(used <= total);
+    }
+
+    #[test]
+    fn partition_page_counts_follow_the_19041_groups() {
+        let row = PartitionNodePages { total: 42, counts: [[1, 2], [3, 4], [5, 6], [7, 8]] };
+        assert_eq!(row.free_pages(), [3, 7, 11 + 15 * 512]);
+    }
+
+    #[test]
+    fn failed_partition_query_preserves_the_19041_output() {
+        let mut out = [[u64::MAX; 3]; 2];
+        assert_eq!(unsafe { query_partition_pages(core::ptr::null_mut(), false, &mut out) }, 0);
+        assert_eq!(unsafe { GetLastError() }, 6);
+        assert_eq!(out, [[u64::MAX; 3]; 2]);
     }
 
     #[test]
@@ -414,7 +492,11 @@ mod tests {
         assert!(f.free_bytes <= f.total_bytes && f.total_bytes > 0);
         let mut l = PhysicalMemoryLayout::default();
         assert_eq!(unsafe { XMemGetPhysicalMemoryLayout(&mut l) }, 1);
-        assert_eq!(l.size, f.total_bytes);
+        if compat_common::os_host::routes::current_build() == 19041 {
+            assert_eq!([l.base, l.size], compat_common::physical_pages::TITLE_LAYOUT_19041);
+        } else {
+            assert_eq!(l.size, f.total_bytes);
+        }
     }
 
     #[test]

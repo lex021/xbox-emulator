@@ -183,13 +183,17 @@ const TABLE: &[Row] = &[
     ("_unlink", K::A, &[0], 1),
     ("remove", K::A, &[0], 1),
     ("CreateFile2", K::W, &[0], 5),
+    ("CopyFileExW", K::W, &[0, 1], 6),
+    ("MoveFileWithProgressW", K::W, &[0, 1], 5),
+    ("ReplaceFileW", K::W, &[0, 1, 2], 6),
+    ("CopyFile2", K::W, &[0, 1], 3),
 ];
 
-static ORIG: [AtomicUsize; 25] = [const { AtomicUsize::new(0) }; 25];
+static ORIG: [AtomicUsize; 29] = [const { AtomicUsize::new(0) }; 29];
 
 macro_rules! hooks {
     ($($i:tt $n:tt),*) => {
-        fn hook_table() -> [usize; 25] {
+        fn hook_table() -> [usize; 29] {
             [$(hook_fn!($i $n)),*]
         }
     };
@@ -205,7 +209,7 @@ macro_rules! hook_fn {
     ($i:tt 7) => {{ unsafe extern "system" fn h(a: usize, b: usize, c: usize, d: usize, e: usize, f: usize, g: usize) -> usize { run($i, vec![a, b, c, d, e, f, g]) } h as usize }};
 }
 
-hooks!(0 7, 1 6, 2 2, 3 1, 4 3, 5 2, 6 2, 7 1, 8 1, 9 4, 10 1, 11 3, 12 2, 13 3, 14 2, 15 3, 16 1, 17 3, 18 1, 19 3, 20 2, 21 3, 22 1, 23 1, 24 5);
+hooks!(0 7, 1 6, 2 2, 3 1, 4 3, 5 2, 6 2, 7 1, 8 1, 9 4, 10 1, 11 3, 12 2, 13 3, 14 2, 15 3, 16 1, 17 3, 18 1, 19 3, 20 2, 21 3, 22 1, 23 1, 24 5, 25 6, 26 5, 27 6, 28 3);
 
 pub fn targets() -> Vec<(&'static str, usize, &'static AtomicUsize)> {
     if game_drive().is_none() && !trace_on() && !super::xcrd_paths::enabled() {

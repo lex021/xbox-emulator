@@ -223,6 +223,7 @@ unsafe fn build_on(dev: *mut c_void, code: &[u8]) -> Option<Pipeline> {
 }
 
 pub unsafe fn write(list: *mut c_void, va: u64) {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::QUERY) };
     let Some((e, off)) = crate::gpu_va::lookup(va) else {
         if once(8) {
             record("d3d12_xs", "sys_ts", &format!("SYSTEM_TIMESTAMP destination {va:#x} is not in a tracked buffer"));
@@ -253,21 +254,21 @@ pub unsafe fn write(list: *mut c_void, va: u64) {
             return;
         }
         crate::fill::barrier_pub(list, p.buf, STATE_COPY_DEST, STATE_UAV);
-        let pred: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u32) = core::mem::transmute(vslot(list, PC_SET_PREDICATION));
+        let pred: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_PREDICATION));
         pred(list, core::ptr::null_mut(), 0, 0);
-        let srs: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(vslot(list, PC_SET_COMPUTE_ROOT_SIGNATURE));
+        let srs: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_COMPUTE_ROOT_SIGNATURE));
         srs(list, p.rs as *mut c_void);
-        let spso: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(vslot(list, PC_SET_PSO));
+        let spso: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_PSO));
         spso(list, p.pso as *mut c_void);
-        let sc: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32) = core::mem::transmute(vslot(list, PC_SET_COMPUTE_ROOT_CONSTANTS));
+        let sc: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_COMPUTE_ROOT_CONSTANTS));
         sc(list, 0, 9, k.as_ptr(), 0);
-        let su: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(vslot(list, PC_SET_COMPUTE_ROOT_UAV));
+        let su: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_COMPUTE_ROOT_UAV));
         su(list, 1, p.va);
-        let d: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = core::mem::transmute(vslot(list, PC_DISPATCH));
+        let d: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_DISPATCH));
         d(list, 1, 1, 1);
         crate::fill::barrier_pub(list, p.buf, STATE_UAV, STATE_COPY_SOURCE);
         if st != STATE_COPY_DEST { crate::fill::barrier_pub(list, e.res, st, STATE_COPY_DEST); }
-        let cp: unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64) = core::mem::transmute(vslot(list, PC_COPY_BUFFER_REGION));
+        let cp: unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_COPY_BUFFER_REGION));
         cp(list, e.res, off, p.buf, soff, 8);
         if st != STATE_COPY_DEST { crate::fill::barrier_pub(list, e.res, STATE_COPY_DEST, st); }
         crate::fill::barrier_pub(list, p.buf, STATE_COPY_SOURCE, STATE_COMMON);

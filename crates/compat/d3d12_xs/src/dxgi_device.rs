@@ -12,7 +12,7 @@
 //! are stubs (the RHI does not call them here).
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 use compat_common::record;
 use crate::device_wrap::Guid;

@@ -254,3 +254,62 @@ fn async_read_all_blobs_and_empty_container() {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+#[test]
+fn names_that_are_not_windows_file_names_round_trip() {
+    let st = save::Store::open(tmp("names")).unwrap();
+    let long_ascii = "n".repeat(256);
+    let long_wide = "\u{00e9}".repeat(128);
+    let names: Vec<String> = ["a<b", "a>b", "a:b", "a\"b", "a/b", "a\\b", "a|b", "a?b", "a*b", "CON", "nul", "Com1", "LPT9.txt", "AUX.", "end.", "end ", " lead", ".hidden", "..", ".", "~7E", "~", "tab\tnl\n", "\u{00dc}n\u{00ef}c\u{00f6}d\u{00e9}", "a.b.c"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([long_ascii.clone(), long_wide.clone()])
+        .collect();
+    let writes: Vec<(String, Vec<u8>)> = names.iter().enumerate().map(|(i, n)| (n.clone(), vec![i as u8; i + 1])).collect();
+    let containers = ["CON".to_string(), "slot:1".into(), "end.".into(), long_ascii.clone()];
+    for c in &containers {
+        st.commit(c, Some("d"), &writes, &[]).unwrap_or_else(|e| panic!("commit to container {c:?}: {e}"));
+        let mut got: Vec<String> = st.blobs(c).into_iter().map(|b| b.0).collect();
+        got.sort();
+        let mut want = names.clone();
+        want.sort();
+        assert_eq!(got, want, "container {c:?}");
+        for (i, n) in names.iter().enumerate() {
+            assert_eq!(st.read_blob(c, n), Some(vec![i as u8; i + 1]), "blob {n:?} in {c:?}");
+        }
+    }
+    let mut cs: Vec<String> = st.containers().into_iter().map(|c| c.name).collect();
+    cs.sort();
+    let mut want = containers.to_vec();
+    want.sort();
+    assert_eq!(cs, want);
+    st.commit("CON", None, &[], &names[..3].to_vec()).unwrap();
+    assert_eq!(st.blobs("CON").len(), names.len() - 3);
+    assert!(st.delete_container("end.").unwrap());
+}
+
+#[test]
+fn long_names_keep_their_case_and_fit_the_file_name_limit() {
+    let root = tmp("long");
+    let st = save::Store::open(root.clone()).unwrap();
+    let upper = "N".repeat(300);
+    let lower = "n".repeat(300);
+    st.commit(&upper, None, &[(upper.clone(), b"x".to_vec())], &[]).unwrap();
+    assert_eq!(st.read_blob(&lower, &lower), Some(b"x".to_vec()));
+    assert_eq!(st.blobs(&upper), vec![(upper.clone(), 1)]);
+    assert_eq!(st.containers().into_iter().map(|c| c.name).collect::<Vec<_>>(), vec![upper.clone()]);
+    fn walk(p: &std::path::Path) {
+        for e in std::fs::read_dir(p).unwrap().flatten() {
+            assert!(e.file_name().len() <= 255, "{:?}", e.file_name());
+            if e.path().is_dir() {
+                walk(&e.path());
+            }
+        }
+    }
+    walk(&root);
+    st.commit(&upper, None, &[], &[upper.clone()]).unwrap();
+    assert!(st.blobs(&upper).is_empty());
+    let d = std::fs::read_dir(&root).unwrap().flatten().next().unwrap().path();
+    let left: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(left, vec![".name".to_string()]);
+}

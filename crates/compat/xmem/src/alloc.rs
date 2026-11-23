@@ -120,7 +120,7 @@ pub fn default_alloc(size: usize, attributes: u64) -> *mut c_void {
         crate::write_note::committed(p as usize, len);
         return p;
     }
-    let p = reserve_aligned(len, align, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    let p = crate::write_watch::reserve(len, align, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if p.is_null() {
         let err = unsafe { GetLastError() };
         record(M, "XMemAllocDefault", &format!("size={size:#x} attrs={attributes:#x} align={align:#x} -> NULL (err={err})"));
@@ -128,6 +128,7 @@ pub fn default_alloc(size: usize, attributes: u64) -> *mut c_void {
     }
     track(p, Kind::Virtual(len), ty);
     account(ty, len, true);
+    crate::write_note::committed(p as usize, len);
     p
 }
 
@@ -141,6 +142,7 @@ pub fn default_free(address: *mut c_void, _attributes: u64) {
             account(ty, len, false);
             crate::epoch::bump_range(address as usize, address as usize + len);
             if !crate::pool::give(ty as usize, address as usize, len) {
+                crate::write_watch::forget(address as usize);
                 unsafe { VirtualFree(address, 0, MEM_RELEASE) };
             }
         }
@@ -168,14 +170,48 @@ type FreeHook = unsafe extern "system" fn(*mut c_void, u64);
 static ALLOC_HOOK: AtomicUsize = AtomicUsize::new(0);
 static FREE_HOOK: AtomicUsize = AtomicUsize::new(0);
 
+fn alloc_log_type() -> Option<u32> {
+    static T: AtomicUsize = AtomicUsize::new(usize::MAX);
+    let v = T.load(Ordering::Relaxed);
+    if v != usize::MAX {
+        return (v != usize::MAX - 1).then_some(v as u32);
+    }
+    let t = std::env::var("TOMBOX_XMEM_ALLOC_LOG").ok().and_then(|s| s.trim().parse::<u32>().ok()).filter(|t| *t < 16);
+    T.store(t.map_or(usize::MAX - 1, |t| t as usize), Ordering::Relaxed);
+    t
+}
+
+fn log_alloc(size: usize, attributes: u64, p: *mut c_void, hooked: bool) {
+    static LOGGED: AtomicUsize = AtomicUsize::new(0);
+    let a = Attr(attributes);
+    if alloc_log_type() != Some(a.memory_type()) || LOGGED.fetch_add(1, Ordering::Relaxed) >= 64 {
+        return;
+    }
+    record(
+        M,
+        "XMemAlloc",
+        &format!(
+            "type={} size={size:#x} end={:#x} attrs={attributes:#x} page_size={} align={:#x} -> {p:p}{}",
+            a.memory_type(),
+            p as usize + size,
+            a.page_size(),
+            a.effective_alignment(),
+            if hooked { " (title allocation hook)" } else { "" }
+        ),
+    );
+}
+
 #[no_mangle]
 pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
     let h = ALLOC_HOOK.load(Ordering::Acquire);
-    if h != 0 {
+    let p = if h != 0 {
         let f: AllocHook = unsafe { core::mem::transmute(h) };
-        return unsafe { f(size, attributes) };
-    }
-    default_alloc(size, attributes)
+        unsafe { f(size, attributes) }
+    } else {
+        default_alloc(size, attributes)
+    };
+    log_alloc(size, attributes, p, h != 0);
+    p
 }
 
 #[no_mangle]
@@ -201,6 +237,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
 
 #[no_mangle]
 pub extern "system" fn XMemSetAllocationHooks(alloc: usize, free: usize) {
+    let free = if alloc == 0 { 0 } else { free };
     ALLOC_HOOK.store(alloc, Ordering::Release);
     FREE_HOOK.store(free, Ordering::Release);
     record(M, "XMemSetAllocationHooks", &format!("alloc={alloc:#x} free={free:#x}"));
@@ -300,6 +337,10 @@ pub unsafe extern "system" fn XMemGetAllocationStatistics(memory_type: u32, alt:
             o.allocation_count = if alt != 0 { 0 } else { s.count.load(Ordering::Relaxed) as u32 };
             o.released_pages = crate::pool::released(i);
         }
+        None if compat_common::gameinput_ext::default_os_build() == 19041 => {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
         None => {
             o.allocated_bytes = 0;
             o.cached_bytes = 0;
@@ -314,6 +355,24 @@ pub unsafe extern "system" fn XMemGetAllocationStatistics(memory_type: u32, alt:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn null_allocator_restores_the_default_free_hook() {
+        thread_local! {
+            static FREE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        unsafe extern "system" fn counting_free(address: *mut c_void, attributes: u64) {
+            FREE_CALLS.with(|calls| calls.set(calls.get() + 1));
+            XMemFreeDefault(address, attributes);
+        }
+        let free = counting_free as *const () as usize;
+        XMemSetAllocationHooks(XMemAllocDefault as *const () as usize, free);
+        XMemFree(XMemAlloc(32, 0), 0);
+        XMemSetAllocationHooks(0, free);
+        XMemFree(XMemAlloc(32, 0), 0);
+        XMemSetAllocationHooks(0, 0);
+        assert_eq!(FREE_CALLS.with(|calls| calls.get()), 1);
+    }
 
     #[test]
     fn attribute_fields_match_console_decode() {
@@ -429,6 +488,33 @@ mod tests {
         assert_eq!(s.cached_bytes, 0);
         assert_eq!(s.released_pages, 2);
         assert_eq!(crate::pool::cached_count(11), 0);
+    }
+
+    #[test]
+    fn allocation_statistics_rejects_invalid_memory_types_on_19041() {
+        if std::env::var("TOMBOX_GI_OSBUILD").as_deref() != Ok("19041") {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "alloc::tests::allocation_statistics_rejects_invalid_memory_types_on_19041"])
+                .env("TOMBOX_GI_OSBUILD", "19041")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        for (memory_type, alt, size, expected_error) in [
+            (16, 0, 32, ERROR_INVALID_PARAMETER),
+            (u32::MAX, 1, 32, ERROR_INVALID_PARAMETER),
+            (16, 0, 31, ERROR_BAD_LENGTH),
+        ] {
+            let mut words = [0xa5a5_a5a5_a5a5_a5a5u64; 4];
+            words[0] = (words[0] & !0xffff_ffff) | size;
+            let initial = words;
+            unsafe {
+                SetLastError(0);
+                assert_eq!(XMemGetAllocationStatistics(memory_type, alt, words.as_mut_ptr().cast()), 0);
+                assert_eq!(GetLastError(), expected_error);
+            }
+            assert_eq!(words, initial);
+        }
     }
 
     #[test]

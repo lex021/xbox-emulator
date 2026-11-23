@@ -12,6 +12,7 @@ pub struct Durango {
 }
 
 const PROGRAM_PREFIX: usize = 0x28;
+pub const BINDING_RECORD: usize = 0x14;
 
 fn u32_at(b: &[u8], o: usize) -> Result<u32, String> {
     b.get(o..o + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]])).ok_or_else(|| format!("durango: u32 read at {o:#x} out of bounds (len {})", b.len()))
@@ -37,7 +38,7 @@ pub fn parse(b: &[u8]) -> Result<Durango, String> {
         return Err(format!("not a Durango shader blob (first words {:x?})", b.get(0..0x24)));
     }
     let code_start = u64_at(b, 0x28)? as usize;
-    let code_end = u64_at(b, 0x30)? as usize;
+    let code_end = (u64_at(b, 0x30)? as usize).saturating_add(PROGRAM_PREFIX);
     if code_start >= code_end || code_end > b.len() || (code_end - code_start) % 4 != 0 {
         return Err(format!("durango: bad code range {code_start:#x}..{code_end:#x} in {} bytes", b.len()));
     }
@@ -46,6 +47,9 @@ pub fn parse(b: &[u8]) -> Result<Durango, String> {
     let prog_end = prog_start + prog_len;
     if prog_len == 0 || prog_len % 4 != 0 || prog_end > code_end || u32_at(b, prog_end - 4)? != 0xbf81_0000 {
         return Err(format!("durango: program {prog_start:#x}+{prog_len:#x} (header 0x1dc) does not end in s_endpgm inside code {code_start:#x}..{code_end:#x}"));
+    }
+    if (code_end - prog_end) % BINDING_RECORD != 0 {
+        return Err(format!("durango: {:#x} bytes after the program at {prog_end:#x} are not whole {BINDING_RECORD}-byte binding records (code ends {code_end:#x})", code_end - prog_end));
     }
     Ok(Durango {
         hash: u64_at(b, 8)?,
@@ -243,8 +247,8 @@ fn swap01(abs: u32, neg: u32) -> (u32, u32) {
 fn smrd_op(op: u32) -> Result<u32, String> {
     match op {
         0x00..=0x04 | 0x08..=0x0c => Ok(op),
-        0x1d => Ok(0x24),
-        0x1e => Ok(0x20),
+        0x1d | 0x1f => Ok(0x20),
+        0x1e => Ok(0x24),
         _ => Err(format!("gfx7 SMRD opcode {op:#x} is not supported")),
     }
 }
@@ -453,13 +457,19 @@ fn convert(ins: &Insn) -> Result<Vec<u32>, String> {
             if (w >> 15) & 1 != 0 {
                 return addr64(ins).map_err(err);
             }
-            ins.words.clone()
+            match (w >> 18) & 0x7f {
+                0x70 | 0x71 => [0x71u32, 0x72].iter().flat_map(|&op| [(w & !(0x7f << 18)) | op << 18, ins.words[1]]).collect(),
+                _ => ins.words.clone(),
+            }
         }
         Enc::Mimg => {
             for (bit, name) in [(15, "R128 (128-bit resource descriptor)"), (16, "TFE (texture fail status VGPR)"), (17, "LWE (LOD warning status)")] {
                 if (w >> bit) & 1 != 0 {
                     return Err(err(format!("MIMG {name} is not translated")));
                 }
+            }
+            if (w >> 18) & 0x7f == 0x13 {
+                return Err(err("image_atomic_rsub (gfx7 MIMG 0x13) has no RDNA2 equivalent".into()));
             }
             let da = (w >> 14) & 1;
             let dim = if da != 0 { 5 } else { 1 };
@@ -774,6 +784,7 @@ pub fn extract_durango(
             .or_else(|| body(b).and_then(|x| crate::meta::parse_signature(b, x).ok()))
             .unwrap_or_default()
     };
+    let output_sig = container.output_signature(dxbc)?;
     Ok(crate::ShaderExtract {
         stage,
         shader_model,
@@ -786,11 +797,12 @@ pub fn extract_durango(
         psv_numthreads: if stage == crate::Stage::Compute { body(b"PSV0").and_then(crate::meta::parse_psv0_cs_threads) } else { None },
         isa_data: lowered.isa,
         has_input_sig: container.chunk(b"ISG1").is_some() || container.chunk(b"ISGN").is_some(),
-        has_output_sig: container.chunk(b"OSG1").is_some() || container.chunk(b"OSGN").is_some(),
+        has_output_sig: output_sig.is_some(),
         has_psv0: container.chunk(b"PSV0").is_some(),
         has_root_sig: container.chunk(b"RTS0").is_some(),
         input_sig: sig(b"ISG1", b"ISGN"),
-        output_sig: sig(b"OSG1", b"OSGN"),
+        output_sig: output_sig.unwrap_or_default(),
+        prim_sig: Vec::new(),
         resources: body(b"PSV0").and_then(|b| crate::meta::parse_psv0(b).ok()).unwrap_or_default(),
         gs_info: body(b"PSV0").and_then(crate::meta::parse_psv0_gs),
         root_sig: body(b"RTS0").and_then(|b| crate::meta::parse_rts0(b).ok()),
@@ -903,6 +915,54 @@ mod tests {
         w.iter().flat_map(|d| d.to_le_bytes()).collect()
     }
 
+    fn durango_blob(program: &[u32], records: &[[u32; 5]], header_code_size: usize) -> Vec<u8> {
+        let cs = 0x200usize;
+        let mut b = vec![0u8; cs + PROGRAM_PREFIX];
+        b.extend(bytes(program));
+        for r in records {
+            b.extend(bytes(r));
+        }
+        let tail_at = b.len();
+        b.extend(bytes(&[0, 0, (tail_at - 0x10) as u32, 0, 0x18, 9, 0x0006_0004, 0]));
+        let n = b.len();
+        b[0..8].copy_from_slice(&(n as u64).to_le_bytes());
+        b[0x18..0x1c].copy_from_slice(&5u32.to_le_bytes());
+        b[0x28..0x30].copy_from_slice(&(cs as u64).to_le_bytes());
+        b[0x30..0x38].copy_from_slice(&((cs + header_code_size) as u64).to_le_bytes());
+        b[0x1dc..0x1e0].copy_from_slice(&((program.len() * 4) as u32).to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn durango_code_size_excludes_the_program_prefix() {
+        let program = [0xbefc_0303, 0xc808_0000, 0xbf81_0000];
+        let record = [0x1a, 0x0010_1000, 0x6000_0000, 0, 0];
+        let blob = durango_blob(&program, &[record], program.len() * 4 + BINDING_RECORD);
+        let d = parse(&blob).unwrap();
+        assert_eq!(words(&d.code), program);
+        assert_eq!(words(&d.data), record);
+        assert_eq!(d.code_end, 0x200 + PROGRAM_PREFIX + program.len() * 4 + BINDING_RECORD);
+        assert_eq!(words(&d.tail)[..2], [0, 0]);
+    }
+
+    #[test]
+    fn durango_binding_table_keeps_every_record() {
+        let program = [0xbf80_0000, 0xbf81_0000];
+        let records: Vec<[u32; 5]> = (0..7).map(|i| [i, 0x0005_0101 + i, 0x3000_0000, 0, 0]).collect();
+        let blob = durango_blob(&program, &records, program.len() * 4 + records.len() * BINDING_RECORD);
+        let d = parse(&blob).unwrap();
+        assert_eq!(d.data.len(), records.len() * BINDING_RECORD);
+        assert_eq!(words(&d.data[6 * BINDING_RECORD..]), records[6]);
+    }
+
+    #[test]
+    fn durango_partial_binding_record_is_an_error() {
+        let program = [0xbf80_0000, 0xbf81_0000];
+        let record = [0x1a, 0x0010_1000, 0x6000_0000, 0, 0];
+        let blob = durango_blob(&program, &[record], program.len() * 4 + 8);
+        assert!(parse(&blob).unwrap_err().contains("binding records"));
+    }
+
     #[test]
     fn getpc_relocates_into_embedded_data() {
         let code = bytes(&[0xc0000300, 0xbe821f00, 0x8002ff02, 0x14, 0x82038003, 0xc0020300, 0xbf810000, 0x0000000e, 0x3f000000, 0xbf810000]);
@@ -985,6 +1045,7 @@ mod tests {
             has_root_sig: false,
             input_sig: Vec::new(),
             output_sig: Vec::new(),
+            prim_sig: Vec::new(),
             resources: Vec::new(),
             gs_info: None,
             root_sig: None,

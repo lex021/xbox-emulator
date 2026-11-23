@@ -448,6 +448,9 @@ pub unsafe fn register(heap: usize, memory: u64, desc: u64, family: u32) -> i32 
     heaps(|m| {
         m.insert(heap, Heap { device, memory, slot0, ty, num, family, cpu, gpu, inc, raw: vec![0; num as usize * words], written: vec![0; num as usize], kinds: vec![kind; num as usize] });
     });
+    if crate::rtcap::enabled() || crate::passcap::tables_on() {
+        crate::bindtrace::note_heap_inc(cpu as usize, gpu, num, inc as usize);
+    }
     record(M, TAG, &format!("heap {heap:#x} type={ty} num={num} over title memory {memory:#x} (slot 0 at {slot0:#x}, console stride {}) -> PC cpu {cpu:#x} gpu {gpu:#x} inc {inc}", console_stride(ty)));
     0
 }
@@ -520,6 +523,9 @@ unsafe fn write_slot(h: &Heap, i: usize, words: &[u32], kind: u8) -> bool {
         } else {
             ok = slot == Slot::Null;
         }
+        if crate::rtcap::enabled() || crate::passcap::tables_on() {
+            crate::bindtrace::note_desc(handle as usize, crate::bindtrace::Desc::Cbv { va: u64::from_le_bytes(c[0..8].try_into().unwrap()), size: u32::from_le_bytes(c[8..12].try_into().unwrap()) });
+        }
         f(dev, &c, handle);
         return ok;
     }
@@ -554,6 +560,10 @@ unsafe fn write_slot(h: &Heap, i: usize, words: &[u32], kind: u8) -> bool {
             }
         },
     };
+    if crate::rtcap::enabled() || crate::passcap::tables_on() {
+        let d = if uav { crate::bindtrace::Desc::Uav { res, desc: Some(view) } } else { crate::bindtrace::Desc::Srv { res, desc: Some(view) } };
+        crate::bindtrace::note_desc(handle as usize, d);
+    }
     if uav {
         let f: unsafe extern "system" fn(usize, usize, usize, *const [u8; 40], u64) = core::mem::transmute(vfn(dev, 19));
         f(dev, res, 0, &view, handle);
@@ -1061,6 +1071,26 @@ pub static DXGI_TO_HW: [[u16; 2]; 193] = [[0, 0], [75, 0], [77, 77], [75, 75], [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bindtrace_resolves_title_table_handles_to_written_views() {
+        let memory = 0x7700_0000_0000u64;
+        let (cpu, gpu, inc, num) = (0x5500_0000usize, 0x6600_0000_0000u64, 32u32, 64u32);
+        heaps(|m| {
+            m.insert(0xabc0, Heap { device: 0, memory, slot0: first_slot(memory, 0), ty: 0, num, family: 0, cpu: cpu as u64, gpu, inc, raw: vec![0; num as usize * 8], written: vec![0; num as usize], kinds: vec![KIND_SRV; num as usize] });
+        });
+        crate::bindtrace::note_heap_inc(cpu, gpu, num, inc as usize);
+        let mut view = [0u8; 40];
+        view[0..4].copy_from_slice(&42u32.to_le_bytes());
+        view[4..8].copy_from_slice(&8u32.to_le_bytes());
+        crate::bindtrace::note_desc(cpu + 5 * inc as usize, crate::bindtrace::Desc::Srv { res: 0x1234, desc: Some(view) });
+        let title_handle = first_slot(memory, 0) + 3 * console_stride(0);
+        crate::bindtrace::set_table(0xfeed, false, 7, title_handle);
+        assert_eq!(crate::bindtrace::table_count(0xfeed, false), 8);
+        assert_eq!(crate::bindtrace::table_srv_fmt(0xfeed, false, 7, 2), Some((0x1234, 42, 8, 0)));
+        assert_eq!(crate::bindtrace::table_srv_fmt(0xfeed, false, 7, 1), None);
+        heaps(|m| { m.remove(&0xabc0); });
+    }
 
     fn t_img(family: u32, va: u64, hw_or_df: u32, nf: u32, ty: u32, base: u32, last: u32, sel: [u32; 4]) -> [u32; 8] {
         let a = (va >> 8) as u32;

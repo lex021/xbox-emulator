@@ -101,6 +101,7 @@ fn ps_extract() -> ShaderExtract {
             SigElement { name: "TEXCOORD_centroid".into(), index: 0, sysval: 0, comp_type: 3, register: 1, mask: 0x3, rw_mask: 0x3 },
         ],
         output_sig: vec![SigElement { name: "SV_Target".into(), index: 0, sysval: 64, comp_type: 3, register: 0, mask: 0xf, rw_mask: 0xf }],
+        prim_sig: Vec::new(),
         resources: Vec::new(),
         gs_info: None,
         root_sig: None,

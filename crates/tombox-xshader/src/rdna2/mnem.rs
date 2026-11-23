@@ -161,10 +161,10 @@ pub fn vop3(op: u32) -> Option<&'static str> {
         return vopc(op);
     }
     if (0x100..0x140).contains(&op) {
-        return vop2(op - 0x100);
+        return if matches!(op - 0x100, 0x20 | 0x21 | 0x2c | 0x2d | 0x37 | 0x38 | 0x3c) { None } else { vop2(op - 0x100) };
     }
     if (0x180..0x200).contains(&op) {
-        return vop1(op - 0x180);
+        return if op - 0x180 == 0x65 { None } else { vop1(op - 0x180) };
     }
     Some(match op {
         0x140 => "v_mad_legacy_f32", 0x141 => "v_mad_f32", 0x142 => "v_mad_i32_i24",
@@ -181,7 +181,10 @@ pub fn vop3(op: u32) -> Option<&'static str> {
         0x344 => "v_perm_b32", 0x351 => "v_min3_f16", 0x354 => "v_max3_f16", 0x357 => "v_med3_f16",
         0x360 => "v_readlane_b32", 0x361 => "v_writelane_b32", 0x363 => "v_bfm_b32", 0x364 => "v_bcnt_u32_b32",
         0x34b => "v_fma_f16",
-        0x404 => "v_pk_lshlrev_b16", 0x405 => "v_pk_lshrrev_b16",
+        0x400 => "v_pk_mad_i16", 0x401 => "v_pk_mul_lo_u16", 0x402 => "v_pk_add_i16", 0x403 => "v_pk_sub_i16",
+        0x404 => "v_pk_lshlrev_b16", 0x405 => "v_pk_lshrrev_b16", 0x406 => "v_pk_ashrrev_i16",
+        0x407 => "v_pk_max_i16", 0x408 => "v_pk_min_i16", 0x409 => "v_pk_mad_u16", 0x40a => "v_pk_add_u16",
+        0x40b => "v_pk_sub_u16", 0x40c => "v_pk_max_u16", 0x40d => "v_pk_min_u16",
         0x40e => "v_pk_fma_f16", 0x40f => "v_pk_add_f16", 0x410 => "v_pk_mul_f16", 0x411 => "v_pk_min_f16", 0x412 => "v_pk_max_f16",
         0x421 => "v_fma_mixlo_f16", 0x422 => "v_fma_mixhi_f16",
         0x420 => "v_fma_mix_f32", // VOP3P opcode 0x20 (see rdna2.rs: VOP3P opcodes are offset by 0x400)
@@ -319,11 +322,15 @@ pub fn mubuf(op: u32) -> Option<&'static str> {
     Some(match op {
         0x00 => "buffer_load_format_x", 0x01 => "buffer_load_format_xy",
         0x02 => "buffer_load_format_xyz", 0x03 => "buffer_load_format_xyzw",
-        0x04 => "buffer_store_format_x", 0x07 => "buffer_store_format_xyzw",
+        0x04 => "buffer_store_format_x", 0x05 => "buffer_store_format_xy",
+        0x06 => "buffer_store_format_xyz", 0x07 => "buffer_store_format_xyzw",
         0x08 => "buffer_load_ubyte", 0x09 => "buffer_load_sbyte", 0x0a => "buffer_load_ushort",
         0x0b => "buffer_load_sshort", 0x0c => "buffer_load_dword", 0x0d => "buffer_load_dwordx2",
         0x0e => "buffer_load_dwordx4", 0x0f => "buffer_load_dwordx3", 0x18 => "buffer_store_byte",
-        0x1a => "buffer_store_short", 0x1c => "buffer_store_dword", 0x1d => "buffer_store_dwordx2",
+        0x19 => "buffer_store_byte_d16_hi", 0x1a => "buffer_store_short", 0x1b => "buffer_store_short_d16_hi",
+        0x1c => "buffer_store_dword", 0x1d => "buffer_store_dwordx2",
+        0x20 => "buffer_load_ubyte_d16", 0x21 => "buffer_load_ubyte_d16_hi", 0x22 => "buffer_load_sbyte_d16",
+        0x23 => "buffer_load_sbyte_d16_hi", 0x24 => "buffer_load_short_d16", 0x25 => "buffer_load_short_d16_hi",
         0x1e => "buffer_store_dwordx4", 0x1f => "buffer_store_dwordx3",
         0x30 => "buffer_atomic_swap", 0x31 => "buffer_atomic_cmpswap", 0x32 => "buffer_atomic_add", 0x71 => "buffer_gl0_inv", 0x72 => "buffer_gl1_inv",
         0x33 => "buffer_atomic_sub", 0x35 => "buffer_atomic_smin", 0x36 => "buffer_atomic_umin",
@@ -396,18 +403,22 @@ pub fn lookup(enc: Enc, op: u32) -> Option<&'static str> {
             0x05 => Some("ds_min_i32"), 0x06 => Some("ds_max_i32"), 0x10 => Some("ds_cmpst_b32"),
             0x21 => Some("ds_sub_rtn_u32"), 0x22 => Some("ds_rsub_rtn_u32"), 0x23 => Some("ds_inc_rtn_u32"), 0x24 => Some("ds_dec_rtn_u32"),
             0x25 => Some("ds_min_rtn_i32"), 0x26 => Some("ds_max_rtn_i32"), 0x2d => Some("ds_wrxchg_rtn_b32"), 0x30 => Some("ds_cmpst_rtn_b32"),
+            0x0c => Some("ds_mskor_b32"), 0x2c => Some("ds_mskor_rtn_b32"), 0x2e => Some("ds_wrxchg2_rtn_b32"), 0x2f => Some("ds_wrxchg2st64_rtn_b32"),
             0x18 => Some("ds_gws_sema_release_all"), 0x19 => Some("ds_gws_init"), 0x1a => Some("ds_gws_sema_v"),
             0x1b => Some("ds_gws_sema_br"), 0x1c => Some("ds_gws_sema_p"), 0x1d => Some("ds_gws_barrier"),
             0x3d => Some("ds_consume"), 0x3e => Some("ds_append"), 0x3f => Some("ds_ordered_count"),
-            0x1e => Some("ds_write_b8"), 0x1f => Some("ds_write_b16"),
+            0x1e => Some("ds_write_b8"), 0x1f => Some("ds_write_b16"), 0xa0 => Some("ds_write_b8_d16_hi"), 0xa1 => Some("ds_write_b16_d16_hi"),
+            0xa2 => Some("ds_read_u8_d16"), 0xa3 => Some("ds_read_u8_d16_hi"), 0xa4 => Some("ds_read_i8_d16"), 0xa5 => Some("ds_read_i8_d16_hi"),
+            0xa6 => Some("ds_read_u16_d16"), 0xa7 => Some("ds_read_u16_d16_hi"),
             0x39 => Some("ds_read_i8"), 0x3a => Some("ds_read_u8"), 0x3b => Some("ds_read_i16"), 0x3c => Some("ds_read_u16"),
             _ => None,
         },
-        Enc::Vinterp => Some(match op {
-            0 => "v_interp_p1_f32",
-            1 => "v_interp_p2_f32",
-            _ => "v_interp_mov_f32",
-        }),
+        Enc::Vinterp => match op {
+            0 => Some("v_interp_p1_f32"),
+            1 => Some("v_interp_p2_f32"),
+            2 => Some("v_interp_mov_f32"),
+            _ => None,
+        },
         _ => None,
     }
 }

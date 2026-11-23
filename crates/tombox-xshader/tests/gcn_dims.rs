@@ -25,6 +25,11 @@ fn psv0_resource_kind_is_read_from_the_v1_bind_records() {
 #[test]
 fn gcn_image_dim_follows_the_declared_resource_kind() {
     assert_eq!(hlsl::psv_image_dim(4, 1), 2);
+    assert_eq!(hlsl::psv_image_dim(3, 1), 1);
+    assert_eq!(hlsl::psv_image_dim_ms(3, 1, false), 1);
+    assert_eq!(hlsl::psv_image_dim_ms(3, 1, true), 6);
+    assert_eq!(hlsl::psv_image_dim_ms(2, 1, true), 1);
+    assert_eq!(hlsl::psv_image_dim_ms(8, 5, true), 5);
     assert_eq!(hlsl::psv_image_dim(5, 1), 3);
     assert_eq!(hlsl::psv_image_dim(1, 1), 0);
     assert_eq!(hlsl::psv_image_dim(6, 5), 4);

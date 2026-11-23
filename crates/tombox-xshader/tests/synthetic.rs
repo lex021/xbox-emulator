@@ -5,7 +5,7 @@
 //! wrapped in a `ShaderExtract` with a made-up signature.
 
 use tombox_xshader::hlsl::translate;
-use tombox_xshader::meta::{GsInfo, MeshInfo, RootParam, RootParamKind, RootRange, RootSig, SigElement};
+use tombox_xshader::meta::{GsInfo, MeshInfo, PsvResource, RootParam, RootParamKind, RootRange, RootSig, SigElement};
 use tombox_xshader::{parse_root_signature, ShaderExtract, Stage};
 
 const S_ENDPGM: u32 = 0xbf81_0000;
@@ -46,6 +46,7 @@ fn shader(stage: Stage, words: &[u32], input_sig: Vec<SigElement>, output_sig: V
         has_root_sig: root.is_some(),
         input_sig,
         output_sig,
+        prim_sig: Vec::new(),
         resources: Vec::new(),
         gs_info: None,
         root_sig: root,
@@ -639,6 +640,49 @@ fn vertex_misc_vector_export_feeds_the_render_target_array_index() {
     assert!(line.contains("uint4(") && line.trim_end().ends_with(".z);"), "{line}");
 }
 
+#[test]
+fn rdna2_viewport_index_comes_from_layer_bits_19_16() {
+    let words = [0xf800_00cf, 0x0403_0200, 0xf800_08df, 0x0200_0101, S_ENDPGM];
+    let inputs = vec![sig("SV_VertexID", 6, 1, 0, 1)];
+    let ex = shader(
+        Stage::Vertex,
+        &words,
+        inputs.clone(),
+        vec![sig("SV_Position", 1, 3, 0, 0xf), sig("SV_RenderTargetArrayIndex", 4, 1, 1, 1), sig("SV_ViewportArrayIndex", 5, 1, 2, 1)],
+        None,
+    );
+    let t = translate(&ex).expect("viewport export translates");
+    let layer = t.hlsl.lines().find(|l| l.contains("o.o1 =")).unwrap_or_else(|| panic!("no layer write:\n{}", t.hlsl));
+    let view = t.hlsl.lines().find(|l| l.contains("o.o2 =")).unwrap_or_else(|| panic!("no viewport write:\n{}", t.hlsl));
+    assert!(layer.contains("(v0) & 0x7ffu"), "{layer}");
+    assert!(view.contains("((v0) >> 16) & 0xfu"), "{view}");
+    assert!(!view.contains(".w"), "{view}");
+    let view_only = shader(
+        Stage::Vertex,
+        &words,
+        inputs.clone(),
+        vec![sig("SV_Position", 1, 3, 0, 0xf), sig("SV_ViewportArrayIndex", 5, 1, 1, 1)],
+        None,
+    );
+    let only = translate(&view_only).expect("viewport without a layer translates");
+    let line = only.hlsl.lines().find(|l| l.contains("o.o1 =")).unwrap_or_else(|| panic!("no viewport write:\n{}", only.hlsl));
+    assert!(line.contains("((v0) >> 16) & 0xfu"), "{line}");
+    let mut no_z = words;
+    no_z[2] = 0xf800_08db;
+    let e = translate(&shader(
+        Stage::Vertex,
+        &no_z,
+        inputs,
+        vec![sig("SV_Position", 1, 3, 0, 0xf), sig("SV_ViewportArrayIndex", 5, 1, 1, 1)],
+        None,
+    ))
+    .err()
+    .expect("missing z lane translated");
+    assert!(e.contains('z') && e.contains("SV_ViewportArrayIndex"), "{e}");
+    #[cfg(windows)]
+    tombox_xshader::dxc::compile(&t.hlsl, &tombox_xshader::dxc::profile_for(t.profile)).unwrap();
+}
+
 const EXP_POS0_V0_V3: [u32; 2] = [0xf800_08cf, 0x0300_0300];
 
 #[test]
@@ -866,4 +910,181 @@ fn one_wave_compute_separates_consecutive_lds_writes() {
 
     let unknown = compute_with(&consecutive_lds(), [0; 4]);
     assert_eq!(barriers_between_first_lds(&unknown), 0, "{unknown}");
+}
+
+#[test]
+fn d16_texel_type_looks_through_half_packing() {
+    let root = || Some(RootSig {
+        version: 2,
+        flags: 1,
+        params: vec![table(0, 64, 5), table(1, 8, 5)],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    });
+    let cs = |words: &[u32]| {
+        let mut ex = shader(Stage::Compute, words, vec![], vec![], root());
+        ex.isa_preamble = [0, 64, 1, 1];
+        (ex.has_input_sig, ex.has_output_sig) = (false, false);
+        ex
+    };
+    let root2 = || Some(RootSig {
+        version: 2,
+        flags: 1,
+        params: vec![table(0, 64, 5), table(3, 16, 5), table(1, 8, 5)],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    });
+    let cs2 = |words: &[u32]| {
+        let mut ex = shader(Stage::Compute, words, vec![], vec![], root2());
+        ex.isa_preamble = [0, 64, 1, 1];
+        (ex.has_input_sig, ex.has_output_sig) = (false, false);
+        ex
+    };
+    let _ = cs;
+    const S_WAITCNT_0: u32 = 0xbf8c_0000;
+    let uav = [0xf40c_0503, 0xfa00_0000, S_WAITCNT_0];
+    let srv = [0xf40c_0202, 0xfa00_0000, S_WAITCNT_0];
+    let store = [0xf020_1f08, 0x8005_0800];
+    let load = [0xf000_1f08, 0x8002_0400];
+
+    let mut w = uav.to_vec();
+    w.extend([
+        0x7e14_1508,
+        0x7e16_1509,
+        0x3614_14ff, 0x0000_ffff,
+        0xd76f_0008, 0x0429_210b,
+        0x7e12_0308,
+    ]);
+    w.extend(store);
+    w.push(S_ENDPGM);
+    let h = translate(&cs2(&w)).expect("f16 packed store").hlsl;
+    assert!(h.contains("RWTexture2D<float4> uav0"), "{h}");
+
+    let mut w = uav.to_vec();
+    w.extend([
+        0x2814_1508,
+        0x3614_14ff, 0x0000_ffff,
+        0xd76f_0008, 0x0429_2109,
+        0x7e12_0308,
+    ]);
+    w.extend(store);
+    w.push(S_ENDPGM);
+    let h = translate(&cs2(&w)).expect("uint packed store").hlsl;
+    assert!(h.contains("RWTexture2D<uint4> uav0"), "{h}");
+    assert!(h.contains("& 0xffffu)") && h.contains(">> 16u)"), "{h}");
+
+    let mut w = uav.to_vec();
+    w.extend([
+        0x2414_1508,
+        0x3614_14ff, 0x0000_ffff,
+        0xd76f_0008, 0x0429_2109,
+        0x7e12_0308,
+    ]);
+    w.extend(store);
+    w.push(S_ENDPGM);
+    let h = translate(&cs2(&w)).expect("sint packed store").hlsl;
+    assert!(h.contains("RWTexture2D<int4> uav0"), "{h}");
+    assert!(h.contains("asint(v8 << 16u) >> 16") && h.contains("asint(v8) >> 16"), "{h}");
+
+    let mut w = srv.to_vec();
+    w.extend(load);
+    w.extend([
+        0x2c10_0890,
+        0x7e10_1708,
+    ]);
+    w.push(S_ENDPGM);
+    let h = translate(&cs2(&w)).expect("f16 packed load").hlsl;
+    assert!(h.contains("Texture2D<float4> tex0"), "{h}");
+
+    let mut w = uav.to_vec();
+    w.extend([
+        0xf044_1108, 0x0005_0400,
+        0xf000_1108, 0x8005_0400,
+        S_ENDPGM,
+    ]);
+    let err = match translate(&cs2(&w)) {
+        Ok(t) => panic!("expected refusal, got:\n{}", t.hlsl),
+        Err(e) => e,
+    };
+    assert!(err.contains("atomic"), "{err}");
+}
+
+#[test]
+fn raw_uav_buffer_atomics_share_ubuf_instead_of_overlapping_utb() {
+    let words = [
+        0xf408_0002, 0xfa00_0000,
+        0x7e02_0284,
+        0x7e06_0287,
+        0xe070_1000, 0x8000_0301,
+        0xe0e8_1004, 0x8000_0301,
+        S_ENDPGM,
+    ];
+    let root = RootSig {
+        version: 2,
+        flags: 0,
+        params: vec![table(1, 1, 0)],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    };
+    let mut ex = shader(Stage::Compute, &words, vec![], vec![], Some(root));
+    ex.isa_preamble = [0, 64, 1, 1];
+    (ex.has_input_sig, ex.has_output_sig) = (false, false);
+    ex.has_psv0 = true;
+    ex.resources.push(PsvResource { res_type: 7, space: 0, lower: 0, upper: 0, kind: 1 });
+    let t = translate(&ex).expect("raw UAV buffer store + atomic");
+    assert!(t.hlsl.contains("ubuf0"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("utb0"), "overlapping utb0 declaration:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("InterlockedOr(ubuf0["), "{}", t.hlsl);
+    if tombox_xshader::dxc::available() {
+        let profile = tombox_xshader::dxc::profile_for(t.profile);
+        tombox_xshader::dxc::compile(&t.hlsl, &profile).expect("DXC compile");
+    }
+}
+
+#[test]
+fn unmapped_position_export_without_clip_or_cull_distance_is_ignored() {
+    let words = [
+        EXP_POS0_V0_V3[0], EXP_POS0_V0_V3[1],
+        0xf800_08df, 0x0302_0100,
+        S_ENDPGM,
+    ];
+    let position = || vec![sig("SV_Position", 1, 3, 0, 0xf)];
+    let ex = shader(Stage::Vertex, &words, vec![], position(), None);
+    let t = translate(&ex).expect("translate position export 13 without clip or cull distance");
+    assert!(t.hlsl.contains("o.o0 ="), "{}", t.hlsl);
+    if tombox_xshader::dxc::available() {
+        let profile = tombox_xshader::dxc::profile_for(t.profile);
+        tombox_xshader::dxc::compile(&t.hlsl, &profile).expect("DXC compile");
+    }
+}
+
+#[test]
+fn image_atomic_64bit_emits_uint64_uav_and_sm66() {
+    let words = [
+        0xf40c_0004, 0xfa00_0000,
+        0x7e02_0284,
+        0x7e04_0285,
+        0x7e06_0286,
+        0x7e08_0287,
+        0xf05c_1308, 0x0000_0301,
+        0xf800_1890, 0x0000_0000,
+        S_ENDPGM,
+    ];
+    let root = RootSig {
+        version: 2,
+        flags: 0,
+        params: vec![table(1, 16, 0)],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    };
+    let ex = shader(Stage::Pixel, &words, vec![], vec![], Some(root));
+    let t = translate(&ex).expect("64-bit image_atomic_umax");
+    assert_eq!(t.profile, "ps_6_6");
+    assert!(t.uses_typed_atomic64);
+    assert!(t.hlsl.contains("RWTexture2D<uint64_t> uav0"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("InterlockedMax(uav0[uint2(v1, v2)], (((uint64_t)v4 << 32) | (uint64_t)v3)"), "{}", t.hlsl);
+    if tombox_xshader::dxc::available() {
+        let profile = tombox_xshader::dxc::profile_for(t.profile);
+        tombox_xshader::dxc::compile(&t.hlsl, &profile).expect("DXC compile ps_6_6");
+    }
 }

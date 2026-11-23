@@ -442,7 +442,7 @@ fn collect(s: &ListState, compute: bool, ds_write: bool) -> Vec<(usize, Option<(
         }
         out.push((res, win, u, why));
     };
-    let mut add_va = |va: u64, u: Use, why: String, add: &mut dyn FnMut(usize, Option<(u64, u64)>, Use, String)| {
+    let add_va = |va: u64, u: Use, why: String, add: &mut dyn FnMut(usize, Option<(u64, u64)>, Use, String)| {
         if va == 0 {
             return;
         }

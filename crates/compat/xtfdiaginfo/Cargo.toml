@@ -12,6 +12,7 @@ crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 [dependencies]
+compat-common = { path = "../compat-common" }
 xtfcommon = { path = "../xtfcommon" }
 xtfmsg = { path = "../xtfmsg" }
 

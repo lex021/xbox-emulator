@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tombox_xshader::{cbv_raw_hlsl, dxc, extract, fma_probe, gcn, hlsl, parse_root_signature, runtime_hlsl, shader_cache, Stage};
+use tombox_xshader::pack_key::{self, CbvRaw, Mode};
+use tombox_xshader::{dxc, extract, fma_probe, parse_root_signature, runtime_hlsl, shader_cache, Stage};
 
 fn stage_name(s: &Stage) -> &'static str {
     match s {
@@ -80,12 +81,12 @@ fn gather(dir: &Path, out: &mut Vec<Item>, seen: &mut HashSet<(u64, [u8; 8], Str
 }
 
 enum Prep {
-    Key { st: &'static str, k: u128, src: String, profile: String },
+    Key { st: &'static str, k: u128, line: String, src: String, profile: String },
     Fail { phase: &'static str, st: &'static str, reason: String },
     RuntimeOnly { st: &'static str, reason: &'static str },
 }
 
-fn prepare(it: &Item, loop_grad: bool, fma: shader_cache::Fma) -> Prep {
+fn prepare(it: &Item, mode: &Mode) -> Prep {
     let Ok(blob) = std::fs::read(&it.path) else {
         return Prep::Fail { phase: "read", st: "??", reason: format!("cannot read {}", it.path.display()) };
     };
@@ -105,25 +106,87 @@ fn prepare(it: &Item, loop_grad: bool, fma: shader_cache::Fma) -> Prep {
                 Err(e) => return Prep::Fail { phase: "extract", st, reason: format!("pipeline root signature: {e}") },
             }
         }
-        let mut t = match hlsl::translate(&ex) {
-            Ok(t) => t,
-            Err(e) => return Prep::Fail { phase: "translate", st, reason: format!("translate: {e}") },
-        };
-        if gcn::is_durango(&ex.fssm) {
-            match cbv_raw_hlsl::rewrite_hlsl(&t.hlsl) {
-                Ok(h) => t.hlsl = h,
-                Err(e) => return Prep::Fail { phase: "translate", st, reason: format!("bind: {e}") },
-            }
+        match pack_key::prelaunch_ex(&ex, &it.rt, None, mode) {
+            Ok(k) => Prep::Key { st, k: k.parts.key, line: k.parts.line(), src: k.src, profile: k.profile },
+            Err((phase, reason)) => Prep::Fail { phase: if phase == "bind" { "translate" } else { phase }, st, reason },
         }
-        let src = runtime_hlsl::finalize(&t.hlsl, &it.rt, loop_grad);
-        let profile = dxc::profile_for(t.profile);
-        let k = shader_cache::key(&src, &profile, fma, "");
-        Prep::Key { st, k, src, profile }
     }));
     r.unwrap_or_else(|p| {
         let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "panic".into());
         Prep::Fail { phase: "panic", st: "??", reason: format!("translator panicked: {msg}") }
     })
+}
+
+fn keys_path(title: &str) -> PathBuf {
+    shader_cache::title_dir(title).join("prelaunch_keys.txt")
+}
+
+fn write_keys(title: &str, rows: &[String]) {
+    let p = keys_path(title);
+    let _ = std::fs::create_dir_all(p.parent().unwrap());
+    let tmp = p.with_extension(format!("txt.{}", std::process::id()));
+    let mut body = String::with_capacity(rows.len() * 200);
+    for r in rows {
+        body.push_str(r);
+        body.push('\n');
+    }
+    if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &p).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+struct Resolved {
+    mode: Mode,
+    notes: Vec<String>,
+    stale: Option<String>,
+}
+
+fn resolve_mode(title: &str, runtime_dll: Option<&Path>, cbraw_env: Option<&str>, loop_grad: bool, probed: shader_cache::Fma) -> Resolved {
+    let marker = std::fs::read_to_string(shader_cache::runtime_mode_path(title)).ok();
+    resolve_mode_from(marker.as_deref(), runtime_dll.map(|p| (p, std::fs::read(p).ok())), cbraw_env, loop_grad, probed)
+}
+
+fn resolve_mode_from(marker: Option<&str>, runtime_dll: Option<(&Path, Option<Vec<u8>>)>, cbraw_env: Option<&str>, loop_grad: bool, probed: shader_cache::Fma) -> Resolved {
+    let parsed = marker.and_then(Mode::parse_line);
+    let xbox_one = marker.is_some_and(|m| m.split_whitespace().any(|w| w == "xbox_one=1"));
+    let mut notes = Vec::new();
+    let fma = match &parsed {
+        Some((_, m)) if m.fma != probed => {
+            notes.push(format!("fma flags {:?} from the last runtime launch used instead of this probe's {:?}", m.fma, probed));
+            m.fma
+        }
+        _ => probed,
+    };
+    let cbv_raw = match (cbraw_env, &parsed) {
+        (Some(v), _) => CbvRaw::decide(Some(v), xbox_one),
+        (None, Some((_, m))) => m.cbv_raw,
+        (None, None) => CbvRaw::Copy,
+    };
+    let mode = Mode { cbv_raw, loop_grad, fma };
+    match &parsed {
+        Some((t, m)) => {
+            notes.push(format!("runtime mode file: {}", marker.unwrap_or("").trim()));
+            if m.cbv_raw != mode.cbv_raw {
+                notes.push(format!("cbv_raw {} here vs {} at the last runtime launch (TOMBOX_CBV_RAW/TOMBOX_CBRAW {})", mode.cbv_raw.name(), m.cbv_raw.name(), cbraw_env.unwrap_or("unset")));
+            }
+            if m.loop_grad != mode.loop_grad {
+                notes.push(format!("TOMBOX_LOOP_GRAD differs from the last runtime launch ({} here, {} there)", mode.loop_grad as u8, m.loop_grad as u8));
+            }
+            if t != pack_key::TRANSLATOR_HASH {
+                notes.push(format!("last runtime launch used translator {t}, this prelaunch is {}", pack_key::TRANSLATOR_HASH));
+            }
+        }
+        None => notes.push(format!("no runtime mode file yet; cbv_raw {} from TOMBOX_CBV_RAW/TOMBOX_CBRAW={}", mode.cbv_raw.name(), cbraw_env.unwrap_or("unset"))),
+    }
+    let stale = runtime_dll.and_then(|(p, b)| {
+        let Some(b) = b else { return Some(format!("STALE: cannot read runtime dll {}", p.display())) };
+        match pack_key::find_translator_tag(&b) {
+            Some(h) if h == pack_key::TRANSLATOR_HASH => None,
+            Some(h) => Some(format!("STALE: {} carries translator {h}, this xshader_prelaunch is {}; its keys can never match the runtime, rebuild it (cargo build -p tombox-xshader --bin xshader_prelaunch)", p.display(), pack_key::TRANSLATOR_HASH)),
+            None => Some(format!("STALE: {} carries no translator tag (built before the tag existed); rebuild d3d12_xs and xshader_prelaunch from the same tree", p.display())),
+        }
+    });
+    Resolved { mode, notes, stale }
 }
 
 fn normalize(e: &str) -> String {
@@ -231,6 +294,7 @@ struct Opts {
     jobs: usize,
     retry_failed: bool,
     check: bool,
+    mode: Mode,
 }
 
 fn run(o: &Opts, sh: &Shared, rep: &Mutex<Report>) {
@@ -256,8 +320,8 @@ fn run(o: &Opts, sh: &Shared, rep: &Mutex<Report>) {
     }
     items.sort_by_key(|it| (it.hash, it.rt));
     eprintln!("[shader prelaunch] {} known (shader, render-target format) variants: {}", items.len(), if per_dir.is_empty() { "none".to_string() } else { per_dir.join(", ") });
-    let fma = fma_probe::probe().fma;
-    let loop_grad = runtime_hlsl::loop_grad_from_env();
+    let mode = o.mode;
+    let fma = mode.fma;
     sh.total.store(items.len(), Ordering::Relaxed);
     let next = AtomicUsize::new(0);
     let preps: Vec<Mutex<Option<Prep>>> = (0..items.len()).map(|_| Mutex::new(None)).collect();
@@ -269,7 +333,7 @@ fn run(o: &Opts, sh: &Shared, rep: &Mutex<Report>) {
                 }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(it) = items.get(i) else { break };
-                *preps[i].lock().unwrap() = Some(prepare(it, loop_grad, fma));
+                *preps[i].lock().unwrap() = Some(prepare(it, &mode));
                 sh.done.fetch_add(1, Ordering::Relaxed);
             });
         }
@@ -277,6 +341,7 @@ fn run(o: &Opts, sh: &Shared, rep: &Mutex<Report>) {
     let neg = if o.retry_failed { HashMap::new() } else { load_neg(&o.title) };
     let mut todo: Vec<(u128, String, String, &'static str, u64, [u8; 8])> = Vec::new();
     let mut keys: HashSet<u128> = HashSet::new();
+    let mut lines: Vec<String> = Vec::new();
     {
         let mut r = rep.lock().unwrap();
         r.known = items.len();
@@ -294,7 +359,8 @@ fn run(o: &Opts, sh: &Shared, rep: &Mutex<Report>) {
                     r.by_stage.entry(st).or_default()[2] += 1;
                     r.fails.push(FailRow { phase, st, hash: it.hash, rt: it.rt, reason });
                 }
-                Some(Prep::Key { st, k, src, profile }) => {
+                Some(Prep::Key { st, k, line, src, profile }) => {
+                    lines.push(format!("{:016x}_{} {line}", it.hash, rt_hex(&it.rt)));
                     if !keys.insert(k) {
                         r.duplicate += 1;
                         continue;
@@ -314,6 +380,9 @@ fn run(o: &Opts, sh: &Shared, rep: &Mutex<Report>) {
         }
         r.unique_keys = keys.len();
     }
+    if !o.check {
+        write_keys(&o.title, &lines);
+    }
     if sh.skip.load(Ordering::Relaxed) {
         return;
     }
@@ -332,12 +401,13 @@ fn run(o: &Opts, sh: &Shared, rep: &Mutex<Report>) {
     std::thread::scope(|s| {
         for _ in 0..o.jobs {
             s.spawn(|| loop {
+                dxc::set_background(true);
                 if sh.skip.load(Ordering::Relaxed) {
                     break;
                 }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some((k, src, profile, st, hash, rt)) = todo.get(i) else { break };
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shader_cache::compile_cached(src, profile, fma, &[]))).unwrap_or_else(|_| Err("dxc panicked".into()));
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shader_cache::compile_cached_with(src, profile, fma, &pack_key::extra(&mode, &[]), || dxc::compile_fma(src, profile, fma, &[])))).unwrap_or_else(|_| Err("dxc panicked".into()));
                 if sh.skip.load(Ordering::Relaxed) && res.is_err() {
                     break;
                 }
@@ -375,6 +445,7 @@ fn summary(o: &Opts, r: &Report, total_s: f64, skipped: bool, todo_left: usize) 
     s.push_str(&format!("[shader prelaunch] {} ({}){}\n", o.title, shader_cache::pack_path().display(), if skipped { " SKIPPED by user, remaining shaders left to runtime async PSO creation" } else { "" }));
     s.push_str(&format!("  known variants {}  unique compiles {}  already cached {}  converted {}  failed {}  runtime-only {}  same HLSL as another variant {}{}\n", r.known, r.unique_keys, r.cached, r.converted, failed, r.runtime_only, r.duplicate, if todo_left > 0 { format!("  not converted (skipped) {todo_left}") } else { String::new() }));
     s.push_str(&format!("  time total {:.1}s (key pass {:.1}s, compile {:.1}s, summed dxc {:.1}s) on {} jobs; {}\n", total_s, r.key_s, r.compile_s, r.compile_ms_sum / 1000.0, o.jobs, dxc::identity()));
+    s.push_str(&format!("  key mode: {}\n", o.mode.line()));
     if o.check {
         s.push_str(&format!("  check only: {} shaders would be converted, nothing compiled\n", r.would_convert));
     }
@@ -656,11 +727,25 @@ mod ui {
     }
 }
 
+fn scan_game(title: &str, game: &Path) -> String {
+    let out = shader_cache::game_scan_dir(title);
+    let t0 = Instant::now();
+    match tombox_xshader::game_scan::sync_dir(game, &out) {
+        Ok(r) if r.skipped => format!("game scan: {} unchanged since the last scan, {} kept ({:.1}s)", game.display(), out.display(), t0.elapsed().as_secs_f64()),
+        Ok(r) => {
+            let (files, mb, zips, gbx, ue, errs) = r.scan.as_ref().map(|s| (s.files, s.bytes >> 20, s.zip_entries, s.gbx, s.ue_entries, s.errors)).unwrap_or_default();
+            format!("game scan: {} shader containers in {} ({files} files, {mb} MB, {zips} zip entries, {gbx} GBX bodies, {ue} UE archive entries, {errs} unreadable); {} new in {} ({:.1}s); the runtime prewarm compiles them after the known variants", r.found, game.display(), r.written, out.display(), t0.elapsed().as_secs_f64())
+        }
+        Err(e) => format!("game scan of {} failed: {e}; shaders not seen before convert at runtime", game.display()),
+    }
+}
+
 fn usage() {
     eprintln!("usage: xshader_prelaunch --title <exe stem> [--name <display name>] [--dir <dump dir>]...");
-    eprintln!("                         [--no-ui] [--yes] [--jobs n] [--retry-failed] [--summary <file>] [--skip-after <ms>] [--check]");
+    eprintln!("                         [--no-ui] [--yes] [--jobs n] [--retry-failed] [--summary <file>] [--skip-after <ms>] [--check] [--runtime-dll <d3d12_xs.dll>]");
+    eprintln!("                         [--game-dir <title install dir>]  (extracts the title's own shader containers into <pack root>/titles/<title>/game_scan for the runtime prewarm; read-only on the game files)");
     eprintln!("translates and DXC-compiles every known shader of the title that is not in the pack yet, then exits;");
-    eprintln!("exit 0 done (failures are reported and left to runtime), 3 skipped, 2 setup problem (launch anyway).");
+    eprintln!("exit 0 done (failures are reported and left to runtime), 3 skipped, 2 setup problem, 4 stale translator (launch anyway).");
     eprintln!("pack root: {}", shader_cache::root().display());
 }
 
@@ -674,6 +759,8 @@ fn main() {
     let mut skip_after: Option<Duration> = None;
     let mut retry_failed = false;
     let mut check = false;
+    let mut runtime_dll: Option<PathBuf> = None;
+    let mut game_dir: Option<PathBuf> = None;
     let mut jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).saturating_sub(2).max(1);
     let mut i = 0;
     let val = |i: usize| args.get(i + 1).cloned().unwrap_or_default();
@@ -685,6 +772,8 @@ fn main() {
             "--dir" => dirs.push(PathBuf::from(val(i))),
             "--jobs" => jobs = val(i).parse().unwrap_or(jobs).max(1),
             "--summary" => summary_file = Some(PathBuf::from(val(i))),
+            "--runtime-dll" => runtime_dll = Some(PathBuf::from(val(i))),
+            "--game-dir" => game_dir = Some(PathBuf::from(val(i))),
             "--skip-after" => skip_after = val(i).parse().ok().map(Duration::from_millis),
             "--no-ui" => {
                 no_ui = true;
@@ -720,13 +809,29 @@ fn main() {
         name = title.clone();
     }
     let started = Instant::now();
+    let scan_note = game_dir.as_deref().map(|g| scan_game(&title, g));
+    if let Some(n) = &scan_note {
+        eprintln!("[shader prelaunch] {n}");
+    }
     if !dxc::available() {
         println!("[shader prelaunch] {title}: dxcompiler.dll + dxil.dll not found (TOMBOX_DXC_DIR); nothing converted, every shader is left to runtime");
         std::process::exit(2);
     }
+    let res = resolve_mode(&title, runtime_dll.as_deref(), CbvRaw::setting_from_env().as_deref(), runtime_hlsl::loop_grad_from_env(), fma_probe::probe().fma);
+    for n in &res.notes {
+        eprintln!("[shader prelaunch] {n}");
+    }
+    if let Some(why) = &res.stale {
+        let s = format!("[shader prelaunch] {title}: {why}; nothing converted, every shader is left to runtime\n");
+        print!("{s}");
+        if let Some(f) = &summary_file {
+            let _ = std::fs::write(f, &s);
+        }
+        std::process::exit(4);
+    }
     let mut all_dirs = vec![shader_cache::src_dir(&title), shader_cache::title_dir(&title).join("dump"), shader_cache::root().join("dump"), std::env::temp_dir().join("tombox_shader_dump")];
     all_dirs.extend(dirs);
-    let o: &'static Opts = Box::leak(Box::new(Opts { title: title.clone(), dirs: all_dirs, jobs, retry_failed, check }));
+    let o: &'static Opts = Box::leak(Box::new(Opts { title: title.clone(), dirs: all_dirs, jobs, retry_failed, check, mode: res.mode }));
     let sh: &'static Shared = Box::leak(Box::new(Shared {
         phase: AtomicU8::new(0),
         done: AtomicUsize::new(0),
@@ -770,7 +875,10 @@ fn main() {
     }
     let r = rep.lock().unwrap_or_else(|e| e.into_inner());
     let left = if skipped { sh.total.load(Ordering::Relaxed).saturating_sub(sh.done.load(Ordering::Relaxed)) } else { 0 };
-    let s = summary(o, &r, started.elapsed().as_secs_f64(), skipped, left);
+    let mut s = summary(o, &r, started.elapsed().as_secs_f64(), skipped, left);
+    if let Some(n) = &scan_note {
+        s.push_str(&format!("  {n}\n"));
+    }
     print!("{s}");
     if let Some(f) = &summary_file {
         let _ = std::fs::write(f, &s);
@@ -789,6 +897,28 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mode_follows_env_then_runtime_file_and_flags_a_stale_dll() {
+        let probed = shader_cache::Fma { preserve: true, any: false, hybrid: false, f2h: false };
+        let runtime = Mode { cbv_raw: CbvRaw::On, loop_grad: true, fma: shader_cache::Fma { preserve: true, any: false, hybrid: true, f2h: true } };
+        let marker = format!("{} xbox_one=1", runtime.line());
+        let r = resolve_mode_from(Some(&marker), None, None, true, probed);
+        assert_eq!(r.mode, runtime);
+        assert!(r.stale.is_none());
+        let r = resolve_mode_from(Some(&marker), None, Some("0"), true, probed);
+        assert_eq!(r.mode.cbv_raw, CbvRaw::Off);
+        let r = resolve_mode_from(None, None, Some("1"), true, probed);
+        assert_eq!((r.mode.cbv_raw, r.mode.fma), (CbvRaw::Forced, probed));
+        assert_eq!(resolve_mode_from(None, None, None, false, probed).mode, Mode { cbv_raw: CbvRaw::Copy, loop_grad: false, fma: probed });
+        let p = Path::new("d3d12_xs.dll");
+        let good = pack_key::translator_tag().to_vec();
+        assert!(resolve_mode_from(None, Some((p, Some(good))), None, true, probed).stale.is_none());
+        let old = format!("xx{}0123456789abcdef yy", pack_key::TAG_PREFIX).into_bytes();
+        let bad = resolve_mode_from(None, Some((p, Some(old))), None, true, probed).stale.unwrap();
+        assert!(bad.starts_with("STALE") && bad.contains("0123456789abcdef"));
+        assert!(resolve_mode_from(None, Some((p, Some(b"no tag".to_vec()))), None, true, probed).stale.is_some());
+    }
 
     #[test]
     fn dump_names_parse() {

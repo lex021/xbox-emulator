@@ -25,6 +25,12 @@ fn is_core_host(h: &str) -> bool {
     h == "nadeo.online" || h.ends_with(".nadeo.online")
 }
 
+pub const STATUS_HOST: &str = "trackmania-status.cdn.ubi.com";
+
+fn is_status_request(req: &Request, host: &str) -> bool {
+    host == STATUS_HOST && req.method == "GET" && req.path.trim_end_matches('/').eq_ignore_ascii_case("/status.json")
+}
+
 pub const NADEO_PARAMETER_GROUP: &str = "NadeoServicesParameters";
 pub const MASTERSERVER_INIT_URL: &str = "https://prod.trackmania.core.nadeo.online/api/routes";
 
@@ -125,6 +131,10 @@ impl TitleService for Trackmania {
         let host = host_of(req);
         if is_nadeo_host(&host) {
             return self.nadeo(req, &host);
+        }
+        if is_status_request(req, &host) {
+            crate::record_raw("online", "trackmania", &format!("{STATUS_HOST}/status.json answered 404: the status schema is not decoded (caller is in the encrypted title pack), and 404 is the answer the game is known to tolerate"));
+            return Some(self.ubi.not_found(req));
         }
         let r = self.ubi.route(req)?;
         Some(with_nadeo_parameters(req, r))

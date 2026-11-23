@@ -38,18 +38,21 @@ Counted live by `tools/progress/gen.py`; full table with evidence in [docs/MILES
 | All shader stages (Mesh, Amplification) | in progress (map) |
 | All Xbox console libraries covered | in progress (map) |
 | Fortnite boots, first frames, login, hotfix, mode select, BR lobby | done (7 run milestones) |
-| 3D scene correct | not reached |
-| Keyboard / controller input | not reached |
-| Audio | not reached |
-| Gameplay | not reached |
-| A second title running | not reached |
+| Keyboard / controller input | done: Trackmania, host pad and keyboard drive the menus to a campaign map (user session 2026-11-22) |
+| Gameplay | done: Trackmania drives Training - 01 and loads campaign Spring 2024 - 01 |
+| A second title running | done: Trackmania and Terraria |
+| 3D scene correct | not reached: Trackmania renders its races, but video and streamed textures stay black and the stencil-tested lighting passes are dark |
+| Audio | in progress: XAudio2 engine and XMA2 source voices come up (Trackmania, 2026-11-22); audible output not verified, test runs are muted |
 
 ## Tested titles
 
 | Title | Build | Result |
 |---|---|---|
 | Fortnite (Chapter 2 Season 4) | 2.0.1461.7919 | Boots, logs in to a private server, reaches the lobby. 2D interface correct. 3D scene lit but the character material is wrong and bloom shows artifacts. No audio. Not playable. On this machine (2026-11-21): boots, first frames, window on the primary monitor, login complete, hotfix success, game-mode select, Battle Royale lobby (`UI.State.Athena.Frontend`). |
-| XDefiant | dump examined | **Not run.** Imports and console OS (10.0.22000) mapped in [docs/LIBRARY_MAP.md](docs/LIBRARY_MAP.md); new modules include XCurl, Bink2Scarlett, chad (XDsp*), xapu (XApu*). |
+| Trackmania | 1.6.2.0 (game build 2024-04-30, GameVersion 3.3.0) | **Boots and plays.** Menus, login against the in-process online backend, Training - 01 race renders and drives at ~60 fps average (1% low ~32) on this machine; campaign map Spring 2024 - 01 loads but runs at 8-17 fps (GPU-bound). Keyboard and controller work. Video screens, billboards and streamed textures are black, and stencil-tested lighting passes are dark. |
+| Terraria | 4.4.14.1081 | **Reaches its world** at a steady 60 fps (1% low ~59); keyboard and controller work. Runs fine when played by hand (user, 2026-11-22); automated test runs still crash some seconds after the world appears (under investigation). |
+| Minecraft (Beta) | 1.18.3064.0 | Boots past the welcome screen to the menu (~44 s), then crashes in automated runs. |
+| XDefiant | 1.0.0.186 | Boots to first frames (~26 s) at under 1 fps (shader and pipeline compiles block the frame), then crashes. Imports and console OS (10.0.22000) mapped in [docs/LIBRARY_MAP.md](docs/LIBRARY_MAP.md); new modules include XCurl, Bink2Scarlett, chad (XDsp*), xapu (XApu*). |
 | Grand Theft Auto VI | 1.0.2.1 | **Not run** (dump has no executable). Shader package examined: 26,503 shaders, plain compressed Xbox shader containers. Of a 4,000-shader sample all disassemble cleanly; ~⅓ of vertex shaders translate. Blockers: mesh shaders, shaders without root signatures. |
 
 ## Our local state

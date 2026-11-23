@@ -85,6 +85,7 @@ pub unsafe fn resolve_into(list: *mut c_void, res: usize, off: u64) -> bool {
 }
 
 pub unsafe fn write(list: *mut c_void, copy_list: bool, addr: u64, a: u32, b: u32, c: u32) {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::QUERY) };
     static MISS: AtomicUsize = AtomicUsize::new(0);
     static LOG: AtomicUsize = AtomicUsize::new(0);
     let Some((e, off)) = crate::gpu_va::lookup(addr) else {

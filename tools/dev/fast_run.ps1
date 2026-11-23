@@ -15,6 +15,7 @@ param(
   [switch]$NoWaitUser,
   [string]$Seed = 'default',
   [switch]$ListScenes,
+  [switch]$Visible,
   [switch]$Fps
 )
 
@@ -32,6 +33,8 @@ function Scr([string]$Name, [string]$File, [int]$X, [int]$Y, [int]$W, [int]$H, [
 
 $tmDrive = "/init challenge 'Training - 01'/+12:press a;+3:press a;+2:down rt+a;+10:stick l 0.5 0 800;+6:stick l -0.5 0 800"
 $tmToTraining = "0:connect;#start+1:press a;?#offline+1:press a;#play+2:press a;#solo+2:press down;+1.5:press left;+1.5:press a;+4:press a;+3:press a"
+$tmToSpring = "0:connect;#start+1:press a;?#offline+1:press a;#play+2:press a;#solo+2:press a;+4:press a;+4:press a;+4:press a"
+$tmDriveSpring = "/init challenge 'Spring 2024 - 01'/+12:press a;+3:press a;+2:down rt+a;+10:stick l 0.5 0 800;+6:stick l -0.5 0 800"
 $AllSpecs = @{
   trackmania = [pscustomobject]@{
     RunTitle = 'Trackmania'; Proc = 'GbxGame'; Drive = 'R:'; Main = 'training01_drive'; Seed = ''
@@ -45,6 +48,8 @@ $AllSpecs = @{
       menu = @{ Pad = "0:connect;#start+1:press a;?#offline+1:press a"; Rx = ''; Screen = 'play'; Timeout = 90; After = 3 }
       training01 = @{ Pad = $tmToTraining; Rx = "init challenge 'Training - 01'"; Screen = ''; Timeout = 120; After = 8 }
       training01_drive = @{ Pad = "$tmToTraining;$tmDrive"; Rx = "init challenge 'Training - 01'"; Screen = ''; Motion = 'down rt'; Timeout = 150; After = 2 }
+      spring01 = @{ Pad = $tmToSpring; Rx = "init challenge 'Spring 2024 - 01'"; Screen = ''; Timeout = 150; After = 8 }
+      spring01_drive = @{ Pad = "$tmToSpring;$tmDriveSpring"; Rx = "init challenge 'Spring 2024 - 01'"; Screen = ''; Motion = 'down rt'; Timeout = 180; After = 2 }
     }
     Milestones = @(
       @{ Name = 'main menu (engine)'; Src = 'ods'; Rx = [regex]'\[Game\] main menu' },
@@ -112,7 +117,7 @@ if (-not $Scene -or $Scene -eq 'main') { $Scene = $Spec.Main }
 if (-not $Spec.Scenes.Contains($Scene)) { throw "scene '$Scene' is not defined for $Title (scenes: $($Spec.Scenes.Keys -join ', '))" }
 $Sc = $Spec.Scenes[$Scene]
 if ($Seconds -le 0) { $Seconds = $Sc.Timeout }
-if ($AfterScene -lt 0) { $AfterScene = $Sc.After }
+if ($AfterScene -lt 0) { $AfterScene = $Sc.After; if ($Fps) { $AfterScene = [Math]::Max($AfterScene, 60) } }
 if ($PadScript -eq 'default') { $PadScript = $Sc.Pad }
 if ($GameArgs -eq 'default') { $GameArgs = '' }
 $SceneRx = if ($Sc.Rx) { [regex]$Sc.Rx } else { $null }
@@ -326,12 +331,30 @@ try {
     Start-Sleep -Seconds 5
   }
   Say ("  locks: {0} (waited {1:N0}s)" -f ($held -join ', '), ((Get-Date) - $waitStart).TotalSeconds) 'DarkGray'
+  $measuring = $null
+  if (-not ($Env.ContainsKey('TOMBOX_PASSCAP') -or $Env.ContainsKey('TOMBOX_RTCAP'))) {
+    $measuring = Join-Path $Runs 'MEASURING'
+    $mStart = Get-Date
+    Set-Content -LiteralPath $measuring -Value ("state=waiting {0} pid={1} title={2} id={3} since={4}" -f $Out, $PID, $Title, $Id, (Get-Date -Format s)) -Encoding utf8
+    $heavy = { @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('cargo', 'rustc', 'dxc', 'xshader_corpus') -or $_.Name -like 'exec-*' -or $_.Name -like 'cfg_fuzz*' }) }
+    $busy = & $heavy
+    if ($busy.Count) { Say ('  MEASURING: waiting for in-flight heavy work: ' + (($busy | ForEach-Object { $_.Name } | Sort-Object -Unique) -join ', ')) 'Yellow' }
+    while ((& $heavy).Count -and ((Get-Date) - $mStart).TotalMinutes -lt 30) { Start-Sleep -Seconds 10 }
+    $left = & $heavy
+    if ($left.Count) { Say ('  MEASURING: 30 min cap hit, measuring with ' + (($left | ForEach-Object { $_.Name } | Sort-Object -Unique) -join ', ') + ' still running') 'Yellow' }
+    Set-Content -LiteralPath $measuring -Value ("state=running {0} pid={1} title={2} id={3} since={4} quiet_wait_s={5:N0}" -f $Out, $PID, $Title, $Id, (Get-Date -Format s), ((Get-Date) - $mStart).TotalSeconds) -Encoding utf8
+  }
+  if (-not $NoWaitUser -and (Test-UserPlaying)) {
+    Say '  USER_PLAYING appeared before launch: holding until it clears' 'Yellow'
+    while (Test-UserPlaying) { Start-Sleep -Seconds 5 }
+    Say '  USER_PLAYING cleared: launching' 'DarkGray'
+  }
 
   $envKeys = @('TOMBOX_HEADLESS', 'TOMBOX_TEST_RUN', 'TOMBOX_HOST_PAD', 'TOMBOX_HOST_KBM', 'TOMBOX_PRELAUNCH_UI', 'TOMBOX_CAPTURE_DIR', 'TOMBOX_PAD_DIR', 'TOMBOX_GDK_ROOT', 'TOMBOX_ALLOW_NETWORK', 'TOMBOX_NET_LOCAL_PORT', 'TOMBOX_TAKEOVER_FILE', 'TOMBOX_USER_PLAYING_FILE') + @($Env.Keys)
   $oldEnv = @{}
   foreach ($k in $envKeys) { $oldEnv[$k] = [Environment]::GetEnvironmentVariable($k) }
   Remove-Item Env:TOMBOX_ALLOW_NETWORK, Env:TOMBOX_NET_LOCAL_PORT, Env:TOMBOX_TAKEOVER_FILE, Env:TOMBOX_USER_PLAYING_FILE -ErrorAction SilentlyContinue
-  $env:TOMBOX_HEADLESS = '1'
+  if (-not $Visible) { $env:TOMBOX_HEADLESS = '1' } else { Remove-Item Env:TOMBOX_HEADLESS -ErrorAction SilentlyContinue }
   $env:TOMBOX_TEST_RUN = '1'
   $env:TOMBOX_HOST_PAD = '0'
   $env:TOMBOX_HOST_KBM = '0'
@@ -373,6 +396,11 @@ try {
       $ra = @('-NoProfile', '-File', (Join-Path $Root 'run_xdefiant.ps1')) + $common + $profileArgs
       $ra += @('-Overlay', (Join-Path $TestRoot 'XDefiant'), '-Drive', $Spec.Drive)
     }
+  }
+  if ($Title -in @('trackmania', 'terraria')) {
+    if ($Env.ContainsKey('TOMBOX_AGILITY_PATH')) { $ra += @('-Agility', "`"$($Env['TOMBOX_AGILITY_PATH'])`"") }
+    if ($Env.ContainsKey('TOMBOX_AGILITY_VERSION')) { $ra += @('-AgilityVersion', "$($Env['TOMBOX_AGILITY_VERSION'])") }
+    if ($Env.ContainsKey('TOMBOX_D3D12_DEBUG') -and "$($Env['TOMBOX_D3D12_DEBUG'])" -ne '0') { $ra += '-D3d12Debug' }
   }
   if ($GameArgs) { $ra += @('-GameArgs', "`"$GameArgs`"") }
   Say ("  launch: powershell {0}" -f ($ra -join ' ')) 'DarkGray'
@@ -512,6 +540,7 @@ try {
   try { [void][TbAudio]::Restore() } catch {}
 }
 finally {
+  if ($measuring) { Remove-Item -LiteralPath $measuring -Force -ErrorAction SilentlyContinue }
   Remove-MyLocks
 }
 

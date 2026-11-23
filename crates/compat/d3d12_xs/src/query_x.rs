@@ -607,6 +607,7 @@ unsafe fn tally_results(batch: &[Resolve]) -> (u64, u64, u64, u32) {
 }
 
 unsafe fn force_results(list: *mut c_void, count: u32, dest: *mut c_void, offset: u64) {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::COPY) };
     if count == 0 || count as u64 > ONES_SLOTS {
         return;
     }

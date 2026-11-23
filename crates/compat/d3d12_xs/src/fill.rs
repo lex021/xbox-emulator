@@ -139,6 +139,7 @@ unsafe fn pattern(dev: *mut c_void, pat: &[u8; 16], need: u64) -> Option<usize> 
 }
 
 unsafe fn barrier(list: *mut c_void, b: &[u8; 32]) {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::BARRIER) };
     let f: unsafe extern "system" fn(*mut c_void, u32, *const u8) = unsafe { core::mem::transmute(*vt(list).add(26)) };
     unsafe { f(list, 1, b.as_ptr()) };
 }
@@ -175,6 +176,7 @@ pub unsafe fn fill(list: *mut c_void, copy_list: bool, va: u64, size: u32, value
 }
 
 pub unsafe fn fill_pattern(list: *mut c_void, copy_list: bool, va: u64, size: u64, pat: &[u8; 16], flags: u32) {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::COPY) };
     let value = u32::from_le_bytes([pat[0], pat[1], pat[2], pat[3]]);
     static LOG: AtomicUsize = AtomicUsize::new(0);
     static MISS: AtomicUsize = AtomicUsize::new(0);

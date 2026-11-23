@@ -249,6 +249,14 @@ pub unsafe fn plan_placed_view(res: *mut c_void, pdesc: *const u8, uav: bool, lo
     if fit_texture_view(&mut pc, &rdesc, uav) && once(&FIT_LOG, 16) {
         record("d3d12_xs", "PlacedViewX", &format!("texture view (resource fmt={} samples={}) given view fmt={} dim={}: PC texture views need a typed format and an MSAA dimension for multisampled resources, so they are taken from the resource",rd32(&rdesc, 0x20), rd32(&rdesc, 0x24), rd32(&pc, 0), rd32(&pc, 4)));
     }
+    if !uav && rd32(&rdesc, 0x24) > 1 {
+        crate::fmask_check::note_view(res as usize, rd32(&pc, 8), rd32(&x, 0x34));
+    }
+    static MS_LOG: AtomicUsize = AtomicUsize::new(0);
+    if !uav && rd32(&rdesc, 0x24) > 1 && (crate::rtcap::enabled() || crate::passcap::on()) && once(&MS_LOG, 64) {
+        let hex: Vec<String> = x.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]]))).collect();
+        record("d3d12_xs", "PlacedViewX", &format!("MS SRV on res {:#x} (fmt={} samples={}): raw Xbox desc dwords [{}] -> PC fmt={} dim={} map={:#x}", res as usize, rd32(&rdesc, 0x20), rd32(&rdesc, 0x24), hex.join(" "), rd32(&pc, 0), rd32(&pc, 4), rd32(&pc, 8)));
+    }
     let extras: Vec<(usize, u32)> = if uav {
         vec![(0x38, rd32(&x, 0x38))]
     } else {

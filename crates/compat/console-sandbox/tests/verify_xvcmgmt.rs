@@ -173,3 +173,26 @@ fn client_flow_against_the_emulated_host() {
     assert_eq!(Call::new().run(xvcmgmt::IOCTL_CLOSE, &q.to_le_bytes(), &mut []), 0);
     assert_eq!(r.wait(5000).map(|x| x.0), Some(xvcmgmt::STATUS_CANCELLED));
 }
+
+#[test]
+fn layout_ioctl_returns_two_frames_in_19041() {
+    if std::env::var_os("XVC_LAYOUT_TEST_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "layout_ioctl_returns_two_frames_in_19041"])
+            .env("XVC_LAYOUT_TEST_CHILD", "1")
+            .env("TOMBOX_CONSOLE_OSBUILD", "19041")
+            .status().unwrap();
+        assert!(status.success());
+        return;
+    }
+    let mut bytes = [0xaa; 18];
+    let code = xvcmgmt::IOCTL_PHYSICAL_MEMORY_LAYOUT;
+    assert_eq!(sync_fail(code, &[], &mut bytes[1..16]), xvcmgmt::STATUS_BUFFER_TOO_SMALL);
+    assert_eq!(bytes, [0xaa; 18]);
+    let mut call = Call::new();
+    assert_eq!(call.run(code, &[], &mut bytes[1..]), 0);
+    assert_eq!(call.wait(0), Some((0, 16)));
+    assert_eq!(u64::from_le_bytes(bytes[1..9].try_into().unwrap()), 0x10000);
+    assert_eq!(bytes[1..9], bytes[9..17]);
+    assert_eq!((bytes[0], bytes[17]), (0xaa, 0xaa));
+}

@@ -560,13 +560,14 @@ extern "system" {
 #[link(name = "ntdll")]
 extern "system" {
     fn NtSuspendProcess(h: HANDLE) -> i32;
+    fn NtResumeProcess(h: HANDLE) -> i32;
 }
 
 #[test]
 fn debug_break_records_pre_suspended_threads_and_tracks() {
     unsafe {
-        let mut c = spawn_sleeper();
-        let pid = c.id();
+        let c = KillChild(spawn_sleeper());
+        let pid = c.0.id();
         Sleep(300);
         let h = OpenProcess(0x1F_FFFF, 0, pid);
         assert!(!h.is_null());
@@ -597,12 +598,15 @@ fn debug_break_records_pre_suspended_threads_and_tracks() {
         let count = SuspendThread(rt);
         assert_ne!(count, u32::MAX);
         ResumeThread(rt);
-        assert_eq!(count, 0);
         titles::unregister_title_process(pid);
+        assert_eq!(count, 1);
+        assert!(NtResumeProcess(h) >= 0);
+        let count = SuspendThread(rt);
+        ResumeThread(rt);
+        assert_eq!(count, 0);
         CloseHandle(rt);
         CloseHandle(h);
-        c.kill().ok();
-        c.wait().ok();
+        drop(c);
     }
 }
 
@@ -1651,7 +1655,7 @@ fn is_elevated() -> bool {
     }
 }
 
-static TRACE_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static TRACE_LOCK: Mutex<()> = Mutex::new(());
 static XCRD_OPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static XCRD_DIR: Mutex<Vec<u16>> = Mutex::new(Vec::new());
 static XCRD_FAIL: Mutex<Vec<(&'static str, HRESULT)>> = Mutex::new(Vec::new());
@@ -1727,10 +1731,35 @@ unsafe extern "system" fn fx_query(out: *mut *mut u16, _h: *const c_void) -> HRE
     if let Some(h) = xfail("query") {
         return h;
     }
-    let mut d = XCRD_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    d.push(0);
-    *out = SysAllocString(d.as_ptr());
+    *out = SysAllocString(wz(FAKE_DEVICE).as_ptr());
     S_OK
+}
+
+const FAKE_DEVICE: &str = "\\\\?\\GLOBALROOT\\Device\\Harddisk42\\Partition1";
+static XCRD_RESOLVED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+unsafe extern "system" fn fx_resolve(p: *const u16, out: *mut u16, cch: u32) -> u32 {
+    let s = String::from_utf16_lossy(wslice(p));
+    XCRD_RESOLVED.lock().unwrap_or_else(|e| e.into_inner()).push(s.clone());
+    let Some(rest) = s.strip_prefix(FAKE_DEVICE) else {
+        return 0;
+    };
+    let mut w = XCRD_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    w.extend(rest.encode_utf16());
+    if out.is_null() || (w.len() + 1) as u32 > cch {
+        return (w.len() + 1) as u32;
+    }
+    core::ptr::copy_nonoverlapping(w.as_ptr(), out, w.len());
+    *out.add(w.len()) = 0;
+    w.len() as u32
+}
+
+fn resolved() -> Vec<String> {
+    XCRD_RESOLVED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn device_leaf(leaf: &str) -> String {
+    format!("{}\\{}", FAKE_DEVICE, leaf)
 }
 
 unsafe extern "system" fn fx_free(p: *mut c_void) -> HRESULT {
@@ -1740,7 +1769,7 @@ unsafe extern "system" fn fx_free(p: *mut c_void) -> HRESULT {
 }
 
 fn fake_xcrd() -> trace::XCrd {
-    trace::XCrd { open_adapter: fx_open, close_adapter: fx_close, build_path: fx_build, delete_xvd: fx_delete, create_xvd: fx_create, mount: fx_mount, unmount: fx_unmount, query_device_path: fx_query, free_device_path_buffer: fx_free, resolve_path: None }
+    trace::XCrd { open_adapter: fx_open, close_adapter: fx_close, build_path: fx_build, delete_xvd: fx_delete, create_xvd: fx_create, mount: fx_mount, unmount: fx_unmount, query_device_path: fx_query, free_device_path_buffer: fx_free, resolve_path: Some(fx_resolve) }
 }
 
 struct TraceSessions;
@@ -1765,6 +1794,7 @@ fn trace_setup(tag: &str) -> (std::sync::MutexGuard<'static, ()>, std::path::Pat
     std::fs::create_dir_all(&dir).unwrap();
     *XCRD_DIR.lock().unwrap_or_else(|e| e.into_inner()) = dir.to_string_lossy().encode_utf16().collect();
     xclear();
+    XCRD_RESOLVED.lock().unwrap_or_else(|e| e.into_inner()).clear();
     trace::bind_xcrd(Some(fake_xcrd()));
     {
         let mut x = trace::XVD.lock().unwrap_or_else(|e| e.into_inner());
@@ -1863,7 +1893,8 @@ fn create_and_mount_failures_release_what_they_took() {
         xclear();
         assert_eq!(trace::create_and_mount_trace_xvd(), S_OK);
         assert_eq!(trace::xvd_handle(), 0x2000);
-        assert_eq!(trace::trace_directory().unwrap(), dir.to_string_lossy().encode_utf16().collect::<Vec<u16>>());
+        assert_eq!(trace::trace_directory().unwrap(), FAKE_DEVICE.encode_utf16().collect::<Vec<u16>>());
+        let _ = &dir;
         xclear();
         assert_eq!(trace::create_and_mount_trace_xvd(), trace::HR_SHARING_VIOLATION);
         assert_eq!(trace::mount_trace_xvd(), trace::HR_SHARING_VIOLATION);
@@ -1883,10 +1914,19 @@ fn advanced_multiplayer_trace_runs_real_etw_or_returns_the_access_error() {
     let (_g, dir, _s) = trace_setup("amp");
     unsafe {
         let mut none: Obj = null_mut();
+        let elevated = is_elevated();
+        if elevated {
+            assert_eq!(trace::wpp_init(), 0);
+        }
         let hr = trace::TRACE_SERVER.route(3, parse("{\"TraceType\":2}").0, &mut none);
         assert!(dir.join("GameCoreTrace").is_dir());
-        if is_elevated() {
+        assert!(resolved().contains(&device_leaf("GameCoreTrace")));
+        assert!(resolved().contains(&device_leaf("GameCoreTrace\\xbtitletrace.etl")));
+        if elevated {
             assert_eq!(hr, S_OK);
+            assert_ne!(trace::WPP.logger.load(Ordering::Acquire), 0);
+            assert_ne!(trace::WPP_STATE.logger.load(Ordering::Acquire), 0);
+            assert_ne!(trace::WPP_STATE.flags.load(Ordering::Acquire) & trace::WPP_STATE_FLAG, 0);
             assert_eq!(trace::trace_type(), 2);
             assert_eq!(xops(), mount_ops());
             assert!(dir.join("GameCoreTrace").join("xbtitletrace.etl").is_file());
@@ -1901,6 +1941,7 @@ fn advanced_multiplayer_trace_runs_real_etw_or_returns_the_access_error() {
             assert_eq!(trace::trace_type(), 0);
             assert_eq!(trace::xvd_handle(), usize::MAX);
             assert!(xops().ends_with(&unmount_ops()));
+            trace::wpp_cleanup();
         } else {
             assert_eq!(hr, 0x8007_0005u32 as i32);
             let mut want = mount_ops();
@@ -1924,6 +1965,7 @@ fn log_network_state_succeeds_with_or_without_session_rights() {
         assert_eq!(trace::TRACE_SERVER.route(12, null_mut(), &mut none), S_OK);
         assert!(dir.join("GameCoreTrace").is_dir());
         assert_eq!(state_files(&dir).len(), if is_elevated() { 1 } else { 0 });
+        assert!(resolved().iter().any(|r| r.starts_with(&device_leaf("GameCoreTrace\\xbtitlestate_")) && r.ends_with(".etl")));
         {
             let mut x = trace::XVD.lock().unwrap();
             x.handle = usize::MAX;
@@ -1941,6 +1983,7 @@ fn pending_trace_xvd_restarts_the_recorded_trace_type() {
         std::fs::write(&pending, 3u32.to_le_bytes()).unwrap();
         assert_eq!(trace::TRACE_SERVER.check_pending(), trace::E_ILLEGAL_METHOD_CALL);
         assert!(!pending.exists());
+        assert!(resolved().contains(&device_leaf("PendingGameCoreTrace")));
         let mut want = strs(&["open", "build 0 XtfTitleTraceStorage.xvd 0", "mount 0x40", "query", "free", "free", "close 0x1000"]);
         want.extend(unmount_ops());
         assert_eq!(xops(), want);
@@ -1994,9 +2037,52 @@ fn wpp_control_guid_registers_and_stays_quiet_until_enabled() {
     unsafe {
         assert_eq!(trace::wpp_init(), 0);
         assert_ne!(trace::WPP.registration.load(Ordering::Acquire), 0);
+        assert_ne!(trace::WPP_STATE.registration.load(Ordering::Acquire), 0);
         assert_eq!(trace::wpp_init(), 0);
         assert!(!trace::wpp_message(&trace::STATE_HEADER_GUID, 0xe, 0));
         trace::wpp_cleanup();
         assert_eq!(trace::WPP.registration.load(Ordering::Acquire), 0);
+        assert_eq!(trace::WPP_STATE.registration.load(Ordering::Acquire), 0);
     }
+}
+
+#[test]
+#[ignore]
+fn monitor_export_child() {
+    if std::env::var_os("XTFDIAG_MONITOR_CHILD").is_none() {
+        return;
+    }
+    let (_g, _dir, _s) = trace_setup("child");
+    unsafe {
+        assert_eq!(trace::XtfOrdinal_10(), S_OK);
+        assert_eq!(trace::XtfOrdinal_10(), S_OK);
+    }
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}
+
+struct KillChild(Child);
+
+impl Drop for KillChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn monitor_export_serves_trace_operations_in_a_title_process() {
+    let exe = std::env::current_exe().unwrap();
+    let c = Command::new(exe).args(["--ignored", "--exact", "tests::monitor_export_child", "--test-threads=1"]).env("XTFDIAG_MONITOR_CHILD", "1").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let k = KillChild(c);
+    unsafe {
+        let name = pipe_name(k.0.id());
+        let o = parse(&pipe_round_trip(&name, "{\"version\":1,\"opid\":4}"));
+        assert_eq!(num(&o, "opresult"), Some(trace::E_ILLEGAL_STATE_CHANGE as f64));
+        assert!(child(&o, "opbody").is_none());
+        let o = parse(&pipe_round_trip(&name, "{\"version\":1,\"opid\":99}"));
+        assert_eq!(num(&o, "opresult"), Some(0.0));
+        let o = parse(&pipe_round_trip(&name, "{\"version\":1,\"opid\":3,\"opbody\":{\"TraceType\":9}}"));
+        assert_eq!(num(&o, "opresult"), Some(E_INVALIDARG as f64));
+    }
+    drop(k);
 }

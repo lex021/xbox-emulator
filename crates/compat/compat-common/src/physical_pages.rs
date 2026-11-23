@@ -1,0 +1,4 @@
+pub const PAGE_BYTES: usize = 0x1_0000;
+pub const FIRST_TITLE_PAGE: u64 = 0x1000;
+const FIRST_TITLE_FRAME: u64 = FIRST_TITLE_PAGE * (PAGE_BYTES as u64 / 4096);
+pub const TITLE_LAYOUT_19041: [u64; 2] = [FIRST_TITLE_FRAME; 2];

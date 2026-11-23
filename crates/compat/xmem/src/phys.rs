@@ -9,7 +9,7 @@ use compat_common::record;
 mod runs;
 
 const M: &str = "xmem";
-pub const PAGE: usize = 0x1_0000;
+pub use compat_common::physical_pages::PAGE_BYTES as PAGE;
 
 const MEM_PRIVATE: u32 = 0x2_0000;
 const MEM_RESERVE_PLACEHOLDER: u32 = 0x4_0000;
@@ -135,7 +135,7 @@ static S: Mutex<Option<State>> = Mutex::new(None);
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let mut g = S.lock().unwrap_or_else(|e| e.into_inner());
     let s = g.get_or_insert_with(|| State {
-        next_pfn: 0x1000,
+        next_pfn: compat_common::physical_pages::FIRST_TITLE_PAGE,
         next_section: 1,
         sections: HashMap::new(),
         pfns: HashMap::new(),
@@ -152,6 +152,38 @@ pub fn serialized<R>(f: impl FnOnce() -> R) -> R {
 
 pub fn live_bytes() -> u64 {
     with(|s| s.pfns.len() as u64 * PAGE as u64)
+}
+
+pub fn owned_extent(va: usize) -> Option<(usize, usize)> {
+    with(|s| region_of(s, va).map(|b| (b, b + s.regions[&b].size)))
+}
+
+#[cfg(test)]
+static MAP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub fn map_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    let g = MAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    runs::reset_breaker();
+    g
+}
+
+#[cfg(test)]
+pub fn released(va: usize) -> Result<(), String> {
+    with(|s| {
+        let m = query(va).ok_or_else(|| format!("{va:#x}: VirtualQuery failed"))?;
+        let placeholder = m.state == MEM_RESERVE && m.kind == 0x2_0000 && m.alloc_protect == PAGE_NOACCESS;
+        if m.state == 0x1_0000 || !placeholder || region_of(s, va).is_some() {
+            Ok(())
+        } else {
+            Err(format!("{va:#x}: placeholder left behind (base {:#x} alloc_base {:#x} size {:#x}) and no live region owns it", m.base, m.alloc_base, m.region_size))
+        }
+    })
+}
+
+#[cfg(test)]
+pub fn counted_bytes_of(pfns: &[u64]) -> u64 {
+    with(|s| pfns.iter().filter(|p| s.pfns.contains_key(p)).count() as u64 * PAGE as u64)
 }
 
 fn query(addr: usize) -> Option<MemoryBasicInformation> {
@@ -464,6 +496,9 @@ pub fn commit_owned(addr: usize, size: usize, protect: u32) -> Option<usize> {
         }
         unsafe {
             if !ensure_split(s, base) {
+                let err = GetLastError();
+                let pieces_now: Vec<String> = (0..rsize / PAGE).filter_map(|i| query(base + i * PAGE)).map(|m| format!("[{:#x} ab={:#x} sz={:#x} st={:#x} ty={:#x} ap={:#x}]", m.base, m.alloc_base, m.region_size, m.state, m.kind, m.alloc_protect)).collect();
+                commit_failed(&format!("split of region {base:#x}+{rsize:#x} err={err} split_flag={} views={} private={} pieces {}", s.regions[&base].split, s.views.range(base..base + rsize).count(), s.private.range(base..base + rsize).count(), pieces_now.join("")));
                 return Some(0);
             }
             for (p, a, n) in ps {
@@ -471,17 +506,30 @@ pub fn commit_owned(addr: usize, size: usize, protect: u32) -> Option<usize> {
                     let plen = PAGE.min(base + rsize - p);
                     let got = VirtualAlloc2(GetCurrentProcess(), p as *mut c_void, plen, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, rprot, core::ptr::null_mut(), 0);
                     if got as usize != p {
+                        commit_failed(&format!("piece {p:#x}+{plen:#x} replace placeholder -> {got:p} err={} state={:x?}", GetLastError(), query(p).map(|m| (m.base, m.alloc_base, m.region_size, m.state, m.kind, m.alloc_protect))));
                         return Some(0);
                     }
                     s.private.insert(p);
                 }
                 if VirtualAlloc(a as *mut c_void, n, MEM_COMMIT, protect).is_null() {
+                    commit_failed(&format!("commit {a:#x}+{n:#x} err={}", GetLastError()));
                     return Some(0);
                 }
             }
         }
         Some(lo)
     })
+}
+
+#[cfg(test)]
+pub static LAST_COMMIT_FAIL: Mutex<String> = Mutex::new(String::new());
+
+fn commit_failed(why: &str) {
+    record(M, "XMemVirtualAlloc", &format!("commit in physical-page region failed: {why}"));
+    #[cfg(test)]
+    {
+        *LAST_COMMIT_FAIL.lock().unwrap_or_else(|e| e.into_inner()) = why.to_string();
+    }
 }
 
 pub fn decommit_owned(addr: usize, size: usize) -> Option<i32> {

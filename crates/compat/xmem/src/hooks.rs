@@ -52,6 +52,9 @@ pub static REALLOC_REPORTS_FREE: AtomicU32 = AtomicU32::new(0);
 static ALLOC_ORIG: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
 static REALLOC_ORIG: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
 static FREE_ORIG: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
+static SIZE_ORIG: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
+static VALIDATE_ORIG: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
+static WALK_ORIG: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
 
 type AllocFn = unsafe extern "system" fn(usize, u32, usize) -> usize;
 type ReallocFn = unsafe extern "system" fn(usize, u32, usize, usize) -> usize;
@@ -68,7 +71,11 @@ unsafe fn report_free(heap: usize, flags: u32, ptr: usize) {
 }
 
 unsafe extern "system" fn alloc_w<const I: usize>(heap: usize, flags: u32, size: usize) -> usize {
-    let r = core::mem::transmute::<usize, AllocFn>(ALLOC_ORIG[I].load(Ordering::Acquire))(heap, flags, size);
+    let ww = if crate::ww_heap::wants(heap, size) { crate::ww_heap::alloc(heap, size) } else { None };
+    let r = match ww {
+        Some(p) => p,
+        None => core::mem::transmute::<usize, AllocFn>(ALLOC_ORIG[I].load(Ordering::Acquire))(heap, flags, size),
+    };
     if r != 0 {
         if let Some(a) = crate::heap_acct::slot(heap) {
             a.add(size);
@@ -81,9 +88,44 @@ unsafe extern "system" fn alloc_w<const I: usize>(heap: usize, flags: u32, size:
     r
 }
 
+pub(crate) unsafe fn ww_realloc(heap: usize, flags: u32, old: usize, size: usize) -> Option<usize> {
+    use crate::ww_heap::{Resize, HEAP_GENERATE_EXCEPTIONS, HEAP_REALLOC_IN_PLACE_ONLY, HEAP_ZERO_MEMORY};
+    let acct = crate::heap_acct::slot(heap);
+    if let Some(b) = crate::ww_heap::lookup(old) {
+        let plain = flags & !(HEAP_REALLOC_IN_PLACE_ONLY | HEAP_GENERATE_EXCEPTIONS);
+        let r = match crate::ww_heap::resize(old, size, flags & HEAP_ZERO_MEMORY != 0, flags & HEAP_REALLOC_IN_PLACE_ONLY != 0, |m| HeapAlloc(heap as Handle, plain, m) as usize) {
+            Resize::InPlace(q) | Resize::Moved(q) => q,
+            Resize::Failed => 0,
+        };
+        if let (Some(a), true) = (acct, r != 0) {
+            a.sub(b.size);
+            a.add(size);
+        }
+        return Some(r);
+    }
+    if old == 0 || flags & HEAP_REALLOC_IN_PLACE_ONLY != 0 || !crate::ww_heap::wants(heap, size) {
+        return None;
+    }
+    let o = crate::heap_acct::block_size(heap, flags, old)?;
+    let q = crate::ww_heap::migrate(heap, old, o, size)?;
+    HeapFree(heap as Handle, 0, old as *mut core::ffi::c_void);
+    if let Some(a) = acct {
+        a.sub(o);
+        a.add(size);
+    }
+    Some(q)
+}
+
 unsafe extern "system" fn realloc_w<const I: usize>(heap: usize, flags: u32, old: usize, size: usize) -> usize {
     if REALLOC_REPORTS_FREE.load(Ordering::Acquire) != 0 {
         report_free(heap, flags, old);
+    }
+    if let Some(r) = ww_realloc(heap, flags, old, size) {
+        let h = TRACKING_HOOKS[1].load(Ordering::Acquire);
+        if h != 0 {
+            guarded(|| core::mem::transmute::<usize, ReallocHook>(h)(heap, flags, size, old, r));
+        }
+        return r;
     }
     let acct = crate::heap_acct::slot(heap);
     let old_size = if acct.is_some() { crate::heap_acct::block_size(heap, flags, old) } else { None };
@@ -102,6 +144,13 @@ unsafe extern "system" fn realloc_w<const I: usize>(heap: usize, flags: u32, old
 }
 
 unsafe extern "system" fn free_w<const I: usize>(heap: usize, flags: u32, ptr: usize) -> usize {
+    if let Some(s) = crate::ww_heap::free(ptr) {
+        if let Some(a) = crate::heap_acct::slot(heap) {
+            a.sub(s);
+        }
+        report_free(heap, flags, ptr);
+        return 1;
+    }
     let acct = crate::heap_acct::slot(heap);
     let old_size = if acct.is_some() { crate::heap_acct::block_size(heap, flags, ptr) } else { None };
     let r = core::mem::transmute::<usize, FreeFn>(FREE_ORIG[I].load(Ordering::Acquire))(heap, flags, ptr);
@@ -112,18 +161,44 @@ unsafe extern "system" fn free_w<const I: usize>(heap: usize, flags: u32, ptr: u
     r
 }
 
-#[derive(Clone, Copy, PartialEq)]
+unsafe extern "system" fn size_w<const I: usize>(heap: usize, flags: u32, ptr: usize) -> usize {
+    if let Some(s) = crate::ww_heap::size_of(ptr) {
+        return s;
+    }
+    core::mem::transmute::<usize, unsafe extern "system" fn(usize, u32, usize) -> usize>(SIZE_ORIG[I].load(Ordering::Acquire))(heap, flags, ptr)
+}
+
+unsafe extern "system" fn validate_w<const I: usize>(heap: usize, flags: u32, ptr: usize) -> i32 {
+    if crate::ww_heap::is_block(ptr) {
+        return 1;
+    }
+    core::mem::transmute::<usize, unsafe extern "system" fn(usize, u32, usize) -> i32>(VALIDATE_ORIG[I].load(Ordering::Acquire))(heap, flags, ptr)
+}
+
+unsafe extern "system" fn walk_w<const I: usize>(heap: usize, entry: *mut crate::ww_heap::HeapEntry) -> i32 {
+    crate::ww_heap::walk(heap, entry, || core::mem::transmute::<usize, unsafe extern "system" fn(usize, *mut crate::ww_heap::HeapEntry) -> i32>(WALK_ORIG[I].load(Ordering::Acquire))(heap, entry))
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Kind {
     Alloc,
     Realloc,
     Free,
+    Size,
+    Validate,
+    Walk,
 }
+
+const KINDS: [Kind; 6] = [Kind::Alloc, Kind::Realloc, Kind::Free, Kind::Size, Kind::Validate, Kind::Walk];
 
 fn wrappers(k: Kind) -> [usize; SLOTS] {
     match k {
         Kind::Alloc => [alloc_w::<0> as *const () as usize, alloc_w::<1> as *const () as usize, alloc_w::<2> as *const () as usize, alloc_w::<3> as *const () as usize],
         Kind::Realloc => [realloc_w::<0> as *const () as usize, realloc_w::<1> as *const () as usize, realloc_w::<2> as *const () as usize, realloc_w::<3> as *const () as usize],
         Kind::Free => [free_w::<0> as *const () as usize, free_w::<1> as *const () as usize, free_w::<2> as *const () as usize, free_w::<3> as *const () as usize],
+        Kind::Size => [size_w::<0> as *const () as usize, size_w::<1> as *const () as usize, size_w::<2> as *const () as usize, size_w::<3> as *const () as usize],
+        Kind::Validate => [validate_w::<0> as *const () as usize, validate_w::<1> as *const () as usize, validate_w::<2> as *const () as usize, validate_w::<3> as *const () as usize],
+        Kind::Walk => [walk_w::<0> as *const () as usize, walk_w::<1> as *const () as usize, walk_w::<2> as *const () as usize, walk_w::<3> as *const () as usize],
     }
 }
 
@@ -132,6 +207,9 @@ fn origs(k: Kind) -> &'static [AtomicUsize; SLOTS] {
         Kind::Alloc => &ALLOC_ORIG,
         Kind::Realloc => &REALLOC_ORIG,
         Kind::Free => &FREE_ORIG,
+        Kind::Size => &SIZE_ORIG,
+        Kind::Validate => &VALIDATE_ORIG,
+        Kind::Walk => &WALK_ORIG,
     }
 }
 
@@ -151,6 +229,9 @@ fn heap_kind_by_name(n: &[u8]) -> Option<Kind> {
         b"HeapAlloc" | b"RtlAllocateHeap" => Some(Kind::Alloc),
         b"HeapReAlloc" | b"RtlReAllocateHeap" => Some(Kind::Realloc),
         b"HeapFree" | b"RtlFreeHeap" => Some(Kind::Free),
+        b"HeapSize" | b"RtlSizeHeap" => Some(Kind::Size),
+        b"HeapValidate" | b"RtlValidateHeap" => Some(Kind::Validate),
+        b"HeapWalk" => Some(Kind::Walk),
         _ => None,
     }
 }
@@ -175,16 +256,17 @@ fn resolve(dlls: &[&[u8]], names: &[&[u8]]) -> Vec<(usize, usize)> {
 fn heap_known() -> &'static Vec<(usize, Kind)> {
     static K: OnceLock<Vec<(usize, Kind)>> = OnceLock::new();
     K.get_or_init(|| {
-        let names: [&[u8]; 6] = [b"HeapAlloc\0", b"RtlAllocateHeap\0", b"HeapReAlloc\0", b"RtlReAllocateHeap\0", b"HeapFree\0", b"RtlFreeHeap\0"];
-        let kinds = [Kind::Alloc, Kind::Alloc, Kind::Realloc, Kind::Realloc, Kind::Free, Kind::Free];
+        let names: [&[u8]; 11] = [b"HeapAlloc\0", b"RtlAllocateHeap\0", b"HeapReAlloc\0", b"RtlReAllocateHeap\0", b"HeapFree\0", b"RtlFreeHeap\0", b"HeapSize\0", b"RtlSizeHeap\0", b"HeapValidate\0", b"RtlValidateHeap\0", b"HeapWalk\0"];
+        let kinds = [Kind::Alloc, Kind::Alloc, Kind::Realloc, Kind::Realloc, Kind::Free, Kind::Free, Kind::Size, Kind::Size, Kind::Validate, Kind::Validate, Kind::Walk];
         resolve(&[b"ntdll.dll\0", b"kernel32.dll\0", b"kernelbase.dll\0"], &names).into_iter().map(|(f, i)| (f, kinds[i])).collect()
     })
 }
 
-fn is_ours(v: usize) -> bool {
-    [Kind::Alloc, Kind::Realloc, Kind::Free].iter().any(|&k| wrappers(k).contains(&v))
+pub(crate) fn is_ours(v: usize) -> bool {
+    KINDS.iter().any(|&k| wrappers(k).contains(&v))
         || winhttp_wrappers().contains(&v)
-        || [vfree_w as *const () as usize, valloc_w as *const () as usize, valloc2_w as *const () as usize, map3_w as *const () as usize].contains(&v)
+        || [vfree_w as *const () as usize, valloc_w as *const () as usize, valloc2_w as *const () as usize, map3_w as *const () as usize, vallocex_w as *const () as usize, vfreeex_w as *const () as usize].contains(&v)
+        || crate::crt_hooks::wrappers().contains(&v)
 }
 
 pub fn heap_rule(_dll: &[u8], name: Option<&[u8]>, value: usize) -> Option<usize> {
@@ -192,8 +274,27 @@ pub fn heap_rule(_dll: &[u8], name: Option<&[u8]>, value: usize) -> Option<usize
         return None;
     }
     let k = name.and_then(heap_kind_by_name).or_else(|| heap_known().iter().find(|(f, _)| *f == value).map(|(_, k)| *k))?;
-    let i = claim(origs(k), value)?;
+    let i = claim_or_warn(origs(k), value, k, _dll, name)?;
     Some(wrappers(k)[i])
+}
+
+static UNWRAPPED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+fn slots_full_message(k: Kind, dll: &[u8], name: Option<&[u8]>, value: usize) -> String {
+    let dll = String::from_utf8_lossy(dll.strip_suffix(b"\0").unwrap_or(dll)).to_string();
+    let name = name.map(|n| String::from_utf8_lossy(n).to_string()).unwrap_or_else(|| "<by ordinal>".into());
+    format!("WARNING: all {SLOTS} {k:?} wrapper slots are taken; import {dll}!{name} -> {value:#x} stays UNWRAPPED and its heap traffic is not tracked")
+}
+
+fn claim_or_warn(table: &[AtomicUsize; SLOTS], value: usize, k: Kind, dll: &[u8], name: Option<&[u8]>) -> Option<usize> {
+    let r = claim(table, value);
+    if r.is_none() {
+        let first = UNWRAPPED.lock().map(|mut v| if v.contains(&value) { false } else { v.push(value); true }).unwrap_or(true);
+        if first {
+            record(M, "XMemSetWin32HeapTrackingHooks", &slots_full_message(k, dll, name, value));
+        }
+    }
+    r
 }
 
 pub fn install_heap_accounting() -> usize {
@@ -294,7 +395,10 @@ static MAP3_ORIG: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "system" fn vfree_w(addr: usize, size: usize, kind: u32) -> i32 {
     let (lo, hi) = crate::epoch::bump_free(addr, size);
-    let r = vfree_inner(addr, size, kind);
+    let r = crate::title_acct::track_free(addr, size, kind, || vfree_inner(addr, size, kind));
+    if r != 0 && kind & MEM_RELEASE != 0 {
+        crate::write_watch::forget_range(addr, size);
+    }
     crate::epoch::bump_range(lo, hi);
     r
 }
@@ -321,15 +425,35 @@ unsafe fn vfree_inner(addr: usize, size: usize, kind: u32) -> i32 {
 static VALLOC_ORIG: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "system" fn valloc_w(addr: usize, size: usize, kind: u32, protect: u32) -> usize {
+    crate::title_acct::track_alloc(addr, size, kind, || valloc_inner(addr, size, kind, protect))
+}
+
+unsafe fn valloc_inner(addr: usize, size: usize, kind: u32, protect: u32) -> usize {
     if addr != 0 && kind & MEM_COMMIT != 0 {
         if let Some(r) = crate::phys::commit_owned(addr, size, protect) {
             crate::write_note::committed(r, size);
             return r;
         }
     }
+    if crate::ww_valloc::wants(addr, size, kind, protect) {
+        let r = crate::ww_valloc::alloc(size, kind, protect);
+        if r != 0 {
+            if kind & MEM_COMMIT != 0 {
+                crate::write_note::committed(r, size);
+            }
+            return r;
+        }
+    }
     let f = VALLOC_ORIG.load(Ordering::Acquire);
     let f = if f != 0 { f } else { VirtualAlloc as *const () as usize };
     let r = core::mem::transmute::<usize, unsafe extern "system" fn(usize, usize, u32, u32) -> usize>(f)(addr, size, kind, protect);
+    if r != 0 && kind & MEM_RESERVE != 0 {
+        if kind & MEM_WRITE_WATCH != 0 {
+            crate::write_watch::note_title(r, size);
+        } else {
+            crate::write_watch::invalidate_range(r, size);
+        }
+    }
     if r != 0 && kind & MEM_COMMIT != 0 {
         crate::write_note::committed(r, size);
     }
@@ -358,10 +482,82 @@ fn strip_partition(params: usize, count: u32) -> Vec<[u64; 2]> {
     out
 }
 
+fn is_self(process: usize) -> bool {
+    process == usize::MAX || process == 0 || unsafe { GetProcessId(process) == GetCurrentProcessId() }
+}
+
 unsafe extern "system" fn valloc2_w(process: usize, base: usize, size: usize, kind: u32, protect: u32, params: usize, count: u32) -> usize {
     let v = strip_partition(params, count);
     let (pp, pc) = if v.is_empty() { (0, 0) } else { (v.as_ptr() as usize, v.len() as u32) };
-    core::mem::transmute::<usize, unsafe extern "system" fn(usize, usize, usize, u32, u32, usize, u32) -> usize>(VALLOC2_ORIG.load(Ordering::Acquire))(process, base, size, kind, protect, pp, pc)
+    let call = || core::mem::transmute::<usize, unsafe extern "system" fn(usize, usize, usize, u32, u32, usize, u32) -> usize>(VALLOC2_ORIG.load(Ordering::Acquire))(process, base, size, kind, protect, pp, pc);
+    if is_self(process) {
+        crate::title_acct::track_alloc(base, size, kind, call)
+    } else {
+        call()
+    }
+}
+
+static VALLOCEX_ORIG: AtomicUsize = AtomicUsize::new(0);
+static VFREEEX_ORIG: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "system" fn vallocex_w(process: usize, addr: usize, size: usize, kind: u32, protect: u32) -> usize {
+    let call = || core::mem::transmute::<usize, unsafe extern "system" fn(usize, usize, usize, u32, u32) -> usize>(VALLOCEX_ORIG.load(Ordering::Acquire))(process, addr, size, kind, protect);
+    if is_self(process) {
+        let r = crate::title_acct::track_alloc(addr, size, kind, call);
+        if r != 0 && kind & MEM_RESERVE != 0 {
+            crate::write_watch::invalidate_range(r, size);
+        }
+        r
+    } else {
+        call()
+    }
+}
+
+unsafe extern "system" fn vfreeex_w(process: usize, addr: usize, size: usize, kind: u32) -> i32 {
+    let call = || core::mem::transmute::<usize, unsafe extern "system" fn(usize, usize, usize, u32) -> i32>(VFREEEX_ORIG.load(Ordering::Acquire))(process, addr, size, kind);
+    if is_self(process) {
+        let (lo, hi) = crate::epoch::bump_free(addr, size);
+        let r = crate::title_acct::track_free(addr, size, kind, call);
+        crate::epoch::bump_range(lo, hi);
+        if r != 0 && kind & MEM_RELEASE != 0 {
+            crate::write_watch::forget_range(addr, size);
+        }
+        r
+    } else {
+        call()
+    }
+}
+
+pub fn vex_rule(_dll: &[u8], name: Option<&[u8]>, value: usize) -> Option<usize> {
+    single_rule(&[b"VirtualAllocEx"], &VALLOCEX_ORIG, vallocex_w as *const () as usize, name, value)
+        .or_else(|| single_rule(&[b"VirtualFreeEx"], &VFREEEX_ORIG, vfreeex_w as *const () as usize, name, value))
+}
+
+#[cfg(test)]
+pub fn ex_wrappers_for_test() -> (usize, usize) {
+    vex_rule(b"KERNEL32.dll", Some(b"VirtualAllocEx"), VirtualAllocEx as *const () as usize);
+    vex_rule(b"KERNEL32.dll", Some(b"VirtualFreeEx"), VirtualFreeEx as *const () as usize);
+    (vallocex_w as *const () as usize, vfreeex_w as *const () as usize)
+}
+
+#[cfg(test)]
+pub fn partition_wrappers_for_test() -> (usize, usize) {
+    extern "system" {
+        fn GetModuleHandleA(name: *const u8) -> usize;
+        fn GetProcAddress(h: usize, name: *const u8) -> usize;
+    }
+    let kb = unsafe { GetModuleHandleA(b"kernelbase.dll\0".as_ptr()) };
+    partition_rule(b"api-ms-win-core-memory-l1-1-6.dll", Some(b"VirtualAlloc2"), unsafe { GetProcAddress(kb, b"VirtualAlloc2\0".as_ptr()) });
+    partition_rule(b"api-ms-win-core-memory-l1-1-6.dll", Some(b"MapViewOfFile3"), unsafe { GetProcAddress(kb, b"MapViewOfFile3\0".as_ptr()) });
+    assert!(VALLOC2_ORIG.load(Ordering::Acquire) != 0 && MAP3_ORIG.load(Ordering::Acquire) != 0);
+    (valloc2_w as *const () as usize, map3_w as *const () as usize)
+}
+
+#[cfg(test)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn VirtualAllocEx(process: usize, addr: usize, size: usize, kind: u32, protect: u32) -> usize;
+    fn VirtualFreeEx(process: usize, addr: usize, size: usize, kind: u32) -> i32;
 }
 
 unsafe extern "system" fn map3_w(file: usize, process: usize, base: usize, offset: u64, size: usize, kind: u32, protect: u32, params: usize, count: u32) -> usize {
@@ -423,4 +619,94 @@ pub fn vfree_wrapper() -> usize {
 #[cfg(test)]
 pub fn strip_for_test(params: &[[u64; 2]]) -> Vec<[u64; 2]> {
     strip_partition(params.as_ptr() as usize, params.len() as u32)
+}
+
+#[cfg(test)]
+mod ww_heap_tests {
+    use super::*;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn HeapReAlloc(heap: Handle, flags: u32, mem: *mut core::ffi::c_void, bytes: usize) -> *mut core::ffi::c_void;
+        fn HeapSize(heap: Handle, flags: u32, mem: *const core::ffi::c_void) -> usize;
+        fn HeapValidate(heap: Handle, flags: u32, mem: *const core::ffi::c_void) -> i32;
+        fn HeapWalk(heap: Handle, entry: *mut crate::ww_heap::HeapEntry) -> i32;
+    }
+
+    fn export(name: &[u8]) -> usize {
+        let z = [name, b"\0"].concat();
+        resolve(&[b"kernel32.dll\0"], &[z.as_slice()]).first().map(|r| r.0).expect("kernel32 export")
+    }
+
+    fn hooked<T: Copy>(name: &[u8]) -> T {
+        let real = export(name);
+        assert!(!is_ours(real), "kernel32 export resolves to a wrapper");
+        let w = heap_rule(b"api-ms-win-core-heap-l1-1-0.dll", Some(name), real).expect("heap slot claims");
+        unsafe { core::mem::transmute_copy::<usize, T>(&w) }
+    }
+
+    #[test]
+    fn a_full_slot_table_refuses_and_names_the_unwrapped_import() {
+        let t: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
+        for v in 1..=SLOTS {
+            assert_eq!(claim_or_warn(&t, v * 0x10, Kind::Alloc, b"kernel32.dll", Some(b"HeapAlloc")), Some(v - 1));
+        }
+        assert_eq!(claim_or_warn(&t, 0x10, Kind::Alloc, b"kernel32.dll", Some(b"HeapAlloc")), Some(0));
+        assert_eq!(claim_or_warn(&t, 0x999, Kind::Alloc, b"kernel32.dll", Some(b"HeapAlloc")), None);
+        let m = slots_full_message(Kind::Alloc, b"kernel32.dll\0", Some(b"HeapAlloc"), 0x999);
+        assert!(m.contains("kernel32.dll!HeapAlloc -> 0x999") && m.contains("UNWRAPPED") && m.contains("Alloc"), "{m}");
+    }
+
+    #[test]
+    fn heap_rule_refuses_its_own_wrappers_but_claims_the_real_export() {
+        let real = export(b"HeapAlloc");
+        let w = heap_rule(b"kernel32.dll", Some(b"HeapAlloc"), real).expect("real export claims");
+        assert!(is_ours(w));
+        assert_eq!(heap_rule(b"kernel32.dll", Some(b"HeapAlloc"), w), None);
+        assert_eq!(heap_rule(b"kernel32.dll", Some(b"HeapAlloc"), real), Some(w));
+    }
+
+    #[test]
+    fn title_heap_imports_serve_large_blocks_from_watched_memory() {
+        let _g = crate::ww_heap::test_lock();
+        crate::ww_heap::set_for_test(true, 0x10_0000);
+        let h = unsafe { GetProcessHeap() } as usize;
+        let alloc: AllocFn = hooked(b"HeapAlloc");
+        let realloc: ReallocFn = hooked(b"HeapReAlloc");
+        let free: FreeFn = hooked(b"HeapFree");
+        let size: unsafe extern "system" fn(usize, u32, usize) -> usize = hooked(b"HeapSize");
+        let validate: unsafe extern "system" fn(usize, u32, usize) -> i32 = hooked(b"HeapValidate");
+        let walk: unsafe extern "system" fn(usize, *mut crate::ww_heap::HeapEntry) -> i32 = hooked(b"HeapWalk");
+        unsafe {
+            let p = alloc(h, 0x8, 0x10_0000);
+            assert!(crate::ww_heap::is_block(p));
+            assert_eq!(size(h, 0, p), 0x10_0000);
+            assert_eq!(validate(h, 0, p), 1);
+            assert_eq!(realloc(h, 0x10, p, 0x40_0000), 0);
+            assert!(crate::ww_heap::is_block(p));
+            let q = realloc(h, 0x8, p, 0x40_0000);
+            assert!(crate::ww_heap::is_block(q) && !crate::ww_heap::is_block(p));
+            assert!(core::slice::from_raw_parts(q as *const u8, 0x40_0000).iter().all(|&x| x == 0));
+            let mut e = crate::ww_heap::HeapEntry::default();
+            let mut found = false;
+            let mut guard = 0;
+            while walk(h, &mut e) != 0 {
+                found |= e.data == q && e.cb_data == 0x40_0000;
+                guard += 1;
+                assert!(guard < 10_000_000);
+            }
+            assert!(found, "HeapWalk must report the watched block");
+            assert_eq!(free(h, 0, q), 1);
+            assert!(!crate::ww_heap::is_block(q));
+            let s = alloc(h, 0, 0x40);
+            assert!(!crate::ww_heap::is_block(s));
+            let g = realloc(h, 0, s, 0x20_0000);
+            assert!(crate::ww_heap::is_block(g));
+            assert_eq!(free(h, 0, g), 1);
+            let other = HeapCreate(0, 0, 0) as usize;
+            let o = alloc(other, 0, 0x20_0000);
+            assert!(!crate::ww_heap::is_block(o));
+            assert_eq!(free(other, 0, o), 1);
+        }
+    }
 }

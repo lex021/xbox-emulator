@@ -446,3 +446,19 @@ fn waiting_queue_is_clear_before_authentication() {
     assert!(gbx_iso_ok("2026-11-22T05:44:00+00:00") && gbx_iso_ok("2026-11-22T05:44:00.123Z") && !gbx_iso_ok("yesterday"));
     assert_eq!(t.route(&req("PUT", CORE, "/waitingQueue/x", &[], &[], b"")).unwrap().status, 400);
 }
+
+#[test]
+fn status_json_gets_the_tolerated_404() {
+    let t = tm();
+    let r = t.route(&req("GET", STATUS_HOST, "/status.json", &[], &[], b"")).unwrap();
+    assert_eq!(r.status, 404);
+    let reference = t.ubi.not_found(&req("GET", STATUS_HOST, "/status.json", &[], &[], b""));
+    assert_eq!(r.content_type, reference.content_type);
+    let (b, rb) = (body(&r), body(&reference));
+    for k in ["errorCode", "httpCode", "message", "errorContext", "environment"] {
+        assert_eq!(b[k], rb[k], "{k}");
+    }
+    assert_eq!(b["httpCode"], 404);
+    assert!(t.route(&req("POST", STATUS_HOST, "/status.json", &[], &[], b"")).is_none());
+    assert!(t.route(&req("GET", "public-ubiservices.ubi.com", "/status.json", &[], &[], b"")).is_none());
+}

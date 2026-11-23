@@ -1,6 +1,7 @@
 pub mod affinity;
 pub mod coverage;
 pub mod dlldir;
+pub mod foreign;
 pub mod fortnite_match;
 pub mod k32legacy;
 pub mod patch;
@@ -8,6 +9,8 @@ pub mod plm;
 pub mod quiesce;
 pub mod routes;
 pub mod routes_rt;
+pub mod webm_probe;
+pub mod tm_race_probe;
 
 use core::ffi::c_void;
 use patch::Hook;
@@ -117,7 +120,7 @@ pub unsafe extern "system" fn dll_loaded(reason: u32, data: *const u8, _ctx: *mu
         return;
     }
     let path = String::from_utf16_lossy(core::slice::from_raw_parts(buf, len));
-    if !patch::is_title_module(&path, base as usize) {
+    if !patch::is_title_module(&path, base as usize) || foreign::is_host_injected(&path) {
         return;
     }
     let mut hits = Vec::new();
@@ -135,6 +138,7 @@ pub fn load_watch_active() -> bool {
 }
 
 unsafe fn watch_loads() -> bool {
+    foreign::prime();
     let p = resolve("ntdll.dll", "LdrRegisterDllNotification");
     if p.is_null() {
         return false;
@@ -173,6 +177,8 @@ unsafe fn install() {
     k32legacy::publish();
     let n = sweep_now();
     fortnite_match::apply();
+    webm_probe::start();
+    tm_race_probe::start();
     let watching = watch_loads();
     let n = n + if watching { unsafe { routes::sweep(hook_table(), &mut Vec::new()) } } else { 0 };
     crate::record_raw("os_host", "install", &format!("{n} import slots patched; late-load watch {}; {}", if watching { "on" } else { "UNAVAILABLE" }, coverage::summary()));

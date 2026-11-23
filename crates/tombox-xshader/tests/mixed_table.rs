@@ -21,6 +21,7 @@ fn shader(words: &[u32], root: RootSig) -> ShaderExtract {
         has_root_sig: true,
         input_sig: vec![],
         output_sig: vec![SigElement { name: "SV_Target".into(), index: 0, sysval: 64, comp_type: 3, register: 0, mask: 0xf, rw_mask: 0 }],
+        prim_sig: Vec::new(),
         resources: Vec::new(),
         gs_info: None,
         root_sig: Some(root),

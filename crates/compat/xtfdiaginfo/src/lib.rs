@@ -16,6 +16,7 @@ pub mod processdelta;
 pub mod offline;
 pub mod conndiag;
 pub mod trace;
+pub mod netstate;
 
 #[cfg(test)]
 mod tests;

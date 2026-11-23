@@ -11,8 +11,17 @@ name = "netprofmsvc_c"
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
+[features]
+service = ["dep:compat-common", "dep:console-sandbox"]
+
+[dependencies]
+compat-common = { path = "../compat-common", optional = true }
+console-sandbox = { path = "../console-sandbox", optional = true }
+
 [build-dependencies]
 xone-exports = { path = "../xone-exports" }
 
 [dev-dependencies]
+compat-common = { path = "../compat-common" }
+console-sandbox = { path = "../console-sandbox" }
 xone-exports = { path = "../xone-exports" }

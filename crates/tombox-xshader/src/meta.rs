@@ -36,38 +36,31 @@ pub fn parse_signature(tag: &[u8; 4], body: &[u8]) -> Result<Vec<SigElement>, St
     if count > 64 {
         return Err(format!("implausible signature element count {count}"));
     }
-    let is_24 = matches!(tag, b"ISGN" | b"OSGN" | b"PCSG");
-    let stride = if is_24 { 24 } else { 32 };
+    let (stride, prefix) = match tag {
+        b"ISGN" | b"OSGN" | b"PCSG" | b"PSGN" => (24, 0),
+        b"OSG5" => (28, 4),
+        _ => (32, 4),
+    };
     if 8 + count * stride > body.len() {
         return Err(format!("signature body truncated for {count} elements"));
     }
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        if is_24 {
-            let e = 8 + i * 24;
-            let name_off = u32_at(body, e)? as usize;
-            out.push(SigElement {
-                name: cstr_at(body, name_off),
-                index: u32_at(body, e + 4)?,
-                sysval: u32_at(body, e + 8)?,
-                comp_type: u32_at(body, e + 12)?,
-                register: u32_at(body, e + 16)?,
-                mask: *body.get(e + 20).ok_or("sig mask oob")?,
-                rw_mask: *body.get(e + 21).ok_or("sig rwmask oob")?,
-            });
-        } else {
-            let e = 8 + i * 32;
-            let name_off = u32_at(body, e + 4)? as usize;
-            out.push(SigElement {
-                name: cstr_at(body, name_off),
-                index: u32_at(body, e + 8)?,
-                sysval: u32_at(body, e + 12)?,
-                comp_type: u32_at(body, e + 16)?,
-                register: u32_at(body, e + 20)?,
-                mask: *body.get(e + 24).ok_or("sig mask oob")?,
-                rw_mask: *body.get(e + 25).ok_or("sig rwmask oob")?,
-            });
+        let record = 8 + i * stride;
+        if tag == b"OSG5" && u32_at(body, record)? != 0 {
+            return Err("nonzero geometry output streams in OSG5 are unsupported".into());
         }
+        let e = record + prefix;
+        let name_off = u32_at(body, e)? as usize;
+        out.push(SigElement {
+            name: cstr_at(body, name_off),
+            index: u32_at(body, e + 4)?,
+            sysval: u32_at(body, e + 8)?,
+            comp_type: u32_at(body, e + 12)?,
+            register: u32_at(body, e + 16)?,
+            mask: body[e + 20],
+            rw_mask: body[e + 21],
+        });
     }
     Ok(out)
 }
@@ -108,9 +101,14 @@ pub struct MeshInfo {
 }
 
 pub(crate) fn mesh_thread_count(dims: [u32; 3]) -> Result<u32, String> {
+    mesh_thread_count_for(14, dims)
+}
+
+pub(crate) fn mesh_thread_count_for(stage: u8, dims: [u32; 3]) -> Result<u32, String> {
     let count = dims.into_iter().try_fold(1u32, u32::checked_mul);
     match count {
         Some(n @ 1..=128) => Ok(n),
+        Some(n @ 129..=256) if stage == 13 && n % 2 == 0 => Ok(n),
         _ => Err(format!("mesh/amplification thread-group size {dims:?} outside 1..128")),
     }
 }
@@ -384,6 +382,28 @@ mod tests {
         assert_eq!(sig_32[0].register, 0);
         assert_eq!(sig_32[0].mask, 0x0f);
         assert_eq!(sig_32[0].rw_mask, 0x0f);
+    }
+
+    #[test]
+    fn stream_signature_keeps_the_second_outputs_semantic_and_masks() {
+        let mut body = Vec::new();
+        for word in [2u32, 8, 0, 64, 0, 1, 3, 0, 0x000f, 0, 76, 3, 0, 3, 1, 0x0c03] {
+            body.extend(word.to_le_bytes());
+        }
+        body.extend(b"SV_Position\0TEXCOORD\0");
+        let container = crate::Dxbc {
+            digest: [0; 16],
+            total_size: body.len() as u32,
+            chunks: vec![crate::Chunk { fourcc: *b"OSG5", offset: 0, size: body.len() }],
+        };
+        let sig = container.output_signature(&body).unwrap().unwrap();
+        assert_eq!(sig.len(), 2);
+        assert_eq!((sig[0].name.as_str(), sig[0].sysval, sig[0].mask), ("SV_Position", 1, 15));
+        let uv = &sig[1];
+        assert_eq!((uv.name.as_str(), uv.index, uv.register, uv.comp_type, uv.mask, uv.rw_mask), ("TEXCOORD", 3, 1, 3, 3, 12));
+        body[36..40].copy_from_slice(&1u32.to_le_bytes());
+        assert!(container.output_signature(&body).unwrap_err().contains("nonzero geometry output streams"));
+        assert!(parse_signature(b"OSG5", &body[..60]).is_err());
     }
 
     fn cs_blob(info_size: u32, dims: [u32; 3]) -> Vec<u8> {

@@ -538,20 +538,18 @@ static NET_SECURITY_REFS: AtomicU32 = AtomicU32::new(0);
 static NET_RESULT_REFS: AtomicU32 = AtomicU32::new(0);
 
 macro_rules! unserved {
-    ($name:ident, $iface:literal, $slot:literal) => {
+    ($name:ident, $iface:literal, $slot:literal, $why:literal) => {
         unsafe extern "system" fn $name(_this: *mut c_void) -> i32 {
-            compat_common::record_raw("gamecore-host", $iface, concat!("slot ", $slot, " has no decoded meaning; E_NOTIMPL"));
+            compat_common::record_raw("gamecore-host", $iface, concat!("slot ", $slot, ": ", $why, "; E_NOTIMPL"));
             E_NOTIMPL
         }
     };
 }
 
-unserved!(v7_7, "PackageV7", 7);
-unserved!(v7_17, "PackageV7", 17);
-unserved!(v7_18, "PackageV7", 18);
-unserved!(v7_19, "PackageV7", 19);
-unserved!(v7_24, "PackageV7", 24);
-unserved!(v7_25, "PackageV7", 25);
+unserved!(v7_17, "PackageV7", 17, "in const GUID*, reached only from package-server slot 23 (19041 fn 8d10), which no title path in any dump calls");
+unserved!(v7_18, "PackageV7", 18, "in const GUID*, reached only from package-server slot 24 (19041 fn 8df0), which no title path in any dump calls");
+unserved!(v7_24, "PackageV7", 24, "batch id query with {HSTRING, u8} results; no console client calls it and the server body is in no dump");
+unserved!(v7_25, "PackageV7", 25, "batch id query with {HSTRING, i32} results; no console client calls it and the server body is in no dump");
 
 unsafe fn wide_text(p: *const u16) -> Option<String> {
     if p.is_null() {
@@ -651,7 +649,7 @@ pub fn features_record(f: &[compat_common::gdk::package::Feature]) -> Vec<u16> {
     v
 }
 
-unsafe extern "system" fn v7_features(_this: *mut c_void, pkg: *const u16, _kind: i32, out: *mut *mut c_void) -> i32 {
+unsafe fn serve_features(slot: u32, pkg: *const u16, out: *mut *mut c_void) -> i32 {
     if out.is_null() {
         return E_POINTER;
     }
@@ -660,8 +658,16 @@ unsafe extern "system" fn v7_features(_this: *mut c_void, pkg: *const u16, _kind
         return compat_common::gdk::E_NOT_FOUND;
     }
     let f = compat_common::gdk::package::features();
-    compat_common::record_raw("gamecore-host", "PackageV7", &format!("slot 26 features -> {} records", f.len()));
+    compat_common::record_raw("gamecore-host", "PackageV7", &format!("slot {slot} features -> {} records", f.len()));
     put_hstring(out, &features_record(f))
+}
+
+unsafe extern "system" fn v7_features(_this: *mut c_void, pkg: *const u16, _kind: i32, out: *mut *mut c_void) -> i32 {
+    serve_features(26, pkg, out)
+}
+
+unsafe extern "system" fn v7_19(_this: *mut c_void, pkg: *const u16, out: *mut *mut c_void) -> i32 {
+    serve_features(19, pkg, out)
 }
 
 unsafe extern "system" fn v7_uninstall(_this: *mut c_void, pkg: *const u16) -> i32 {
@@ -691,7 +697,7 @@ unsafe fn fill_details(d: *mut PkgDetails) -> i32 {
     core::ptr::write_bytes(d as *mut u8, 0, core::mem::size_of::<PkgDetails>());
     let d = &mut *d;
     d.version = [t.version[3], t.version[2], t.version[1], t.version[0]];
-    for (slot, text) in [(&mut d.id, compat_common::gdk::package::package_id()), (&mut d.display, t.display.clone()), (&mut d.publisher, t.publisher.clone())] {
+    for (slot, text) in [(&mut d.id, compat_common::gdk::package::package_id()), (&mut d.display, t.display.clone()), (&mut d.publisher, t.publisher.clone()), (&mut d.store_id, compat_common::gdk::store::game_store_id())] {
         let hr = put_hstring(slot, &wide(&text));
         if hr < 0 {
             return hr;
@@ -918,6 +924,24 @@ unsafe extern "system" fn v7_14(_this: *mut c_void, watched: *const u16, install
     S_OK
 }
 
+pub fn alias_identity(kind: i32, id: &str) -> Option<String> {
+    (kind == 0 && !id.is_empty() && id.eq_ignore_ascii_case(&compat_common::gdk::store::game_store_id())).then(compat_common::gdk::package::package_id)
+}
+
+unsafe extern "system" fn v7_7(_this: *mut c_void, kind: i32, id: *const u16, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    *out = core::ptr::null_mut();
+    let id = wide_text(id).unwrap_or_default();
+    let hit = alias_identity(kind, &id);
+    compat_common::record_raw("gamecore-host", "PackageV7", &format!("slot 7 alias kind {kind} '{id}' -> {}", hit.as_deref().unwrap_or("not found")));
+    match hit {
+        Some(p) => put_hstring(out, &wide(&p)),
+        None => compat_common::gdk::E_NOT_FOUND,
+    }
+}
+
 unsafe extern "system" fn v7_16(_this: *mut c_void, kind: i32, id: *const u16, out: *mut *mut c_void, kind_out: *mut i32) -> i32 {
     if out.is_null() || kind_out.is_null() {
         return E_POINTER;
@@ -925,12 +949,12 @@ unsafe extern "system" fn v7_16(_this: *mut c_void, kind: i32, id: *const u16, o
     *out = core::ptr::null_mut();
     *kind_out = 0;
     let id = wide_text(id).unwrap_or_default();
-    let hit = kind == 0 && id.eq_ignore_ascii_case(&compat_common::gdk::store::game_store_id());
-    compat_common::record_raw("gamecore-host", "PackageV7", &format!("slot 16 resolve kind {kind} '{id}' -> {}", if hit { "this package" } else { "not found" }));
-    if !hit {
-        return compat_common::gdk::E_NOT_FOUND;
+    let hit = alias_identity(kind, &id);
+    compat_common::record_raw("gamecore-host", "PackageV7", &format!("slot 16 resolve kind {kind} '{id}' -> {}", if hit.is_some() { "this package" } else { "not found" }));
+    match hit {
+        Some(p) => put_hstring(out, &wide(&p)),
+        None => compat_common::gdk::E_NOT_FOUND,
     }
-    put_hstring(out, &wide(&compat_common::gdk::package::package_id()))
 }
 
 unsafe extern "system" fn v7_mount_step(slot: u32, target: *const u16, caller: *const u16) -> i32 {

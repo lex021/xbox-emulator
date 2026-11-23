@@ -41,7 +41,7 @@ unsafe extern "system" fn loaded(reason: u32, data: *const u8, _ctx: *mut c_void
         return;
     }
     let path = String::from_utf16_lossy(core::slice::from_raw_parts(buf, len));
-    if !is_title_path(&path) {
+    if !is_title_path(&path) || crate::os_host::foreign::is_host_injected(&path) {
         return;
     }
     let n = super::hook::patch_late(base);
@@ -55,6 +55,7 @@ pub fn watch() -> bool {
     if WATCHING.load(Ordering::Acquire) {
         return true;
     }
+    crate::os_host::foreign::prime();
     unsafe {
         let nt: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
         let h = GetModuleHandleW(nt.as_ptr());

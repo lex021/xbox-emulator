@@ -7,6 +7,9 @@ use crate::sys::*;
 use crate::virt::{XMemBasicInformation, XMemVirtualQuery};
 use compat_common::record;
 
+#[path = "heap_19041.rs"]
+mod legacy;
+
 const M: &str = "xmem";
 
 const HEAP_NO_SERIALIZE: u32 = 0x1;
@@ -15,6 +18,7 @@ const XMEM_HEAP_IN_PLACE: u64 = 0x2;
 const XMEM_HEAP_SERIALIZED: u64 = 0x4;
 
 static NAMES: Mutex<Option<HashMap<usize, [u8; 8]>>> = Mutex::new(None);
+static TITLE_HEAPS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 #[no_mangle]
 pub extern "system" fn XMemGetTitleHeap() -> Handle {
@@ -24,7 +28,9 @@ pub extern "system" fn XMemGetTitleHeap() -> Handle {
 #[no_mangle]
 pub unsafe extern "system" fn XMemCreateWin32Heap(flags: u64, base: *mut c_void) -> Handle {
     let f = flags & !0x8000;
-    if f > 7 {
+    let legacy = compat_common::os_host::routes::current_build() == 19041;
+    let max_flags = if legacy { 2 } else { 7 };
+    if f > max_flags {
         SetLastError(ERROR_INVALID_PARAMETER);
         return core::ptr::null_mut();
     }
@@ -32,6 +38,9 @@ pub unsafe extern "system" fn XMemCreateWin32Heap(flags: u64, base: *mut c_void)
         if base.is_null() || base as usize & 0xfff != 0 || f != XMEM_HEAP_IN_PLACE {
             SetLastError(ERROR_INVALID_PARAMETER);
             return core::ptr::null_mut();
+        }
+        if legacy {
+            return legacy::create(base);
         }
         let mut info = XMemBasicInformation::default();
         if XMemVirtualQuery(GetCurrentProcess(), base, &mut info) == 0 || info.state & MEM_COMMIT == 0 {
@@ -42,13 +51,20 @@ pub unsafe extern "system" fn XMemCreateWin32Heap(flags: u64, base: *mut c_void)
         record(M, "XMemCreateWin32Heap", &format!("in-place base={base:p} size={:#x} -> {h:p}", info.region_size));
         return h;
     }
-    if f & XMEM_HEAP_TOOLS != 0 {
+    if !legacy && f & XMEM_HEAP_TOOLS != 0 {
         record(M, "XMemCreateWin32Heap", "tools partition requested; not available");
         SetLastError(ERROR_INVALID_PARAMETER);
         return core::ptr::null_mut();
     }
-    let opts = if f & XMEM_HEAP_SERIALIZED != 0 { 0 } else { HEAP_NO_SERIALIZE };
-    let h = HeapCreate(opts, 0, 0);
+    let (h, title) = if legacy {
+        legacy::partition_heap(f == XMEM_HEAP_TOOLS, flags & 0x8000 != 0)
+    } else {
+        let opts = if f & XMEM_HEAP_SERIALIZED != 0 { 0 } else { HEAP_NO_SERIALIZE };
+        (HeapCreate(opts, 0, 0), true)
+    };
+    if title && !h.is_null() {
+        TITLE_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).push(h as usize);
+    }
     record(M, "XMemCreateWin32Heap", &format!("flags={flags:#x} -> {h:p}"));
     h
 }
@@ -93,10 +109,12 @@ pub unsafe extern "system" fn XMemGetWin32HeapStatistics(heap: Handle, out: *mut
         SetLastError(ERROR_INVALID_PARAMETER);
         return 0;
     }
+    crate::title_acct::announce();
     if let Some(a) = crate::heap_acct::slot(heap as usize) {
         let (allocated, overhead) = a.read();
         (*out).allocated = allocated;
         (*out).overhead = overhead;
+        trace_heap(heap, allocated, overhead);
         return 1;
     }
     let patched = crate::hooks::install_heap_accounting();
@@ -108,10 +126,20 @@ pub unsafe extern "system" fn XMemGetWin32HeapStatistics(heap: Handle, out: *mut
     let allocated = (s.allocated as u64).min(committed);
     (*out).allocated = allocated;
     (*out).overhead = committed - allocated;
-    if crate::heap_acct::register(heap as usize, allocated, committed - allocated).is_some() {
+    let title_created = crate::title_acct::enabled() && TITLE_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).contains(&(heap as usize));
+    let reg = if title_created { crate::heap_acct::register_title(heap as usize, allocated, committed - allocated) } else { crate::heap_acct::register(heap as usize, allocated, committed - allocated) };
+    if reg.is_some() {
         record(M, "XMemGetWin32HeapStatistics", &format!("heap {heap:p}: one baseline HeapSummary (allocated {allocated:#x}, overhead {:#x}), then running totals from the heap import wrappers ({patched} import slots); no further heap walks", committed - allocated));
     }
+    trace_heap(heap, allocated, committed - allocated);
     1
+}
+
+fn trace_heap(heap: Handle, allocated: u64, overhead: u64) {
+    if !crate::title_acct::log_on() {
+        return;
+    }
+    crate::title_acct::trace("heap", &format!("queried heap {heap:p} reported allocated {allocated:#x} overhead {overhead:#x} (sum {:.1}MB)", (allocated + overhead) as f64 / (1u64 << 20) as f64));
 }
 
 #[no_mangle]
@@ -215,7 +243,15 @@ mod tests {
         TRACKING_HOOKS[1].store(on_realloc as *const () as usize, Ordering::Release);
         TRACKING_HOOKS[2].store(on_free as *const () as usize, Ordering::Release);
         let patched = unsafe { crate::iat::patch_module(exe, &heap_rule) };
-        assert!(patched >= 2, "patched {patched}");
+        let wrapped = std::cell::Cell::new(0usize);
+        let count = |_dll: &[u8], name: Option<&[u8]>, value: usize| -> Option<usize> {
+            if matches!(name, Some(b"HeapAlloc" | b"HeapReAlloc" | b"HeapFree")) && crate::hooks::is_ours(value) {
+                wrapped.set(wrapped.get() + 1);
+            }
+            None
+        };
+        unsafe { crate::iat::patch_module(exe, &count) };
+        assert!(wrapped.get() >= 2, "heap imports routed through wrappers: {} (newly patched {patched})", wrapped.get());
         let heap = unsafe { GetProcessHeap() };
         let p = unsafe { HeapAlloc(heap, 0, MAGIC) } as usize;
         assert!(p != 0);

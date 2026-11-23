@@ -7,7 +7,7 @@ Contributions are welcome. The most useful thing you can add right now is covera
 | Path | What it is |
 |---|---|
 | `crates/compat/<dll>/` | One crate per console DLL. It builds a drop-in DLL with the console's exports. |
-| `crates/compat/<dll>/exports.txt` | One line per export: `ordinal Name status \| notes`. Status is `implemented`, `forwarded`, `pc`, `title` or `missing`. |
+| `crates/compat/<dll>/exports.txt` | One line per export: `ordinal Name status \| notes`. Status is `implemented`, `forwarded`, `hooked`, `pc`, `title`, `unsupported` or `missing` (meanings in the [library map](docs/LIBRARY_MAP.md#statuses)). Only `implemented`, `forwarded` and `hooked` rows are routed to the emulator; every other row keeps the PC binding. |
 | `crates/compat/compat-common/` | Shared runtime: OS hooks, GDK file system and import routing. |
 | `crates/compat/d3d12_xs/`, `d3d12_x/` | Xbox Direct3D 12.x (Series X\|S and One). |
 | `crates/tombox-xshader/` | RDNA2 shader translator. |

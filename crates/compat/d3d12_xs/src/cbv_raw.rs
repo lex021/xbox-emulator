@@ -23,16 +23,94 @@ static PREV_RS: AtomicUsize = AtomicUsize::new(0);
 static PREV_CBV: AtomicUsize = AtomicUsize::new(0);
 static REAL_ROOT_SRV: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
 
-pub fn enabled() -> bool {
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Auto,
+    On,
+    Off,
+    Copy,
+}
+
+pub fn parse_mode(v: Option<&str>) -> Result<Mode, String> {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("copy") => Ok(Mode::Copy),
+        Some("auto") => Ok(Mode::Auto),
+        Some("1") | Some("on") => Ok(Mode::On),
+        Some("0") | Some("off") => Ok(Mode::Off),
+        Some(other) => Err(format!("cbv_raw={other:?} is not one of copy, auto, on, off, 1, 0; using copy")),
+    }
+}
+
+pub fn mode_setting(cbv_raw: Option<String>, cbraw: Option<String>, cfg: Option<String>) -> Option<String> {
+    cbv_raw.or(cbraw).or(cfg)
+}
+
+pub fn mode() -> Mode {
+    static M: OnceLock<Mode> = OnceLock::new();
+    *M.get_or_init(|| {
+        let raw = mode_setting(std::env::var("TOMBOX_CBV_RAW").ok(), std::env::var("TOMBOX_CBRAW").ok(), compat_common::cfg("cbv_raw"));
+        parse_mode(raw.as_deref()).unwrap_or_else(|e| {
+            record("d3d12_xs", "cbv_raw", &e);
+            Mode::Copy
+        })
+    })
+}
+
+pub fn copy_on() -> bool {
+    static C: OnceLock<bool> = OnceLock::new();
+    *C.get_or_init(|| mode() == Mode::Copy)
+}
+
+pub fn pack_mode(xbox_one: bool) -> tombox_xshader::pack_key::CbvRaw {
+    pack_mode_of(mode(), enabled(), xbox_one)
+}
+
+pub fn pack_mode_of(mode: Mode, enabled: bool, xbox_one: bool) -> tombox_xshader::pack_key::CbvRaw {
+    if mode == Mode::Copy {
+        tombox_xshader::pack_key::CbvRaw::Copy
+    } else {
+        tombox_xshader::pack_key::CbvRaw::of(enabled, xbox_one)
+    }
+}
+
+pub fn xbox_one_title() -> bool {
+    static X: OnceLock<bool> = OnceLock::new();
+    *X.get_or_init(|| {
         extern "system" {
             fn GetModuleHandleW(n: *const u16) -> *mut c_void;
         }
         let name: Vec<u16> = "d3d12_x.dll".encode_utf16().chain(Some(0)).collect();
-        let on = !unsafe { GetModuleHandleW(name.as_ptr()) }.is_null();
+        !unsafe { GetModuleHandleW(name.as_ptr()) }.is_null()
+    })
+}
+
+pub fn shader_kind_refusal(xbox_one: bool, durango: bool) -> Option<&'static str> {
+    (xbox_one && !durango).then_some("Xbox One title shader is not a Durango program")
+}
+
+pub fn enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        let mode = mode();
+        let xbox_one = xbox_one_title();
+        let on = match mode {
+            Mode::Auto => xbox_one,
+            Mode::On => true,
+            Mode::Off | Mode::Copy => false,
+        };
+        let why = match (mode, xbox_one) {
+            (Mode::Copy, _) => "cbv_raw=copy",
+            (Mode::Auto, _) => "Xbox One title (d3d12_x.dll loaded)",
+            (Mode::On, _) => "cbv_raw=on",
+            (Mode::Off, true) => "cbv_raw=off on an Xbox One title (d3d12_x.dll loaded)",
+            (Mode::Off, false) => "cbv_raw=off",
+        };
         if on {
-            record("d3d12_xs", "cbv_raw", &format!("Xbox One title (d3d12_x.dll loaded): constant buffers are bound as raw SRVs in space {TB_CBRAW_SPACE}+n so a CBV may start at any 16-byte-aligned address like on the console"));
+            record("d3d12_xs", "cbv_raw", &format!("{why}: constant buffers are bound as raw SRVs in space {}+n so a CBV may start at any 16-byte-aligned address like on the console", tombox_xshader::cbv_raw_hlsl::space_base()));
+        } else if mode == Mode::Copy {
+            record("d3d12_xs", "cbv_raw", &format!("{why}: root CBVs stay PC CBVs and one whose address is not 256-byte aligned is copied on the GPU timeline into a 256-aligned emulator ring before each draw or dispatch; descriptor-table CBV ranges are rebound as raw SRVs (space {}+n) so a table CBV may start at any 16-byte-aligned address (xbox_one_title={xbox_one})", tombox_xshader::cbv_raw_hlsl::space_base()));
+        } else if mode == Mode::Off {
+            record("d3d12_xs", "cbv_raw", &format!("{why}: constant buffers stay PC CBVs (BufferLocation must be 256-byte aligned)"));
         }
         on
     })
@@ -55,6 +133,10 @@ fn wr(b: &mut [u8], o: usize, v: u32) {
 
 
 pub fn patch_rts0(b: &mut [u8]) -> Result<RsPatch, String> {
+    patch_rts0_with(b, true)
+}
+
+pub fn patch_rts0_with(b: &mut [u8], roots: bool) -> Result<RsPatch, String> {
     let version = rd(b, 0)?;
     let range_size = match version {
         1 => 20,
@@ -79,7 +161,7 @@ pub fn patch_rts0(b: &mut [u8]) -> Result<RsPatch, String> {
                     }
                 }
             }
-            PARAM_CBV => {
+            PARAM_CBV if roots => {
                 let space = map_space(rd(b, payload + 4)?)?;
                 wr(b, at, PARAM_SRV);
                 wr(b, payload + 4, space);
@@ -91,10 +173,35 @@ pub fn patch_rts0(b: &mut [u8]) -> Result<RsPatch, String> {
     Ok(p)
 }
 
+pub fn alias_blob(blob: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    let (o, n) = crate::console_slots_mesh::rts0_range(blob).ok_or("root signature blob has no RTS0 part")?;
+    let body = blob.get(o..o + n).ok_or("RTS0 chunk out of bounds")?;
+    match crate::bl_alias::add_aliases(body)? {
+        Some(b) => Ok(Some(crate::bl_alias::replace_rts0(blob, &b)?)),
+        None => Ok(None),
+    }
+}
+
 pub fn patch_blob(blob: &[u8]) -> Result<Option<(Vec<u8>, RsPatch)>, String> {
+    patch_blob_with(blob, true)
+}
+
+pub fn table_blob(blob: &[u8]) -> Result<Option<(Vec<u8>, RsPatch)>, String> {
+    patch_blob_with(blob, false)
+}
+
+pub fn copy_mode_blob(blob: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    if copy_on() {
+        table_blob(blob).map(|r| r.map(|(b, _)| b))
+    } else {
+        alias_blob(blob)
+    }
+}
+
+fn patch_blob_with(blob: &[u8], roots: bool) -> Result<Option<(Vec<u8>, RsPatch)>, String> {
     let (o, n) = crate::console_slots_mesh::rts0_range(blob).ok_or("root signature blob has no RTS0 part")?;
     let mut body = blob.get(o..o + n).ok_or("RTS0 chunk out of bounds")?.to_vec();
-    let mut p = patch_rts0(&mut body)?;
+    let mut p = patch_rts0_with(&mut body, roots)?;
     if let Some(b) = crate::bl_alias::add_aliases(&body)? {
         body = b;
         p.aliased = true;
@@ -145,8 +252,26 @@ unsafe fn vslot(o: *mut c_void, i: usize) -> usize {
 
 unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, blob: *const u8, len: usize, riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
     let f: unsafe extern "system" fn(*mut c_void, u32, *const u8, usize, *const c_void, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(PREV_RS.load(Ordering::Relaxed)) };
-    if blob.is_null() || len == 0 || !enabled() {
+    if blob.is_null() || len == 0 {
         return unsafe { f(this, mask, blob, len, riid, ppv) };
+    }
+    if !enabled() {
+        let given = unsafe { core::slice::from_raw_parts(blob, len) };
+        return match copy_mode_blob(given) {
+            Ok(Some(b)) => {
+                static N: AtomicUsize = AtomicUsize::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 3 {
+                    let what = if copy_on() { "copy root signature: root CBVs kept, descriptor-table CBV ranges rebound as raw SRVs" } else { "off root signature: CBVs kept" };
+                    record("d3d12_xs", "cbv_raw", &format!("cbv_raw={what}, SRV/UAV ranges aliased for the translator's bindless spaces"));
+                }
+                unsafe { f(this, mask, b.as_ptr(), b.len(), riid, ppv) }
+            }
+            Ok(None) => unsafe { f(this, mask, blob, len, riid, ppv) },
+            Err(e) => {
+                record("d3d12_xs", "cbv_raw", &format!("root signature (raw patch off) not aliased ({e}); created as given"));
+                unsafe { f(this, mask, blob, len, riid, ppv) }
+            }
+        };
     }
     if check_on() {
         log_root_regs(unsafe { core::slice::from_raw_parts(blob, len) });
@@ -165,16 +290,16 @@ unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, bl
             unsafe { f(this, mask, blob, len, riid, ppv) }
         }
     };
-    if hr >= 0 && inherit_on() && !ppv.is_null() {
+    if hr >= 0 && track_on() && !ppv.is_null() {
         let rs = unsafe { *ppv } as usize;
-        let regs = root_cbv_regs(unsafe { core::slice::from_raw_parts(blob, len) });
+        let regs = root_cbv_params(unsafe { core::slice::from_raw_parts(blob, len) });
         dc_with(|d| { d.rs.insert(rs, regs); });
     }
     hr
 }
 
 unsafe extern "system" fn create_cbv(this: *mut c_void, pdesc: *const u8, dest: usize) {
-    if !enabled() {
+    if !enabled() && !copy_on() {
         let f: unsafe extern "system" fn(*mut c_void, *const u8, usize) = unsafe { core::mem::transmute(PREV_CBV.load(Ordering::Relaxed)) };
         return unsafe { f(this, pdesc, dest) };
     }
@@ -206,6 +331,7 @@ unsafe extern "system" fn set_compute_root_cbv_x(this: *mut c_void, i: u32, va: 
     if crate::rtcap::enabled() {
         crate::bindtrace::set_root_cbv(this as usize, true, i, va);
     }
+    crate::rootlog::note(this as usize, "cbv_raw:title", 39, i as u64, va, 0, 0);
     let f: unsafe extern "system" fn(*mut c_void, u32, u64) = unsafe { core::mem::transmute(REAL_ROOT_SRV[0].load(Ordering::Relaxed)) };
     unsafe { f(this, i, va) }
 }
@@ -217,7 +343,7 @@ unsafe extern "system" fn set_graphics_root_cbv_x(this: *mut c_void, i: u32, va:
     if crate::rtcap::enabled() {
         crate::bindtrace::set_root_cbv(this as usize, false, i, va);
     }
-    if inherit_on() {
+    if track_on() {
         dc_with(|d| {
             let l = d.lists.entry(this as usize).or_default();
             if (i as usize) < 64 {
@@ -227,6 +353,7 @@ unsafe extern "system" fn set_graphics_root_cbv_x(this: *mut c_void, i: u32, va:
             d.last.entry(this as usize).or_default().insert(i, va);
         });
     }
+    crate::rootlog::note(this as usize, "cbv_raw:title", 40, i as u64, va, 0, 0);
     let f: unsafe extern "system" fn(*mut c_void, u32, u64) = unsafe { core::mem::transmute(REAL_ROOT_SRV[1].load(Ordering::Relaxed)) };
     unsafe { f(this, i, va) }
 }
@@ -254,6 +381,7 @@ fn check_root(i: u32, va: u64, compute: bool) {
 }
 
 pub unsafe fn install_root_cbv_hooks(xbox_vt: &[AtomicUsize], real_vt: *const usize) {
+    crate::cbv_copy::install(xbox_vt, false);
     if !enabled() || xbox_vt.len() <= XBOX_SLOT_GRAPHICS_ROOT_CBV {
         return;
     }
@@ -275,15 +403,68 @@ pub fn hook_device(v: &mut [usize]) {
     v[17] = create_cbv as usize;
 }
 
-pub fn clamp_knob() -> Option<(u32, u32)> {
-    static K: OnceLock<Option<(u32, u32)>> = OnceLock::new();
-    *K.get_or_init(|| {
-        let v = std::env::var("TOMBOX_CBRAW_CLAMP").ok()?;
-        let (a, b) = v.split_once(':')?;
-        let lim = b.trim().trim_start_matches("0x");
-        let lim = if lim == "z" { u32::MAX } else { u32::from_str_radix(lim, 16).ok()? };
-        Some((a.trim().parse().ok()?, lim))
-    })
+pub fn clamp_knob() -> Option<(u32, u32, Option<u64>)> {
+    static K: OnceLock<Option<(u32, u32, Option<u64>)>> = OnceLock::new();
+    *K.get_or_init(|| parse_clamp(&std::env::var("TOMBOX_CBRAW_CLAMP").ok()?))
+}
+
+pub fn parse_clamp(v: &str) -> Option<(u32, u32, Option<u64>)> {
+    let mut it = v.split(':');
+    let a = it.next()?;
+    let lim = it.next()?.trim().trim_start_matches("0x");
+    let lim = if lim == "z" { u32::MAX } else { u32::from_str_radix(lim, 16).ok()? };
+    let only = match it.next() {
+        Some(h) => Some(u64::from_str_radix(h.trim(), 16).ok()?),
+        None => None,
+    };
+    Some((a.trim().parse().ok()?, lim, only))
+}
+
+pub fn hoist_hashes() -> &'static Vec<u64> {
+    static S: OnceLock<Vec<u64>> = OnceLock::new();
+    S.get_or_init(|| std::env::var("TOMBOX_CBRAW_HOIST").map(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect()).unwrap_or_default())
+}
+
+pub fn hoist_const_loads(h: &str) -> (String, usize) {
+    let Some(at) = h.find("uint tb_pc = 0u;") else { return (h.to_string(), 0) };
+    let ls = h[..at].rfind('\n').map_or(0, |x| x + 1);
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut out = String::with_capacity(h.len());
+    let mut i = 0;
+    while i < h.len() {
+        if h[i..].starts_with("tb_cbr") {
+            let ns = i + 6;
+            let ne = ns + h[ns..].bytes().take_while(|c| c.is_ascii_digit()).count();
+            let rest = &h[ne..];
+            if ne > ns && rest.starts_with(".Load4((") {
+                let ds = ne + 8;
+                let de = ds + h[ds..].bytes().take_while(|c| c.is_ascii_digit()).count();
+                if de > ds && h[de..].starts_with(") * 16u)") && i >= ls {
+                    let slot = &h[ns..ne];
+                    let idx = &h[ds..de];
+                    let name = format!("tb_h{slot}_{idx}");
+                    if !seen.iter().any(|(n, _)| *n == name) {
+                        seen.push((name.clone(), format!("tb_cbr{slot}.Load4(({idx}) * 16u)")));
+                    }
+                    out.push_str(&name);
+                    i = de + 8;
+                    continue;
+                }
+            }
+        }
+        let c = h[i..].chars().next().unwrap();
+        out.push(c);
+        i += c.len_utf8();
+    }
+    if seen.is_empty() {
+        return (h.to_string(), 0);
+    }
+    let decl: String = seen.iter().map(|(n, e)| format!("    uint4 {n} = {e};\n")).collect();
+    let mut r = String::with_capacity(out.len() + decl.len());
+    r.push_str(&out[..ls]);
+    r.push_str(&decl);
+    r.push_str(&out[ls..]);
+    (r, seen.len())
 }
 
 pub fn clamp_reads(h: &str, slot: u32, lim: u32) -> String {
@@ -298,15 +479,19 @@ pub fn clamp_reads(h: &str, slot: u32, lim: u32) -> String {
 }
 
 pub fn root_cbv_regs(blob: &[u8]) -> Vec<(usize, u32, u32)> {
+    root_cbv_params(blob).into_iter().map(|(i, r, sp, _)| (i, r, sp)).collect()
+}
+
+pub fn root_cbv_params(blob: &[u8]) -> Vec<(usize, u32, u32, u32)> {
     let mut out = Vec::new();
     let Some((o, n)) = crate::console_slots_mesh::rts0_range(blob) else { return out };
     let Some(b) = blob.get(o..o + n) else { return out };
     let (Ok(np), Ok(po)) = (rd(b, 4), rd(b, 8)) else { return out };
     for i in 0..np as usize {
         let at = po as usize + i * 12;
-        if let (Ok(PARAM_CBV), Ok(pl)) = (rd(b, at), rd(b, at + 8)) {
+        if let (Ok(PARAM_CBV), Ok(vis), Ok(pl)) = (rd(b, at), rd(b, at + 4), rd(b, at + 8)) {
             if let (Ok(r), Ok(sp)) = (rd(b, pl as usize), rd(b, pl as usize + 4)) {
-                out.push((i, r, sp));
+                out.push((i, r, sp, vis));
             }
         }
     }
@@ -328,7 +513,7 @@ fn log_root_regs(blob: &[u8]) {
 
 #[derive(Default)]
 struct DrawCheck {
-    rs: std::collections::HashMap<usize, Vec<(usize, u32, u32)>>,
+    rs: std::collections::HashMap<usize, Vec<(usize, u32, u32, u32)>>,
     lists: std::collections::HashMap<usize, (usize, u64, std::collections::HashMap<u32, u64>)>,
     last: std::collections::HashMap<usize, std::collections::HashMap<u32, u64>>,
     seen: std::collections::HashSet<(usize, u64)>,
@@ -366,6 +551,10 @@ fn inherit_on() -> bool {
     *E.get_or_init(|| enabled() && (check_on() || std::env::var("TOMBOX_CBRAW_INHERIT").map(|v| v == "1").unwrap_or(false)))
 }
 
+fn track_on() -> bool {
+    inherit_on() || crate::hang_cap::on()
+}
+
 unsafe extern "system" fn reset_checked(this: *mut c_void, alloc: *mut c_void, pso: *mut c_void) -> i32 {
     dc_with(|d| {
         d.lists.remove(&(this as usize));
@@ -382,11 +571,15 @@ pub fn inherit_plan(regs: &[(usize, u32, u32)], mask: u64, last: &std::collectio
         .collect()
 }
 
-fn check_draw(list: usize) {
+fn check_draw(list: usize, text: &dyn Fn() -> String) {
     let (plan, msg) = dc_with(|d| {
         let (rs, mask, vas) = d.lists.get(&list).cloned().unwrap_or_default();
-        let Some(regs) = d.rs.get(&rs).cloned() else { return (Vec::new(), None) };
-        let plan = d.last.get(&list).map(|last| inherit_plan(&regs, mask, last)).unwrap_or_default();
+        let Some(params) = d.rs.get(&rs).cloned() else { return (Vec::new(), None) };
+        if crate::hang_cap::on() {
+            crate::hang_cap::draw(list, &format!("rs {rs:#x} {}", text()), &params, mask, &vas);
+        }
+        let regs: Vec<(usize, u32, u32)> = params.iter().map(|&(i, r, sp, _)| (i, r, sp)).collect();
+        let plan = if inherit_on() { d.last.get(&list).map(|last| inherit_plan(&regs, mask, last)).unwrap_or_default() } else { Vec::new() };
         if let Some(l) = d.lists.get_mut(&list) {
             for (i, va) in &plan {
                 l.1 |= 1u64 << i;
@@ -403,7 +596,6 @@ fn check_draw(list: usize) {
         if unset.is_empty() {
             return (plan, None);
         }
-        let _ = vas;
         let key = (rs, mask);
         if d.seen.len() >= 64 || !d.seen.insert(key) {
             return (plan, None);
@@ -413,6 +605,7 @@ fn check_draw(list: usize) {
     if !plan.is_empty() {
         let f: unsafe extern "system" fn(*mut c_void, u32, u64) = unsafe { core::mem::transmute(REAL_ROOT_SRV[1].load(Ordering::Relaxed)) };
         for (i, va) in &plan {
+            crate::rootlog::note(list, "cbv_raw:inherit", 40, *i as u64, *va, 0, 0);
             unsafe { f(list as *mut c_void, *i, *va) };
         }
         let n = INHERITED.fetch_add(plan.len(), Ordering::Relaxed);
@@ -426,19 +619,22 @@ fn check_draw(list: usize) {
 }
 
 unsafe extern "system" fn draw_indexed_checked(this: *mut c_void, a: u32, b: u32, c: u32, d: i32, e: u32) {
-    check_draw(this as usize);
+    check_draw(this as usize, &|| format!("DrawIndexedInstanced(idx={a} inst={b} startIdx={c} baseVtx={d} startInst={e})"));
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32) = unsafe { core::mem::transmute(PREV_DRAW_IDX.load(Ordering::Relaxed)) };
-    unsafe { f(this, a, b, c, d, e) }
+    unsafe { f(this, a, b, c, d, e) };
+    unsafe { crate::hang_snap::after_draw(this as usize) }
 }
 
 unsafe extern "system" fn draw_checked(this: *mut c_void, a: u32, b: u32, c: u32, d: u32) {
-    check_draw(this as usize);
+    check_draw(this as usize, &|| format!("DrawInstanced(vtx={a} inst={b} startVtx={c} startInst={d})"));
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32) = unsafe { core::mem::transmute(PREV_DRAW.load(Ordering::Relaxed)) };
-    unsafe { f(this, a, b, c, d) }
+    unsafe { f(this, a, b, c, d) };
+    unsafe { crate::hang_snap::after_draw(this as usize) }
 }
 
 pub fn install_draw_check(xbox_vt: &[AtomicUsize]) {
-    if !inherit_on() || xbox_vt.len() <= XBOX_SLOT_SET_GRAPHICS_RS || REAL_ROOT_SRV[1].load(Ordering::Relaxed) == 0 {
+    crate::cbv_copy::install(xbox_vt, true);
+    if !track_on() || xbox_vt.len() <= XBOX_SLOT_SET_GRAPHICS_RS || REAL_ROOT_SRV[1].load(Ordering::Relaxed) == 0 {
         return;
     }
     PREV_RESET.store(xbox_vt[XBOX_SLOT_RESET].load(Ordering::Relaxed), Ordering::Relaxed);
@@ -449,13 +645,133 @@ pub fn install_draw_check(xbox_vt: &[AtomicUsize]) {
     xbox_vt[XBOX_SLOT_SET_GRAPHICS_RS].store(set_graphics_rs_checked as usize, Ordering::Relaxed);
     xbox_vt[XBOX_SLOT_DRAW_INDEXED].store(draw_indexed_checked as usize, Ordering::Relaxed);
     xbox_vt[XBOX_SLOT_DRAW].store(draw_checked as usize, Ordering::Relaxed);
-    record("d3d12_xs", "cbv_raw", "root CBV inheritance across root signature changes installed");
+    crate::hang_cap::install_cmdlist(xbox_vt);
+    record("d3d12_xs", "cbv_raw", if inherit_on() { "root CBV inheritance across root signature changes installed" } else { "root CBV tracking installed for the hang capture (no inheritance)" });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gpu_va::Entry;
+
+    #[test]
+    fn hoist_moves_constant_raw_loads_before_the_dispatcher() {
+        let h = "ByteAddressBuffer tb_cbr13 : register(t13, space4100000);
+void main() {
+    uint a = tb_cbr13.Load4((3) * 16u).x;
+    uint tb_pc = 0u; uint tb_guard = 0u;
+    while (tb_pc != 9u) {
+    uint b = tb_cbr13.Load4((5) * 16u).y + tb_cbr13.Load4((5) * 16u).z;
+    uint c = tb_cbr13.Load4((t1) * 16u).w;
+    }
+}
+";
+        let (o, n) = hoist_const_loads(h);
+        assert_eq!(n, 1, "{o}");
+        assert!(o.contains("    uint4 tb_h13_5 = tb_cbr13.Load4((5) * 16u);
+    uint tb_pc = 0u;"), "{o}");
+        assert!(o.contains("uint b = tb_h13_5.y + tb_h13_5.z;"), "{o}");
+        assert!(o.contains("uint a = tb_cbr13.Load4((3) * 16u).x;"), "{o}");
+        assert!(o.contains("tb_cbr13.Load4((t1) * 16u).w"), "{o}");
+        assert_eq!(hoist_const_loads("void f() {}
+").1, 0);
+    }
+
+    #[test]
+    fn root_signature_built_from_a_shader_gets_the_raw_rebind() {
+        let body = rts0(2, &[[2, 1, 0, 0]], true);
+        let plain = crate::device_wrap::shader_root_container(&body, false);
+        let raw = crate::device_wrap::shader_root_container(&body, true);
+        let cbvs = |b: &[u8]| root_cbv_params(b).len();
+        assert_eq!(cbvs(&plain), 1);
+        assert_eq!(cbvs(&raw), 0);
+        let (o, n) = crate::console_slots_mesh::rts0_range(&raw).unwrap();
+        let r = &raw[o..o + n];
+        let po = u32::from_le_bytes(r[8..12].try_into().unwrap()) as usize;
+        let last = po + 12;
+        assert_eq!(u32::from_le_bytes(r[last..last + 4].try_into().unwrap()), PARAM_SRV);
+    }
+
+    #[test]
+    fn non_raw_default_shader_root_signature_gets_aliases_and_keeps_cbvs() {
+        let body = rts0(2, &[[0, u32::MAX, 0, 0]], true);
+        let plain = crate::device_wrap::shader_root_container(&body, false);
+        assert!(copy_on() && !enabled());
+        let console = crate::device_wrap::wrap_root_signature(&body);
+        let given = crate::rs_xbox::pc_blob(&console).unwrap_or(console);
+        assert_eq!(Some(plain.clone()), alias_blob(&given).unwrap());
+        assert_eq!(root_cbv_params(&plain), root_cbv_params(&given));
+        assert_eq!(root_cbv_params(&plain).len(), 1);
+        let only_cbv = rts0(2, &[[2, 1, 0, 0]], true);
+        let c = crate::device_wrap::wrap_root_signature(&only_cbv);
+        let g = crate::rs_xbox::pc_blob(&c).unwrap_or(c);
+        let tbl = crate::device_wrap::shader_root_container(&only_cbv, false);
+        assert_eq!(Some(tbl.clone()), table_blob(&g).unwrap().map(|(b, _)| b));
+        assert_ne!(tbl, g, "cbv_raw=copy rebinds the descriptor-table CBV range as a raw SRV range");
+        assert_eq!(root_cbv_params(&tbl), root_cbv_params(&g));
+    }
+
+    #[test]
+    fn copy_mode_aliases_unbounded_ranges_but_keeps_root_cbvs() {
+        let body = rts0(2, &[[0, u32::MAX, 0, 0]], true);
+        let container = crate::device_wrap::shader_root_container(&body, false);
+        let console = crate::device_wrap::wrap_root_signature(&body);
+        let given = crate::rs_xbox::pc_blob(&console).unwrap_or(console);
+        let raw = patch_blob(&given).unwrap().unwrap().0;
+        let aliased = alias_blob(&given).unwrap().expect("an unbounded range gets aliases");
+        assert!(alias_blob(&aliased).unwrap().is_none(), "aliasing is idempotent");
+        assert_eq!(root_cbv_params(&aliased), root_cbv_params(&given));
+        assert_eq!(root_cbv_params(&aliased).len(), 1);
+        let ranges = |b: &[u8]| {
+            let (o, n) = crate::console_slots_mesh::rts0_range(b).unwrap();
+            let r = &b[o..o + n];
+            let rd = |x: usize| u32::from_le_bytes(r[x..x + 4].try_into().unwrap()) as usize;
+            let (np, po) = (rd(4), rd(8));
+            (0..np).filter(|i| rd(po + i * 12) == 0).map(|i| rd(rd(po + i * 12 + 8))).sum::<usize>()
+        };
+        assert_eq!(ranges(&aliased), ranges(&raw));
+        assert!(ranges(&aliased) > ranges(&given));
+        assert_eq!(ranges(&container), ranges(&aliased));
+    }
+
+    #[test]
+    fn cbv_raw_mode_setting_is_validated() {
+        assert_eq!(parse_mode(None), Ok(Mode::Copy));
+        assert_eq!(parse_mode(Some("")), Ok(Mode::Copy));
+        assert_eq!(parse_mode(Some("copy")), Ok(Mode::Copy));
+        assert_eq!(parse_mode(Some("auto")), Ok(Mode::Auto));
+        assert_eq!(parse_mode(Some(" ON ")), Ok(Mode::On));
+        assert_eq!(parse_mode(Some("1")), Ok(Mode::On));
+        assert_eq!(parse_mode(Some("off")), Ok(Mode::Off));
+        assert_eq!(parse_mode(Some("0")), Ok(Mode::Off));
+        assert_eq!(parse_mode(Some(" Copy ")), Ok(Mode::Copy));
+        assert!(parse_mode(Some("yes")).is_err());
+    }
+
+    #[test]
+    fn cbv_raw_wins_over_the_cbraw_alias_then_cfg() {
+        let s = |x: &str| Some(x.to_string());
+        assert_eq!(mode_setting(s("off"), s("1"), s("on")), s("off"));
+        assert_eq!(mode_setting(None, s("1"), s("off")), s("1"));
+        assert_eq!(mode_setting(None, None, s("auto")), s("auto"));
+        assert_eq!(mode_setting(None, None, None), None);
+    }
+
+    #[test]
+    fn only_xbox_one_titles_require_durango_programs() {
+        assert_eq!(shader_kind_refusal(true, true), None);
+        assert!(shader_kind_refusal(true, false).is_some());
+        assert_eq!(shader_kind_refusal(false, false), None);
+        assert_eq!(shader_kind_refusal(false, true), None);
+    }
+
+    #[test]
+    fn clamp_knob_takes_an_optional_shader_scope() {
+        assert_eq!(parse_clamp("13:z"), Some((13, u32::MAX, None)));
+        assert_eq!(parse_clamp("13:0x470"), Some((13, 0x470, None)));
+        assert_eq!(parse_clamp("13:z:f861c56a34758d84"), Some((13, u32::MAX, Some(0xf861c56a34758d84))));
+        assert_eq!(parse_clamp("13:z:nothex"), None);
+    }
 
     fn rts0(version: u32, ranges: &[[u32; 4]], root_cbv: bool) -> Vec<u8> {
         let rs = if version == 1 { 20 } else { 24 };

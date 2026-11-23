@@ -41,3 +41,13 @@ pub unsafe fn debug_active_process_stop(pid: u32) -> BOOL {
     }
     DebugActiveProcessStop(pid)
 }
+
+pub fn title_pids() -> Vec<u32> {
+    let mut v = vec![unsafe { GetCurrentProcessId() }];
+    for p in TITLE_PIDS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if !v.contains(p) {
+            v.push(*p);
+        }
+    }
+    v
+}

@@ -769,7 +769,9 @@ mod tests {
         let (mut a, mut b, mut c) = (0u64, 0u64, 0u32);
         unsafe {
             assert_eq!(read_u32(h, &mut c), NOT_SUPPORTED);
-            assert_eq!(read_pair(h, &mut a, &mut b), NOT_SUPPORTED);
+            let t0 = core::arch::x86_64::_rdtsc();
+            assert_eq!(read_pair(h, &mut a, &mut b), 0);
+            assert!(a >= t0 && b != 0);
             assert_eq!(set_pair(h, 1, 2), 0);
             assert_eq!(xgs_kmd_emu::ported::process_options().host_posts.get(&1), Some(&2));
             assert_eq!(allocate(h, 0, 0, 0, 0, &mut a, &mut b, null_mut()), NOT_SUPPORTED);

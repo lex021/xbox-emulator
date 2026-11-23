@@ -130,6 +130,7 @@ pub fn discover(timeout: Duration, extra: &[SocketAddr]) -> Option<SocketAddr> {
     let dp = discovery_port();
     crate::net_guard::allow_lan_broadcast(dp);
     let sock = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    crate::netview::sockets::report_std(&sock);
     let _ = sock.set_broadcast(true);
     let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));
     let ask = format!("{MAGIC_ASK} {}", device_id());
@@ -297,6 +298,7 @@ impl Hub {
 
 pub fn start_hub(port: u16) -> std::io::Result<u16> {
     let l = TcpListener::bind(("0.0.0.0", port))?;
+    crate::netview::sockets::report_std(&l);
     let bound = l.local_addr()?.port();
     let h = hub();
     std::thread::Builder::new().name("tombox-lan-hub".into()).spawn(move || {
@@ -316,6 +318,7 @@ pub fn start_hub(port: u16) -> std::io::Result<u16> {
     let dp = discovery_port();
     match UdpSocket::bind(("0.0.0.0", dp)) {
         Ok(u) => {
+            crate::netview::sockets::report_std(&u);
             let _ = std::thread::Builder::new().name("tombox-lan-discovery".into()).spawn(move || {
                 let mut buf = [0u8; 256];
                 loop {

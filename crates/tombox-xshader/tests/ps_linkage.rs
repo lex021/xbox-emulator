@@ -60,6 +60,7 @@ fn ps_extract() -> ShaderExtract {
             el("TEXCOORD", 1, 0, 3, 0x7, 0),
         ],
         output_sig: vec![el("SV_Target", 0, 64, 0, 0xf, 0xf)],
+        prim_sig: Vec::new(),
         resources: Vec::new(),
         gs_info: None,
         root_sig: None,

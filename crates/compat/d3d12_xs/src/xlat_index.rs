@@ -3,7 +3,15 @@ use std::sync::OnceLock;
 use compat_common::record;
 use tombox_xshader::hlsl::InputInterp;
 
-pub const TRANSLATOR: &str = env!("TOMBOX_XLAT_SRC_HASH");
+pub const TRANSLATOR: &str = tombox_xshader::pack_key::TRANSLATOR_HASH;
+#[used]
+pub static TRANSLATOR_TAG: [u8; tombox_xshader::pack_key::TAG_LEN] = tombox_xshader::pack_key::translator_tag();
+pub const KEY_VERSION: u32 = 2;
+
+pub fn translator_tag() -> String {
+    let t = unsafe { core::ptr::read_volatile(&TRANSLATOR_TAG) };
+    String::from_utf8_lossy(&t).into_owned()
+}
 const MAGIC: &[u8; 8] = b"TBXIDX01";
 const ENV_KEYS: [&str; 12] = [
     "TOMBOX_LOOP_GRAD", "TOMBOX_SHADER_COMPILER", "TOMBOX_DXC_BRANCH_FREE", "TOMBOX_DXC_CS_PARALLEL", "TOMBOX_DXC_DIR", "TOMBOX_FAST_FMA",
@@ -19,7 +27,7 @@ fn bypass_reason_from(vars: impl Iterator<Item = (String, String)>, disabled: Op
     if disabled.as_deref().map(str::trim) == Some("0") {
         return Some("TOMBOX_XLAT_INDEX=0".into());
     }
-    let knobs: Vec<String> = vars.map(|(k, _)| k).filter(|k| k.starts_with("TOMBOX_XS_") || k.starts_with("TOMBOX_CBRAW_")).collect();
+    let knobs: Vec<String> = vars.map(|(k, _)| k).filter(|k| k.starts_with("TOMBOX_XS_") || k.starts_with("TOMBOX_CBRAW_") || k == "TOMBOX_INFER_ROOT_SIG").collect();
     if knobs.is_empty() { None } else { Some(format!("translator debug knobs set ({})", knobs.join(", "))) }
 }
 
@@ -28,7 +36,7 @@ fn enabled() -> bool {
     *E.get_or_init(|| {
         let why = bypass_reason_from(std::env::vars(), std::env::var("TOMBOX_XLAT_INDEX").ok());
         record("d3d12_xs", "xlat_index", &match &why {
-            None => format!("pre-translate index on (translator {TRANSLATOR}): a shader whose input bytes, render-target formats, linkage, compiler and translator build all match a stored translation is served from the shader pack without re-translating (TOMBOX_XLAT_INDEX=0 disables)"),
+            None => format!("pre-translate index on ({}): a shader whose input bytes, render-target formats, linkage, compiler and translator build all match a stored translation is served from the shader pack without re-translating (TOMBOX_XLAT_INDEX=0 disables)", translator_tag()),
             Some(w) => format!("pre-translate index bypassed: {w}; every shader is translated"),
         });
         why.is_none()
@@ -74,7 +82,7 @@ pub fn key(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, ctx: &st
     if std::env::temp_dir().join("tombox_shader_override").join(format!("{hash:016x}.hlsl")).exists() {
         return None;
     }
-    let ctx = format!("{ctx};{}", env_part());
+    let ctx = format!("v{KEY_VERSION};{ctx};{}", env_part());
     Some(key_with(TRANSLATOR, tombox_xshader::dxc::identity(), &ctx, blob, rtfmt, link))
 }
 
@@ -124,9 +132,31 @@ mod tests {
         let v = |k: &str| vec![(k.to_string(), "1".to_string())].into_iter();
         assert!(bypass_reason_from(v("TOMBOX_XS_STUB"), None).is_some());
         assert!(bypass_reason_from(v("TOMBOX_XS_DROP"), None).is_some());
+        assert!(bypass_reason_from(v("TOMBOX_INFER_ROOT_SIG"), None).is_some());
         assert!(bypass_reason_from(v("TOMBOX_CBRAW_CLAMP"), None).is_some());
         assert!(bypass_reason_from(v("TOMBOX_FRAME_CSV"), None).is_none());
         assert!(bypass_reason_from(v("TOMBOX_FRAME_CSV"), Some("0".into())).is_some());
         assert!(bypass_reason_from(std::iter::empty(), Some("1".into())).is_none());
+        assert!(bypass_reason_from(v("TOMBOX_XS_F16_NATIVE"), None).is_some());
+    }
+
+    #[test]
+    fn env_keys_change_only_with_a_key_version_bump() {
+        let unset: String = ENV_KEYS.iter().map(|k| format!("{k}=;")).collect();
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in format!("v{KEY_VERSION};{unset}").bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        assert_eq!((KEY_VERSION, h), (2, PINNED_ENV_HASH), "ENV_KEYS or KEY_VERSION changed: bump KEY_VERSION and re-pin PINNED_ENV_HASH to {h:#018x} in the same change");
+        assert!(!ENV_KEYS.iter().any(|k| k.starts_with("TOMBOX_XS_") || k.starts_with("TOMBOX_CBRAW_")), "TOMBOX_XS_* and TOMBOX_CBRAW_* bypass the index, they never belong in ENV_KEYS");
+    }
+
+    const PINNED_ENV_HASH: u64 = 0x569816d392b976da;
+
+    #[test]
+    fn translator_tag_is_embedded() {
+        let t = unsafe { core::ptr::read_volatile(&TRANSLATOR_TAG) };
+        assert_eq!(tombox_xshader::pack_key::find_translator_tag(&t).as_deref(), Some(TRANSLATOR));
     }
 }

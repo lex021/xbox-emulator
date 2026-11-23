@@ -75,8 +75,16 @@ fn with<R>(index: usize, f: impl FnOnce(&mut Pool, u32) -> R) -> R {
     f(p, sh)
 }
 
+fn reported_hysteresis(pages: u32, shift: u32) -> u64 {
+    if shift == SHIFT_19041 {
+        u64::from(pages << shift)
+    } else {
+        u64::from(pages) << shift
+    }
+}
+
 pub fn hysteresis_bytes(index: usize) -> u64 {
-    with(index, |p, sh| (p.hysteresis as u64) << sh)
+    with(index, |p, sh| reported_hysteresis(p.hysteresis, sh))
 }
 
 pub fn set_hysteresis(index: usize, bytes: usize) {
@@ -85,6 +93,7 @@ pub fn set_hysteresis(index: usize, bytes: usize) {
         while p.free.len() as u64 > p.hysteresis as u64 {
             let c = p.free.pop().unwrap();
             crate::epoch::bump_range(c, c + (1usize << sh));
+            crate::write_watch::forget(c);
             unsafe { VirtualFree(c as *mut c_void, 0, MEM_RELEASE) };
             p.released = p.released.wrapping_add(1);
         }
@@ -97,7 +106,7 @@ pub fn preallocate(index: usize) -> bool {
         let gran = 1usize << sh;
         let mut ok = true;
         while (p.free.len() as u64) < p.hysteresis as u64 {
-            let c = reserve_aligned(gran, gran, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            let c = crate::write_watch::reserve(gran, gran, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
             if c.is_null() {
                 ok = false;
                 break;
@@ -147,6 +156,15 @@ pub fn cached_count(index: usize) -> usize {
     with(index, |p, _| p.free.len())
 }
 
+pub fn total_cached_bytes() -> u64 {
+    let sh = SHIFT.load(Ordering::Acquire);
+    if sh == 0 {
+        return 0;
+    }
+    let g = POOLS.lock().unwrap_or_else(|p| p.into_inner());
+    g.iter().flatten().map(|p| (p.free.len() as u64) << sh).sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +182,15 @@ mod tests {
         assert_eq!(shift_for(22000, false), 0x13);
         assert_eq!(shift_for(22621, true), 0x15);
         assert_eq!((BIG_HYSTERESIS >> 0x16, SMALL_HYSTERESIS >> 0x16), (16, 2));
+    }
+
+    #[test]
+    fn hysteresis_report_width_at_four_gib() {
+        assert_eq!(reported_hysteresis(1023, SHIFT_19041), 0xffc0_0000);
+        assert_eq!(reported_hysteresis(1024, SHIFT_19041), 0);
+        assert_eq!(reported_hysteresis(1025, SHIFT_19041), 0x40_0000);
+        assert_eq!(reported_hysteresis(8192, SHIFT_SMALL), 1u64 << 32);
+        assert_eq!(reported_hysteresis(2048, SHIFT_LARGE), 1u64 << 32);
     }
 
     #[test]

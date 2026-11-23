@@ -241,7 +241,7 @@ impl<'a> Emitter<'a> {
         format!("    for (uint tb_k = 0u; tb_k < {n}u; tb_k++) tb_plw[tb_k] = tb_pl.w[tb_k];\n    s10 = {:#x}u; s11 = 0u;\n", MS_PAY_HI >> 4)
     }
 
-    pub(super) fn finish_amp(&mut self, mut h: String) -> Result<String, String> {
+    pub(super) fn finish_amp(&mut self, mut h: String, static_init: &str) -> Result<String, String> {
         let m = self.amp_info()?;
         if m.payload_bytes > MAX_PAYLOAD {
             return Err(format!("amplification payload of {} bytes exceeds the D3D12 limit {MAX_PAYLOAD}", m.payload_bytes));
@@ -258,6 +258,8 @@ impl<'a> Emitter<'a> {
             self.regs.insert(reg.to_string());
         }
         let _ = writeln!(h, "{}", self.reg_decls());
+        h.push_str(&self.ud_init());
+        h.push_str(static_init);
         let _ = writeln!(h, "    v0 = gtid.x; v1 = gtid.y; v2 = gtid.z;");
         let _ = writeln!(h, "    s2 = {:#x}u; s3 = {:#x}u; s4 = gid.x; tb_gidx = gid.x;", ARGS_HI << 24, PAY_HI << 24);
         let _ = writeln!(h, "    for (uint tb_k = gi; tb_k < 4u; tb_k += {threads}u) tb_args[tb_k] = 0u;");

@@ -21,7 +21,7 @@ extern "system" {
     fn GetModuleFileNameW(h: *mut c_void, buf: *mut u16, n: u32) -> u32;
 }
 
-fn module_path() -> Option<PathBuf> {
+pub(crate) fn module_path() -> Option<PathBuf> {
     let mut h: *mut c_void = std::ptr::null_mut();
     let mut buf = [0u16; 1024];
     let n = unsafe {
@@ -70,8 +70,16 @@ pub fn title_dir(title: &str) -> PathBuf {
     root().join("titles").join(title)
 }
 
+pub fn runtime_mode_path(title: &str) -> PathBuf {
+    title_dir(title).join("runtime_mode.txt")
+}
+
 pub fn src_dir(title: &str) -> PathBuf {
     title_dir(title).join("src")
+}
+
+pub fn game_scan_dir(title: &str) -> PathBuf {
+    title_dir(title).join("game_scan")
 }
 
 fn fnv(seed: u64, parts: &[&[u8]]) -> u64 {

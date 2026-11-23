@@ -143,7 +143,10 @@ unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u32, barriers
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, *const u8) =
         core::mem::transmute(REAL_BARRIER.load(Ordering::Relaxed));
-    f(this, n, barriers)
+    if !crate::depth_uav::barriers(this, n, barriers, f) {
+        f(this, n, barriers);
+    }
+    crate::placed_offset::after_barrier(this, n, barriers)
 }
 
 pub fn note_shim(real: *mut c_void, shim: *mut c_void, debug_umd: bool) {

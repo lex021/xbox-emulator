@@ -361,37 +361,39 @@ fn take(i: usize, n: u32) -> u32 {
 }
 
 unsafe fn resolve(list: *mut c_void, heap: *mut c_void, start: u32, n: u32, dst: usize, off: u64) {
-    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut c_void, u64) = unsafe { core::mem::transmute(vslot(list, PC_RESOLVE_QUERY_DATA)) };
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut c_void, u64) = unsafe { core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_RESOLVE_QUERY_DATA)) };
     unsafe { f(list, heap, QUERY_TYPE_TIMESTAMP, start, n, dst as *mut c_void, off) };
 }
 
 unsafe fn copy(list: *mut c_void, dst: usize, doff: u64, src: usize, soff: u64, n: u64) {
-    let f: unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64) = unsafe { core::mem::transmute(vslot(list, PC_COPY_BUFFER_REGION)) };
+    let f: unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64) = unsafe { core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_COPY_BUFFER_REGION)) };
     unsafe { f(list, dst, doff, src, soff, n) };
 }
 
 unsafe fn bind(list: *mut c_void, p: Pipe, s: Scratch) {
     unsafe {
-        let srs: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(vslot(list, PC_SET_COMPUTE_ROOT_SIGNATURE));
+        let srs: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_COMPUTE_ROOT_SIGNATURE));
         srs(list, p.rs as *mut c_void);
-        let spso: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(vslot(list, PC_SET_PSO));
+        let spso: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_PSO));
         spso(list, p.pso as *mut c_void);
-        let su: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(vslot(list, PC_SET_COMPUTE_ROOT_UAV));
+        let su: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_COMPUTE_ROOT_UAV));
         su(list, 1, s.va);
     }
 }
 
 unsafe fn dispatch(list: *mut c_void, cal: &Calibration, base: u32, count: u32) {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::QUERY) };
     let k = constants(cal, base, count);
     unsafe {
-        let sc: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32) = core::mem::transmute(vslot(list, PC_SET_COMPUTE_ROOT_CONSTANTS));
+        let sc: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_COMPUTE_ROOT_CONSTANTS));
         sc(list, 0, 10, k.as_ptr(), 0);
-        let d: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = core::mem::transmute(vslot(list, PC_DISPATCH));
+        let d: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_DISPATCH));
         d(list, count.div_ceil(GROUP), 1, 1);
     }
 }
 
 pub unsafe fn emit(list: *mut c_void, heap: *mut c_void, start: u32, n: u32, dst: usize, off: u64, dst_state: Option<u32>) -> bool {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::QUERY) };
     if n == 0 {
         return true;
     }
@@ -413,7 +415,7 @@ pub unsafe fn emit(list: *mut c_void, heap: *mut c_void, start: u32, n: u32, dst
     };
     unsafe {
         let paused = crate::cl2_state::pause_queries(list, false);
-        let pred: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u32) = core::mem::transmute(vslot(list, PC_SET_PREDICATION));
+        let pred: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_PREDICATION));
         pred(list, core::ptr::null_mut(), 0, 0);
         for (i, cnt) in chunks(n, RING) {
             let base = take(scratch_index(ty), cnt);
