@@ -173,18 +173,114 @@ pub fn patch_rts0_with(b: &mut [u8], roots: bool) -> Result<RsPatch, String> {
     Ok(p)
 }
 
-fn expand_scarlett_graphics_table(blob: &[u8]) -> Option<Vec<u8>> {
+/// Diagnostic for the footage/table expansion path: which branch matched, which
+/// root parameter holds the shader-local table, and how many slots it exposes.
+/// `TOMBOX_SR_TRACE` caps the number of lines so a long run stays readable.
+fn trace_enabled() -> bool {
+    static T: OnceLock<bool> = OnceLock::new();
+    *T.get_or_init(|| std::env::var("TOMBOX_SR_TRACE").map(|v| v.trim() != "0").unwrap_or(true))
+}
+
+fn trace_limit() -> usize {
+    static L: OnceLock<usize> = OnceLock::new();
+    *L.get_or_init(|| {
+        std::env::var("TOMBOX_SR_TRACE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(24)
+    })
+}
+
+fn trace_once(key: u64) -> bool {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<u64>>> = std::sync::Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let set = g.get_or_insert_with(std::collections::HashSet::new);
+    if set.len() >= trace_limit() || !set.insert(key) {
+        if set.len() >= trace_limit() && !set.contains(&key) {
+            return false;
+        }
+        return set.contains(&key) && set.len() <= trace_limit();
+    }
+    true
+}
+
+/// Whether the root-signature trace is enabled. Shared with the console-path
+/// caller so both hooks print the same run.
+pub(crate) fn trace_on() -> bool {
+    trace_enabled()
+}
+
+pub(crate) fn expand_scarlett_graphics_table(blob: &[u8]) -> Option<Vec<u8>> {
     use tombox_xshader::meta::{
-        scarlett_graphics_table_slots, scarlett_media_table, SCARLETT_MEDIA_SAMPLERS,
-        SCARLETT_MEDIA_UAV_SLOT, SCARLETT_PACKED_CBV_REGISTER, SCARLETT_PACKED_SRV_REGISTER,
+        scarlett_footage_table, scarlett_graphics_table, scarlett_media_table, scarlett_packed_graphics_table,
+        SCARLETT_MEDIA_SAMPLERS, SCARLETT_PACKED_CBV_REGISTER,
+        SCARLETT_PACKED_SRV_REGISTER,
     };
-    let (offset, length) = crate::console_slots_mesh::rts0_range(blob)?;
+    let (offset, length) = match crate::console_slots_mesh::rts0_range(blob) {
+        Some(v) => v,
+        None => {
+            if trace_enabled() {
+                record("d3d12_xs", "cbv_raw", "SR trace: root signature blob carries no RTS0 part; no table expansion");
+            }
+            return None;
+        }
+    };
     let rts = blob.get(offset..offset.checked_add(length)?)?;
-    let root = tombox_xshader::meta::parse_rts0(rts).ok()?;
-    let slots = scarlett_graphics_table_slots(&root)?;
+    let root = match tombox_xshader::meta::parse_rts0(rts) {
+        Ok(r) => r,
+        Err(e) => {
+            if trace_enabled() {
+                record("d3d12_xs", "cbv_raw", &format!("SR trace: RTS0 does not parse ({e}); no table expansion"));
+            }
+            return None;
+        }
+    };
+    let (param, slots) = match scarlett_graphics_table(&root) {
+        Some(v) => v,
+        None => {
+            if trace_enabled() {
+                use tombox_xshader::meta::RootParamKind;
+                let shape: Vec<String> = root.params.iter().enumerate().map(|(i, p)| match &p.kind {
+                    RootParamKind::Table(rs) => format!(
+                        "p{i}:table[vis={} {} ranges: {}]",
+                        p.visibility,
+                        rs.len(),
+                        rs.iter().map(|r| format!("t{}b{}s{}{}", r.range_type, r.base_register, r.space, if r.num != 1 { format!("x{}", r.num) } else { String::new() })).collect::<Vec<_>>().join(",")
+                    ),
+                    RootParamKind::Constants { register, space, num32 } => format!("p{i}:const[b{register}s{space}n{num32}]"),
+                    RootParamKind::Descriptor { kind, register, space } => format!("p{i}:desc[k{kind}b{register}s{space}]"),
+                }).collect();
+                let key = crate::shader_xlat::fnv1a(rts) ^ 0x5eed_0000_0000_0000;
+                if trace_once(key) {
+                    record("d3d12_xs", "cbv_raw", &format!(
+                        "SR shape: flags={:#x} samplers={} rts0={:016x} | {}",
+                        root.flags, root.num_static_samplers, crate::shader_xlat::fnv1a(rts), shape.join(" ")));
+                }
+            }
+            return None;
+        }
+    };
     let media = scarlett_media_table(&root);
+    if trace_enabled() {
+        let branch = if media {
+            "media(param 0, 8 slots)"
+        } else if scarlett_packed_graphics_table(&root) {
+            "packed-graphics(param 0)"
+        } else if scarlett_footage_table(&root) {
+            "footage(param 1, 8 slots)"
+        } else {
+            "?"
+        };
+        let key = crate::shader_xlat::fnv1a(rts);
+        if trace_once(key) {
+            record("d3d12_xs", "cbv_raw", &format!(
+                "SR trace: expanding {branch} for RTS0 {key:016x} (version={} flags={:#x} params={} len={length})",
+                root.version, root.flags, root.params.len()));
+        }
+    }
     let params = rd(rts, 8).ok()? as usize;
-    let table = rd(rts, params + 8).ok()? as usize;
+    let table = rd(rts, params + param * 12 + 8).ok()? as usize;
     let ranges = rd(rts, table + 4).ok()? as usize;
     let mut expanded = rts.to_vec();
     let num_ranges = rd(rts, table).ok()?;
@@ -199,7 +295,10 @@ fn expand_scarlett_graphics_table(blob: &[u8]) -> Option<Vec<u8>> {
         }
     }
     if media {
-        for word in [1, 1, SCARLETT_MEDIA_UAV_SLOT, 1, 1, SCARLETT_MEDIA_UAV_SLOT] {
+        // The serialized media signature describes only its first CBV, while
+        // FSSM can assign a UAV to any of the packed slots (the observed
+        // TrailMap clear shader uses slots 0 and 1, not only slot 4).
+        for word in [1, slots, 0, 1, 1, 0] {
             expanded.extend_from_slice(&word.to_le_bytes());
         }
         let sampler_offset = expanded.len() as u32;
@@ -348,6 +447,7 @@ unsafe extern "system" fn create_cbv(this: *mut c_void, pdesc: *const u8, dest: 
     if !pdesc.is_null() {
         let va = unsafe { core::ptr::read_unaligned(pdesc.cast::<u64>()) };
         let bytes = unsafe { core::ptr::read_unaligned(pdesc.add(8).cast::<u32>()) };
+        crate::bindtrace::trace_raw_cbv_request(dest, va, bytes);
         unsafe { crate::heap_wrap::mirror_scarlett_cbv(dest, va, bytes) };
     }
     if !enabled() && !copy_on() {

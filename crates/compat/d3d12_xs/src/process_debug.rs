@@ -3,6 +3,45 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use compat_common::record;
 
 static TRACE_NATIVE_AV: AtomicBool = AtomicBool::new(false);
+static DESC_GUARD_PAGE: AtomicUsize = AtomicUsize::new(0);
+static DESC_GUARD_USED: AtomicBool = AtomicBool::new(false);
+
+extern "system" {
+    fn VirtualProtect(address: *mut c_void, size: usize, protect: u32, old: *mut u32) -> i32;
+}
+
+/// One diagnostic guard-page access. Windows removes PAGE_GUARD on the first
+/// access, so reads can consume it before a write. Never rearm in the handler.
+pub(crate) unsafe fn arm_descriptor_guard(cpu: usize) {
+    if std::env::var_os("TOMBOX_TEST_DESCRIPTOR_GUARD").is_none() || DESC_GUARD_USED.swap(true, Ordering::AcqRel) { return; }
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| unsafe { AddVectoredExceptionHandler(1, descriptor_guard_exception); });
+    let page = cpu & !0xfff;
+    DESC_GUARD_PAGE.store(page, Ordering::Release);
+    let mut old = 0;
+    let ok = unsafe { VirtualProtect(page as *mut c_void, 4096, 0x104, &mut old) };
+    if ok == 0 { DESC_GUARD_PAGE.store(0, Ordering::Release); }
+    record("d3d12_xs", "descriptor_guard", &format!("one-shot page={page:#x} target={cpu:#x} armed={} old_protect={old:#x}; first access may be a read", ok != 0));
+}
+
+unsafe extern "system" fn descriptor_guard_exception(info: *const [usize; 2]) -> i32 {
+    if info.is_null() { return 0; }
+    let [exception, context] = unsafe { *info };
+    if exception == 0 || context == 0 { return 0; }
+    let fields = exception as *const usize;
+    if unsafe { *fields as u32 } != 0x8000_0001 { return 0; }
+    let address = unsafe { *fields.add(2) };
+    let action = unsafe { *fields.add(4) };
+    let target = unsafe { *fields.add(5) };
+    let page = DESC_GUARD_PAGE.load(Ordering::Acquire);
+    if page == 0 || target & !0xfff != page || DESC_GUARD_PAGE.compare_exchange(page, 0, Ordering::AcqRel, Ordering::Acquire).is_err() { return 0; }
+    let msg = format!("DescriptorGuard first-access rip={address:#x} target={target:#x} action={action} (0=read, 1=write, 8=execute); guard consumed\n");
+    let mut written = 0;
+    unsafe { WriteFile(GetStdHandle((-12i32) as u32), msg.as_ptr(), msg.len() as u32, &mut written, core::ptr::null_mut()) };
+    let stack = unsafe { exception_stack(context, address) };
+    unsafe { WriteFile(GetStdHandle((-12i32) as u32), stack.as_ptr(), stack.len() as u32, &mut written, core::ptr::null_mut()) };
+    -1
+}
 thread_local! {
     static DESCRIPTOR_COPY: core::cell::Cell<Option<[usize; 6]>> = const { core::cell::Cell::new(None) };
 }

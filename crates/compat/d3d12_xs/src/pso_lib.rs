@@ -478,6 +478,19 @@ fn lib(real: *mut c_void) -> Option<&'static Lib> {
     LIB.get_or_init(|| unsafe { open(real) }).as_ref()
 }
 
+pub(crate) fn offline_dir(real: *mut c_void) -> Option<&'static std::path::Path> {
+    if !enabled() {
+        return None;
+    }
+    lib(real)?.path.parent()
+}
+
+pub(crate) fn save_offline() -> Result<(), String> {
+    let report = save(false)?;
+    record("d3d12_xs", "pso_offline", &format!("{report}; {}", summary()));
+    Ok(())
+}
+
 pub fn warm(real: *mut c_void, wrapper: *mut c_void) {
     if !enabled() || real.is_null() || LIB.get().is_some() {
         return;

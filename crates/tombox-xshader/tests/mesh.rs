@@ -329,6 +329,30 @@ fn mesh_typed_buffer_load_uses_root_table_range() {
 }
 
 #[test]
+fn mesh_fssm_table_slots_follow_the_eight_system_sgprs() {
+    let mut words = vec![0xf408_0008, 0xfa00_0020, 0xe000_2000, 0x8000_0101];
+    words.extend(console_ms(3, 1, 0));
+    let mut shader = ms(&words, mesh_info(128, 128, 128, 2), pos_param_outs());
+    let mut f = vec![0u8; 0x100];
+    f[0..4].copy_from_slice(b"FSSM");
+    f[0xD6] = 9;
+    f[0x58..0x60].copy_from_slice(&0xB0u64.to_le_bytes());
+    f[0xE8..0xF0].copy_from_slice(&0xF0u64.to_le_bytes());
+    f[0xF0..0xF8].copy_from_slice(&0x104u64.to_le_bytes());
+    f[0xF8..0xFC].copy_from_slice(&1u32.to_le_bytes());
+    f[0xFC..0x100].copy_from_slice(&1u32.to_le_bytes());
+    for w in [3u32, 0, 1, 0, 8, 0x300, 8, 7, 4, 0x0804] {
+        f.extend_from_slice(&w.to_le_bytes());
+    }
+    shader.fssm = f;
+    assert!(translate(&shader).is_err());
+    let translated = tombox_xshader::translate_with_fssm_root(&shader).unwrap_or_else(|e| panic!("FSSM table translation failed: {e}"));
+    assert!(translated.hlsl.contains("Buffer<"), "{}", translated.hlsl);
+    assert!(translated.hlsl.contains("register(t7)"), "{}", translated.hlsl);
+    assert!(dxc::compile(&translated.hlsl, &dxc::profile_for(translated.profile)).is_ok());
+}
+
+#[test]
 fn mesh_root_signature_inference_binds_scalar_buffer_load() {
     let mut words = vec![sop1(3, 0, 16), sop1(3, 28, 0), 0xf420_000e, 0xfa00_0000];
     words.extend(console_ms(3, 1, 0));

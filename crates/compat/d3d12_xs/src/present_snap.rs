@@ -8,7 +8,13 @@ pub fn dir() -> Option<String> {
 }
 
 pub fn wanted(frame: u64) -> bool {
-    dir().is_some() && (SNAP_FRAMES.contains(&frame)
+    static FRAMES: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let frames = FRAMES.get_or_init(|| {
+        std::env::var("TOMBOX_PRESENT_SNAP_FRAMES").ok()
+            .and_then(|s| s.split(',').map(|f| f.trim().parse().ok()).collect::<Option<Vec<_>>>())
+            .unwrap_or_else(|| SNAP_FRAMES.to_vec())
+    });
+    dir().is_some() && (frames.contains(&frame)
         || (frame == 1 && std::env::var_os("TOMBOX_PRESENT_SNAP_FIRST").is_some()))
 }
 

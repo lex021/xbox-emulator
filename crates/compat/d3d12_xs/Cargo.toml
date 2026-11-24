@@ -14,8 +14,6 @@ path = "src/lib.rs"
 compat-common = { path = "../compat-common" }
 xgs-kmd-emu = { path = "../xgs-kmd-emu" }
 tombox-xshader = { path = "../../tombox-xshader" }
-
-[dev-dependencies]
 miniz_oxide = "0.8"
 
 [target.'cfg(windows)'.build-dependencies]

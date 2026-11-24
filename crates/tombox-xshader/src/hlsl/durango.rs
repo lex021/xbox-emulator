@@ -267,8 +267,40 @@ fn soft_score(d: &SSharp, s: &StaticSampler) -> u32 {
     n
 }
 
-fn same_state(a: &StaticSampler, b: &StaticSampler) -> bool {
+pub(super) fn same_state(a: &StaticSampler, b: &StaticSampler) -> bool {
     StaticSampler { register: 0, space: 0, visibility: 0, ..*a } == StaticSampler { register: 0, space: 0, visibility: 0, ..*b }
+}
+
+pub fn literal_mismatch(d: &SSharp, w3: u32, s: &StaticSampler) -> Option<String> {
+    let addr = [s.address_u, s.address_v, s.address_w];
+    if addr != d.addr {
+        return Some(format!("address modes {addr:?}, literal {:?}", d.addr));
+    }
+    let reduction = (s.filter >> 7) & 3;
+    if reduction != d.reduction {
+        return Some(format!("filter reduction {reduction}, literal {}", d.reduction));
+    }
+    if reduction == 1 && s.comparison_func != d.cmp_func {
+        return Some(format!("comparison function {}, literal {}", s.comparison_func, d.cmp_func));
+    }
+    let basic = s.filter & 0x7f;
+    match (d.filter, d.max_aniso) {
+        (Some(_), Some(a)) if basic & 0x40 == 0 || s.max_anisotropy != a => return Some(format!("filter {basic:#x} anisotropy {}, literal anisotropic x{a}", s.max_anisotropy)),
+        (Some(f), None) if basic != f => return Some(format!("filter {basic:#x}, literal {f:#x}")),
+        _ => {}
+    }
+    if addr.contains(&4) {
+        let ok = match w3 >> 30 {
+            0 => s.border_color == 0,
+            1 => matches!(s.border_color, 1 | 3),
+            2 => matches!(s.border_color, 2 | 4),
+            _ => false,
+        };
+        if !ok {
+            return Some(format!("border colour {}, literal border type {}", s.border_color, w3 >> 30));
+        }
+    }
+    None
 }
 
 pub fn pick_static_sampler(d: &SSharp, cands: &[StaticSampler]) -> Result<usize, String> {

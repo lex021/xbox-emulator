@@ -125,7 +125,7 @@ extern "system" {
 /// (`FXboxCommonGDKWindow::Initialize`, EXE+0x10d0dc3 `CreateWindowExW`), so presentation
 /// goes there rather than into a second window. Picks the largest visible, unowned
 /// top-level window of this process.
-unsafe fn find_title_window() -> usize {
+pub(crate) unsafe fn find_title_window() -> usize {
     unsafe extern "system" fn cb(h: *mut c_void, l: isize) -> i32 {
         let best = &mut *(l as *mut (usize, i64));
         let mut pid = 0u32;
@@ -790,7 +790,10 @@ unsafe fn present_x_body(queue: *mut c_void, plane_count: u32, planes: *const u8
             if st.frames == 2 || st.frames % 300 == 0 {
                 crate::timestamp::check_clock(queue, REAL_QVT[16].load(Ordering::Relaxed), REAL_QVT[17].load(Ordering::Relaxed));
             }
-            if st.frames <= 3 || st.frames % 300 == 0 {
+            static TRACE_ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if st.frames <= 3 || st.frames % 300 == 0
+                || *TRACE_ALL.get_or_init(|| std::env::var_os("TOMBOX_PRESENT_TRACE_ALL").is_some_and(|v| v == "1"))
+            {
                 record("d3d12_xs", "PresentX", &format!(
                     "frame {} presented ({}x{} fmt={})", st.frames, st.width, st.height, st.format));
             }

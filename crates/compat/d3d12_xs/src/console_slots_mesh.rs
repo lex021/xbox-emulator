@@ -161,6 +161,14 @@ pub unsafe fn root_data(root: *mut c_void) -> Option<Vec<u8>> {
     Some(body)
 }
 
+pub(crate) unsafe fn translation_root_data(root: *mut c_void) -> Option<std::sync::Arc<[u8]>> {
+    let info = crate::pso_lib::root_info(root as usize);
+    if let Some((_, blob, false)) = &info {
+        return Some(blob.clone());
+    }
+    unsafe { root_data(root) }.map(std::sync::Arc::from).or_else(|| info.map(|(_, blob, _)| blob))
+}
+
 type RsFn = unsafe extern "system" fn(*mut c_void, u32, *const u8, usize, *const c_void, *mut *mut c_void) -> i32;
 
 unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, blob: *const u8, len: usize, riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
@@ -174,8 +182,37 @@ unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, bl
     }
     let b = unsafe { core::slice::from_raw_parts(blob, len) };
     let flags = console_root_flags(b);
-    let pc = pc_root_blob(b);
-    let (ptr, size) = pc.as_ref().map_or((blob, len), |p| (p.as_ptr(), p.len()));
+    // The console serializes only the first pair of a packed descriptor table;
+    // the shader-local slots the splash and footage pixel shaders read are
+    // implicit. Expanding here, before the PC blob is built, is the only place
+    // the title's signatures pass through.
+    let expanded = crate::cbv_raw::expand_scarlett_graphics_table(b);
+    if crate::cbv_raw::trace_on() {
+        let shape = match crate::console_slots_mesh::rts0_range(b) {
+            None => "no RTS0 range".to_string(),
+            Some((o, n)) => match b.get(o..o.saturating_add(n)).map(tombox_xshader::meta::parse_rts0) {
+                None => format!("RTS0 range {o:#x}+{n} out of bounds"),
+                Some(Err(e)) => format!("RTS0 does not parse: {e}"),
+                Some(Ok(root)) => {
+                    use tombox_xshader::meta::RootParamKind;
+                    let ps: Vec<String> = root.params.iter().enumerate().map(|(i, p)| match &p.kind {
+                        RootParamKind::Table(rs) => format!(
+                            "p{i}:table[{}]",
+                            rs.iter().map(|r| format!("t{}b{}s{}{}", r.range_type, r.base_register, r.space, if r.num != 1 { format!("x{}", r.num) } else { String::new() })).collect::<Vec<_>>().join(",")),
+                        RootParamKind::Constants { register, space, num32 } => format!("p{i}:const[b{register}s{space}n{num32}]"),
+                        RootParamKind::Descriptor { kind, register, space } => format!("p{i}:desc[k{kind}b{register}s{space}]"),
+                    }).collect();
+                    format!("flags={:#x} samplers={} | {}", root.flags, root.num_static_samplers, ps.join(" "))
+                }
+            },
+        };
+        record("d3d12_xs", "console_slots_mesh", &format!(
+            "SR path: console create_root_signature len={len} xbox_flags={flags:?} expanded={} {shape}",
+            expanded.as_ref().map_or("no".to_string(), |e| format!("{}B", e.len()))));
+    }
+    let src = expanded.as_deref().unwrap_or(b);
+    let pc = pc_root_blob(src);
+    let (ptr, size) = pc.as_ref().map_or((src.as_ptr(), src.len()), |p| (p.as_ptr(), p.len()));
     let extended = flags.filter(|&fl| crate::rs_xbox::XboxRoot(fl).internal_xdxr())
         .and_then(|_| unsafe {
             crate::global_bind::create_root(ptr, size, riid, ppv, |p, n| f(this, mask, p, n, riid, ppv))
@@ -207,7 +244,11 @@ unsafe extern "system" fn create_pipeline_state(this: *mut c_void, desc: *const 
         return E_INVALIDARG;
     }
     let real = unsafe { crate::device_wrap::real_device(this) };
-    unsafe { crate::mesh_pso::create_pipeline_state(real, desc, riid, ppv) }
+    let hr = unsafe { crate::mesh_pso::create_pipeline_state(real, desc, riid, ppv) };
+    if hr < 0 && crate::device_wrap::pso_failure_trace() {
+        record("d3d12_xs", "pso_terminal", &format!("PipelineStream hr={hr:#010x}"));
+    }
+    hr
 }
 
 pub const NO_PSO: &str = "No pipeline state object is currently bound to the pipeline.";

@@ -251,6 +251,10 @@ pub struct StaticSampler {
     pub visibility: u32,
 }
 
+/// Maximum number of static samplers in a D3D12 root signature.
+/// Defined by the D3D12 specification as D3D12_REQ_ROOT_COMMAND_LIST_DESCRIPTOR_STATIC_SAMPLERS = 2032.
+pub const D3D12_REQ_ROOT_COMMAND_LIST_DESCRIPTOR_STATIC_SAMPLERS: u32 = 2032;
+
 /// The Scarlett packed graphics table uses shader-local descriptor types and
 /// register numbers. The serialized signature only describes its first pair.
 pub const SCARLETT_PACKED_TABLE_SLOTS: u32 = 7;
@@ -258,17 +262,47 @@ pub const SCARLETT_PACKED_SRV_REGISTER: u32 = 32;
 pub const SCARLETT_PACKED_CBV_REGISTER: u32 = 16;
 pub const SCARLETT_MEDIA_UAV_SLOT: u32 = 4;
 
+/// Flags the compiler emits on Scarlett root signatures. They combine freely
+/// across the signatures a single title creates, so every check below tests
+/// bits rather than comparing the whole word: a run over 103 distinct
+/// signatures produced `0x0`, `0x1`, `0x400`, `0x401`, `0x800`, `0x801`,
+/// `0xc00`, `0xc01` and `0x3000000` for otherwise identical tables.
+const FLAG_ALLOW_INPUT_ASSEMBLER: u32 = 0x1;
+#[allow(dead_code)]
+const FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS: u32 = 0x8;
+#[allow(dead_code)]
+const FLAG_DENY_HULL_SHADER_ROOT_ACCESS: u32 = 0x10;
+#[allow(dead_code)]
+const FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS: u32 = 0x20;
+#[allow(dead_code)]
+const FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS: u32 = 0x40;
+#[allow(dead_code)]
+const FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS: u32 = 0x80;
+/// Set when the signature declares overrides the console-only compiler needs.
+const FLAG_CONSOLE_OVERRIDE: u32 = 0x3000000;
+
+fn ranges_in(ranges: &[RootRange], space: u32) -> impl Iterator<Item = &RootRange> {
+    ranges.iter().filter(move |r| r.space == space)
+}
+
+fn has_range(ranges: &[RootRange], kind: u32, register: u32, space: u32) -> bool {
+    ranges.iter().any(|r| r.range_type == kind && r.base_register == register && r.space == space)
+}
+
+/// The packed graphics table keeps a handful of shader-local descriptors in a
+/// single unbounded-looking table. RTS0 only describes its first pair, so the
+/// shape test is the table + trailing constants layout, not the exact contents.
 pub fn scarlett_packed_graphics_table(root: &RootSig) -> bool {
     let [table, constants] = root.params.as_slice() else { return false };
     let RootParamKind::Table(ranges) = &table.kind else { return false };
-    let [srv, cbv] = ranges.as_slice() else { return false };
-    root.version == 2 && root.flags == 0x801 && root.num_static_samplers == 0
+    root.version == 2
+        && root.flags & FLAG_ALLOW_INPUT_ASSEMBLER != 0
+        && root.flags & FLAG_CONSOLE_OVERRIDE == 0
+        && root.num_static_samplers == 0
         && table.visibility == 0 && constants.visibility == 0
         && matches!(constants.kind, RootParamKind::Constants { register: 500, space: 0, num32: 2 })
-        && srv.range_type == 0 && srv.num == 1 && srv.base_register == 2 && srv.space == 1
-        && matches!(srv.offset_in_table, 0 | u32::MAX)
-        && cbv.range_type == 2 && cbv.num == 1 && cbv.base_register == 0 && cbv.space == 1
-        && matches!(cbv.offset_in_table, 1 | u32::MAX)
+        && has_range(ranges, 0, 2, 1) && has_range(ranges, 2, 0, 1)
+        && ranges.iter().all(|r| r.space == 1 || r.space == 0)
 }
 
 /// The media pipeline uses the same packed table, with only b27 described
@@ -276,22 +310,51 @@ pub fn scarlett_packed_graphics_table(root: &RootSig) -> bool {
 pub fn scarlett_media_table(root: &RootSig) -> bool {
     let [table] = root.params.as_slice() else { return false };
     let RootParamKind::Table(ranges) = &table.kind else { return false };
-    let [cbv] = ranges.as_slice() else { return false };
-    root.version == 2 && root.flags == 1 && root.num_static_samplers == 0
-        && table.visibility == 0 && cbv.range_type == 2 && cbv.num == 1
-        && cbv.base_register == 27 && cbv.space == 1
-        && matches!(cbv.offset_in_table, 0 | u32::MAX)
+    root.version == 2
+        && root.flags & FLAG_ALLOW_INPUT_ASSEMBLER != 0
+        && root.flags & FLAG_CONSOLE_OVERRIDE == 0
+        && root.num_static_samplers == 0
+        && table.visibility == 0
+        && ranges.len() == 1
+        && has_range(ranges, 2, 27, 1)
+        && matches!(ranges[0].offset_in_table, 0 | u32::MAX)
 }
 
-pub fn scarlett_graphics_table_slots(root: &RootSig) -> Option<u32> {
+/// The footage pipelines put their shader-local descriptors in the second
+/// table. The CBV is b5 in PSV0 but can occupy slot 6 or 7 in the physical table.
+/// Entry point is the six-range space-1 table, which is unique to this family;
+/// the shared table and the static sampler count vary with the stage.
+pub fn scarlett_footage_table(root: &RootSig) -> bool {
+    let [shared, footage] = root.params.as_slice() else { return false };
+    let (RootParamKind::Table(shared_ranges), RootParamKind::Table(ranges)) =
+        (&shared.kind, &footage.kind) else { return false };
+    root.version == 2
+        && root.flags & FLAG_ALLOW_INPUT_ASSEMBLER != 0
+        && root.flags & FLAG_CONSOLE_OVERRIDE == 0
+        && shared.visibility == 0 && footage.visibility == 0
+        && ranges.len() == 6
+        && ranges_in(ranges, 1).count() == 6
+        && has_range(ranges, 2, 5, 1)
+        && has_range(ranges, 0, 83, 1) && has_range(ranges, 0, 82, 1)
+        && has_range(ranges, 0, 71, 1) && has_range(ranges, 0, 80, 1)
+        && has_range(ranges, 0, 78, 1)
+        && shared_ranges.iter().all(|r| r.space == 0)
+}
+
+pub fn scarlett_graphics_table(root: &RootSig) -> Option<(usize, u32)> {
     if scarlett_media_table(root) {
-        // Media shaders load a CBV descriptor at byte offset 0xe0 (slot 7).
-        Some(8)
+        Some((0, 8))
+    } else if scarlett_footage_table(root) {
+        Some((1, 8))
     } else if scarlett_packed_graphics_table(root) {
-        Some(SCARLETT_PACKED_TABLE_SLOTS)
+        Some((0, SCARLETT_PACKED_TABLE_SLOTS))
     } else {
         None
     }
+}
+
+pub fn scarlett_graphics_table_slots(root: &RootSig) -> Option<u32> {
+    scarlett_graphics_table(root).map(|(_, slots)| slots)
 }
 
 pub const SCARLETT_MEDIA_SAMPLERS: [(u32, [u32; 4]); 5] = [
@@ -317,7 +380,7 @@ pub(crate) fn scarlett_fssm_table_kind(
     for record in fssm.get(start..end)?.chunks_exact(20) {
         let source = u32_at(record, 0).ok()?;
         let location = u32_at(record, 16).ok()?;
-        if source >> 8 != 3 || location >> 8 != u32::from(table_sgpr)
+        if source >> 8 != 3 || (location >> 8) & 0xff != u32::from(table_sgpr)
             || u32_at(record, 4).ok()? != byte_offset / 4
         {
             continue;
@@ -345,6 +408,10 @@ pub fn parse_rts0(body: &[u8]) -> Result<RootSig, String> {
     let flags = u32_at(body, 20)?;
     if nparams > 64 {
         return Err(format!("implausible root parameter count {nparams}"));
+    }
+    let available_params = body.get(params_off..).map_or(0, |remaining| remaining.len() / 12);
+    if nparams > available_params {
+        return Err(format!("root signature has {nparams} root parameters but only {available_params} fit in RTS0"));
     }
     let v11 = version >= 2;
     let mut params = Vec::with_capacity(nparams);
@@ -389,30 +456,37 @@ pub fn parse_rts0(body: &[u8]) -> Result<RootSig, String> {
         };
         params.push(RootParam { visibility, kind });
     }
-    let mut static_samplers = Vec::new();
-    if num_static_samplers <= 64 {
-        if let Ok(so) = u32_at(body, 16) {
-            let stride = if version >= 3 { 56 } else { 52 };
-            for i in 0..num_static_samplers as usize {
-                let q = so as usize + i * stride;
-                if let (Ok(address_u), Ok(register), Ok(space), Ok(visibility)) = (u32_at(body, q + 4), u32_at(body, q + 40), u32_at(body, q + 44), u32_at(body, q + 48)) {
-                    let at = |o: usize| u32_at(body, q + o).unwrap_or(0);
-                    static_samplers.push(StaticSampler {
-                        filter: at(0),
-                        address_v: at(8),
-                        address_w: at(12),
-                        max_anisotropy: at(20),
-                        comparison_func: at(24),
-                        border_color: at(28),
-                        min_lod_bits: at(32),
-                        max_lod_bits: at(36),
-                        address_u,
-                        register,
-                        space,
-                        visibility,
-                    });
-                }
-            }
+    if num_static_samplers > D3D12_REQ_ROOT_COMMAND_LIST_DESCRIPTOR_STATIC_SAMPLERS {
+        return Err(format!(
+            "root signature static sampler count {num_static_samplers} exceeds D3D12 limit of {D3D12_REQ_ROOT_COMMAND_LIST_DESCRIPTOR_STATIC_SAMPLERS}"
+        ));
+    }
+    let mut static_samplers = Vec::with_capacity(num_static_samplers as usize);
+    if num_static_samplers > 0 {
+        let so = u32_at(body, 16)? as usize;
+        let stride = if version >= 3 { 56 } else { 52 };
+        let available = body.get(so..).map_or(0, |remaining| remaining.len() / stride);
+        if (num_static_samplers as usize) > available {
+            return Err(format!(
+                "root signature has {num_static_samplers} static samplers but only {available} fit in RTS0"
+            ));
+        }
+        for i in 0..num_static_samplers as usize {
+            let q = so + i * stride;
+            static_samplers.push(StaticSampler {
+                filter: u32_at(body, q)?,
+                address_u: u32_at(body, q + 4)?,
+                address_v: u32_at(body, q + 8)?,
+                address_w: u32_at(body, q + 12)?,
+                max_anisotropy: u32_at(body, q + 20)?,
+                comparison_func: u32_at(body, q + 24)?,
+                border_color: u32_at(body, q + 28)?,
+                min_lod_bits: u32_at(body, q + 32)?,
+                max_lod_bits: u32_at(body, q + 36)?,
+                register: u32_at(body, q + 40)?,
+                space: u32_at(body, q + 44)?,
+                visibility: u32_at(body, q + 48)?,
+            });
         }
     }
     Ok(RootSig { version, flags, params, num_static_samplers, static_samplers })
@@ -544,5 +618,176 @@ mod wide_table_tests {
             body.pop();
             assert!(parse_rts0(&body).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod static_sampler_tests {
+    use super::*;
+
+    fn build_rts0_with_samplers(
+        version: u32,
+        num_samplers: u32,
+        samplers_offset: u32,
+        extra_bytes: usize,
+    ) -> Vec<u8> {
+        let stride = if version >= 3 { 56 } else { 52 };
+        let total_size = (samplers_offset as usize)
+            .saturating_add((num_samplers as usize).saturating_mul(stride))
+            .saturating_add(extra_bytes);
+        let mut body = vec![0u8; total_size.max(24)];
+        body[0..4].copy_from_slice(&version.to_le_bytes());
+        body[4..8].copy_from_slice(&0u32.to_le_bytes()); // nparams = 0
+        body[8..12].copy_from_slice(&24u32.to_le_bytes()); // params_off = 24
+        body[12..16].copy_from_slice(&num_samplers.to_le_bytes());
+        body[16..20].copy_from_slice(&samplers_offset.to_le_bytes());
+        body[20..24].copy_from_slice(&0u32.to_le_bytes()); // flags = 0
+
+        for i in 0..num_samplers as usize {
+            let q = (samplers_offset as usize) + i * stride;
+            if q + stride <= body.len() {
+                // filter: 1
+                body[q..q + 4].copy_from_slice(&1u32.to_le_bytes());
+                // address_u: 2
+                body[q + 4..q + 8].copy_from_slice(&2u32.to_le_bytes());
+                // address_v: 3
+                body[q + 8..q + 12].copy_from_slice(&3u32.to_le_bytes());
+                // address_w: 4
+                body[q + 12..q + 16].copy_from_slice(&4u32.to_le_bytes());
+                // max_anisotropy: 16
+                body[q + 20..q + 24].copy_from_slice(&16u32.to_le_bytes());
+                // comparison_func: 5
+                body[q + 24..q + 28].copy_from_slice(&5u32.to_le_bytes());
+                // border_color: 1
+                body[q + 28..q + 32].copy_from_slice(&1u32.to_le_bytes());
+                // min_lod_bits: 0
+                body[q + 32..q + 36].copy_from_slice(&0u32.to_le_bytes());
+                // max_lod_bits: 1000
+                body[q + 36..q + 40].copy_from_slice(&1000u32.to_le_bytes());
+                // register: (i as u32)
+                body[q + 40..q + 44].copy_from_slice(&(i as u32).to_le_bytes());
+                // space: 0
+                body[q + 44..q + 48].copy_from_slice(&0u32.to_le_bytes());
+                // visibility: 0
+                body[q + 48..q + 52].copy_from_slice(&0u32.to_le_bytes());
+            }
+        }
+        body
+    }
+
+    #[test]
+    fn parses_boundary_static_sampler_counts() {
+        for version in [1, 2, 3] {
+            // Boundary cases: 0, 1, 64, 65, 2032
+            for &count in &[0, 1, 64, 65, 2032] {
+                let body = build_rts0_with_samplers(version, count, 24, 0);
+                let root = parse_rts0(&body).unwrap_or_else(|e| {
+                    panic!("v{version} with count {count} should parse, but failed: {e}")
+                });
+                assert_eq!(root.num_static_samplers, count);
+                assert_eq!(root.static_samplers.len(), count as usize);
+                if count > 0 {
+                    assert_eq!(root.static_samplers[0].filter, 1);
+                    assert_eq!(root.static_samplers[0].address_u, 2);
+                    assert_eq!(root.static_samplers[0].address_v, 3);
+                    assert_eq!(root.static_samplers[0].address_w, 4);
+                    assert_eq!(root.static_samplers[0].register, 0);
+                    let last = &root.static_samplers[(count - 1) as usize];
+                    assert_eq!(last.register, count - 1);
+                }
+            }
+
+            // Exceeding limit: 2033 must be rejected safely
+            let body_2033 = build_rts0_with_samplers(version, 2033, 24, 0);
+            let err = parse_rts0(&body_2033).unwrap_err();
+            assert!(
+                err.contains("exceeds D3D12 limit of 2032"),
+                "Expected D3D12 limit error, but got: {err}"
+            );
+
+            // Large/overflowing count
+            let mut body_overflow = build_rts0_with_samplers(version, 0, 24, 0);
+            body_overflow[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(parse_rts0(&body_overflow).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_static_samplers_and_malformed_offsets() {
+        for version in [1, 2, 3] {
+            // Truncation: 1 byte missing for count = 65
+            let mut body_65 = build_rts0_with_samplers(version, 65, 24, 0);
+            body_65.pop();
+            let err = parse_rts0(&body_65).unwrap_err();
+            assert!(err.contains("fit in RTS0"), "Error was: {err}");
+
+            // Truncation: 1 byte missing for count = 2032
+            let mut body_2032 = build_rts0_with_samplers(version, 2032, 24, 0);
+            body_2032.pop();
+            let err = parse_rts0(&body_2032).unwrap_err();
+            assert!(err.contains("fit in RTS0"), "Error was: {err}");
+
+            // Malformed offset pointing beyond buffer
+            let mut body_bad_offset = build_rts0_with_samplers(version, 1, 24, 0);
+            body_bad_offset[16..20].copy_from_slice(&0x10000u32.to_le_bytes());
+            let err = parse_rts0(&body_bad_offset).unwrap_err();
+            assert!(err.contains("fit in RTS0"), "Error was: {err}");
+
+            // Malformed offset at u32::MAX
+            let mut body_max_offset = build_rts0_with_samplers(version, 1, 24, 0);
+            body_max_offset[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+            let err = parse_rts0(&body_max_offset).unwrap_err();
+            assert!(err.contains("fit in RTS0"), "Error was: {err}");
+        }
+    }
+
+    #[test]
+    fn parses_combined_params_and_static_samplers() {
+        // 1 root constants param (12 bytes header at offset 24 + 12 bytes descriptor at offset 36)
+        // followed by 65 static samplers at offset 48
+        let version = 2u32;
+        let num_samplers = 65u32;
+        let samplers_offset = 48u32;
+        let stride = 52usize;
+        let total = (samplers_offset as usize) + (num_samplers as usize) * stride;
+        let mut body = vec![0u8; total];
+
+        body[0..4].copy_from_slice(&version.to_le_bytes());
+        body[4..8].copy_from_slice(&1u32.to_le_bytes()); // nparams = 1
+        body[8..12].copy_from_slice(&24u32.to_le_bytes()); // params_off = 24
+        body[12..16].copy_from_slice(&num_samplers.to_le_bytes());
+        body[16..20].copy_from_slice(&samplers_offset.to_le_bytes());
+        body[20..24].copy_from_slice(&0u32.to_le_bytes()); // flags = 0
+
+        // Param header at 24: ptype = 1 (Constants), visibility = 0, off = 36
+        body[24..28].copy_from_slice(&1u32.to_le_bytes());
+        body[28..32].copy_from_slice(&0u32.to_le_bytes());
+        body[32..36].copy_from_slice(&36u32.to_le_bytes());
+
+        // Constant descriptor at 36: register = 5, space = 0, num32 = 4
+        body[36..40].copy_from_slice(&5u32.to_le_bytes());
+        body[40..44].copy_from_slice(&0u32.to_le_bytes());
+        body[44..48].copy_from_slice(&4u32.to_le_bytes());
+
+        // Fill samplers
+        for i in 0..num_samplers as usize {
+            let q = (samplers_offset as usize) + i * stride;
+            body[q..q + 4].copy_from_slice(&1u32.to_le_bytes()); // filter
+            body[q + 40..q + 44].copy_from_slice(&(i as u32).to_le_bytes()); // register
+        }
+
+        let root = parse_rts0(&body).expect("combined signature should parse");
+        assert_eq!(root.params.len(), 1);
+        match &root.params[0].kind {
+            RootParamKind::Constants { register, space, num32 } => {
+                assert_eq!(*register, 5);
+                assert_eq!(*space, 0);
+                assert_eq!(*num32, 4);
+            }
+            _ => panic!("expected Constants param"),
+        }
+        assert_eq!(root.num_static_samplers, 65);
+        assert_eq!(root.static_samplers.len(), 65);
+        assert_eq!(root.static_samplers[64].register, 64);
     }
 }

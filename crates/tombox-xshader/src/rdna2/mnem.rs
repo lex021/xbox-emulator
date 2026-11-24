@@ -198,6 +198,7 @@ pub fn vop3(op: u32) -> Option<&'static str> {
         0x308 => "v_ashrrev_i16", 0x309 => "v_max_u16", 0x30a => "v_max_i16", 0x30b => "v_min_u16",
         0x30c => "v_min_i16", 0x30d => "v_add_nc_i16", 0x30e => "v_sub_nc_i16", 0x314 => "v_lshlrev_b16",
         0x311 => "v_pack_b32_f16", 0x312 => "v_cvt_pknorm_i16_f16", 0x313 => "v_cvt_pknorm_u16_f16",
+        0x342 => "v_interp_p1ll_f16", 0x343 => "v_interp_p1lv_f16", 0x35a => "v_interp_p2_f16",
         0x340 => "v_mad_u16", 0x35e => "v_mad_i16", 0x352 => "v_min3_i16", 0x353 => "v_min3_u16",
         0x355 => "v_max3_i16", 0x356 => "v_max3_u16", 0x358 => "v_med3_i16", 0x359 => "v_med3_u16",
         0x171 => "v_msad_u8", 0x14c => "v_fma_f64", 0x160 => "v_div_fixup_f64", 0x164 => "v_add_f64", 0x165 => "v_mul_f64",
@@ -242,6 +243,7 @@ pub fn sop1(op: u32) -> Option<&'static str> {
         0x27 => "s_andn2_saveexec_b64", 0x28 => "s_orn2_saveexec_b64", 0x29 => "s_nand_saveexec_b64",
         0x34 => "s_abs_i32", 0x37 => "s_andn1_saveexec_b64", 0x3c => "s_and_saveexec_b32",
         0x3d => "s_or_saveexec_b32", 0x3e => "s_xor_saveexec_b32", 0x3f => "s_andn2_saveexec_b32",
+        0x46 => "s_andn1_wrexec_b32", 0x47 => "s_andn2_wrexec_b32",
         _ => return None,
     })
 }
@@ -337,6 +339,10 @@ pub fn mubuf(op: u32) -> Option<&'static str> {
         0x37 => "buffer_atomic_smax", 0x38 => "buffer_atomic_umax", 0x39 => "buffer_atomic_and",
         0x3a => "buffer_atomic_or", 0x3b => "buffer_atomic_xor", 0x3c => "buffer_atomic_inc",
         0x3d => "buffer_atomic_dec",
+        0x80 => "buffer_load_format_d16_x", 0x81 => "buffer_load_format_d16_xy",
+        0x82 => "buffer_load_format_d16_xyz", 0x83 => "buffer_load_format_d16_xyzw",
+        0x84 => "buffer_store_format_d16_x", 0x85 => "buffer_store_format_d16_xy",
+        0x86 => "buffer_store_format_d16_xyz", 0x87 => "buffer_store_format_d16_xyzw",
         _ => return None,
     })
 }

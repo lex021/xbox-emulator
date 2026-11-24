@@ -585,12 +585,8 @@ pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], ri
         let k = stage_rtfmt(ty, (n, f));
         let k = if ty == SUB_PS { crate::centroid_bind::tag_rtfmt(root, k) } else { k };
         if root != 0 && crate::shader_xlat::needs_external_root_data(b) {
-            let pipeline_root = root_data.get_or_init(|| {
-                crate::pso_lib::root_info(root as usize)
-                    .filter(|(_, _, via_real)| !via_real)
-                    .map(|(_, blob, _)| blob.to_vec())
-                    .or_else(|| crate::console_slots_mesh::root_data(root as *mut c_void))
-                    .or_else(|| crate::pso_lib::root_info(root as usize).map(|(_, blob, _)| blob.to_vec()))
+            let pipeline_root = root_data.get_or_init(|| unsafe {
+                crate::console_slots_mesh::translation_root_data(root as *mut c_void)
             });
             if let Some(data) = pipeline_root {
                 return crate::shader_xlat::translate_with_pipeline_root(b, data, k, &link).map_err(|e| e.to_string());

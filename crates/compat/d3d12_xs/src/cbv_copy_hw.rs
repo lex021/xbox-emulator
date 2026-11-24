@@ -721,6 +721,22 @@ unsafe fn heap_handles(dev: usize) -> (usize, usize, u64) {
 #[test]
 #[ignore = "needs a D3D12 device; run: cargo test -p d3d12_xs --lib hw_cbv_copy -- --ignored --test-threads=1 (TOMBOX_HW_ADAPTER=warp for WARP)"]
 fn hw_cbv_copy_unaligned_descriptor_table_cbv_reads_through_a_raw_view_next_to_a_root_cbv() {
+    unaligned_descriptor_table_cbv(0);
+}
+
+#[test]
+#[ignore = "needs a D3D12 device; run with --ignored --test-threads=1"]
+fn hw_cbv_copy_descriptor_between_cpu_and_gpu_heaps_reads_correct_resource() {
+    unaligned_descriptor_table_cbv(1);
+}
+
+#[test]
+#[ignore = "needs a D3D12 device; run with --ignored --test-threads=1"]
+fn hw_cbv_copy_descriptor_through_xbox_device_wrapper() {
+    unaligned_descriptor_table_cbv(2);
+}
+
+fn unaligned_descriptor_table_cbv(mode: u8) {
     if skip() {
         return;
     }
@@ -753,7 +769,31 @@ fn hw_cbv_copy_unaligned_descriptor_table_cbv_reads_through_a_raw_view_next_to_a
     let (res, d) = crate::cbv_raw::raw_view(table_va, 368, &crate::gpu_va::lookup).expect("raw view of the table CBV");
     assert_eq!(res, src.res);
     let (heap, cpu, gpu_h) = unsafe { heap_handles(g.dev) };
-    unsafe { call!(g.dev, 18, (*mut c_void, *const u8, usize) -> (), res as *mut c_void, d.as_ptr(), cpu) };
+    if mode != 0 {
+        let hd = [0u32, 1, 0, 0]; // separate, non-shader-visible source heap
+        let mut source: *mut c_void = core::ptr::null_mut();
+        unsafe {
+            assert!(call!(g.dev, 14, (*const u32, *const Guid, *mut *mut c_void) -> i32, hd.as_ptr(), &IID_DESC_HEAP, &mut source) >= 0);
+            let mut source_cpu = 0usize;
+            let ret = call!(source, 9, (*mut usize) -> usize, &mut source_cpu);
+            if ret != &mut source_cpu as *mut usize as usize { source_cpu = ret; }
+            assert_ne!(source_cpu, cpu);
+            call!(g.dev, 18, (*mut c_void, *const u8, usize) -> (), res as *mut c_void, d.as_ptr(), source_cpu);
+            if mode == 2 {
+                crate::device_wrap::test_patch_descriptor_device(g.dev as *mut c_void);
+                let wrapper = crate::device_wrap::wrap_device(g.dev as *mut c_void);
+                assert!(crate::device_wrap::is_wrapper(wrapper));
+                let before = crate::device_wrap::TEST_DESCRIPTOR_COPY_CALLS.load(core::sync::atomic::Ordering::Relaxed);
+                call!(wrapper, 24, (u32, usize, usize, u32) -> (), 1, cpu, source_cpu, 0);
+                assert_eq!(crate::device_wrap::TEST_DESCRIPTOR_COPY_CALLS.load(core::sync::atomic::Ordering::Relaxed), before + 1, "copy must reach the real-device interceptor");
+            } else {
+                call!(g.dev, 24, (u32, usize, usize, u32) -> (), 1, cpu, source_cpu, 0);
+            }
+            call!(source, 2, () -> u32);
+        }
+    } else {
+        unsafe { call!(g.dev, 18, (*mut c_void, *const u8, usize) -> (), res as *mut c_void, d.as_ptr(), cpu) };
+    }
     let want: Vec<u8> = (0..CB_BYTES).map(|i| data[root_off + i] ^ data[table_off + i]).collect();
     let mut r = unsafe { run_new(g, LIST_DIRECT) };
     let l = r.list;
@@ -789,5 +829,5 @@ fn hw_cbv_copy_unaligned_descriptor_table_cbv_reads_through_a_raw_view_next_to_a
         let out = get(&f.rb, 0, CB_BYTES);
         same("root CBV ^ unaligned table CBV (raw view) output", &out, &want);
     }
-    eprintln!("table CBV at +{:#x} from 256 read through a raw SRV next to a real root CBV: {} bytes bit-exact", table_va % SLOT_ALIGN, CB_BYTES);
+    eprintln!("table CBV at +{:#x} from 256 read through a raw SRV next to a real root CBV: {} bytes bit-exact; mode={mode} (0=direct, 1=host copy, 2=wrapper copy)", table_va % SLOT_ALIGN, CB_BYTES);
 }

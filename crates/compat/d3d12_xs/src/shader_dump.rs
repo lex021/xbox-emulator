@@ -1,5 +1,5 @@
 use compat_common::record;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -38,6 +38,39 @@ fn dir() -> Option<&'static PathBuf> {
         Some(d)
     })
     .as_ref()
+}
+
+/// Each returned root belongs to this exact captured shader and render-target variant.
+pub(crate) fn captured_roots(blob: &[u8], hash: u64) -> Vec<([u8; 8], Vec<u8>)> {
+    type RootDump = ([u8; 8], u64, PathBuf, PathBuf);
+    static INDEX: OnceLock<HashMap<u64, Vec<RootDump>>> = OnceLock::new();
+    let Some(dir) = dir() else { return Vec::new() };
+    let index = INDEX.get_or_init(|| {
+        let mut index = HashMap::<u64, Vec<RootDump>>::new();
+        let Ok(files) = std::fs::read_dir(dir) else { return index };
+        for entry in files.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some((stem, hash_suffix)) = name.strip_suffix(".root").and_then(|name| name.rsplit_once('.')) else { continue };
+            let xbox = format!("{stem}.xbox");
+            let Some((shader_hash, rtfmt)) = crate::shader_xlat::parse_src_name(&xbox) else { continue };
+            let Ok(root_hash) = u64::from_str_radix(hash_suffix, 16) else { continue };
+            index.entry(shader_hash).or_default().push((rtfmt, root_hash, dir.join(xbox), entry.path()));
+        }
+        index
+    });
+    let mut candidates = Vec::new();
+    for (rtfmt, root_hash, xbox, root) in index.get(&hash).into_iter().flatten() {
+        let Ok(captured_shader) = std::fs::read(xbox) else { continue };
+        if captured_shader != blob {
+            continue;
+        }
+        let Ok(root) = std::fs::read(root) else { continue };
+        if fnv1a(&root) == *root_hash {
+            candidates.push((*rtfmt, root));
+        }
+    }
+    candidates
 }
 
 fn write_new(p: &std::path::Path, data: &[u8]) -> bool {

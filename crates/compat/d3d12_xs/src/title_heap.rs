@@ -291,6 +291,39 @@ pub fn buffer_view(buf: &Buffer, offset: u64, uav: bool) -> Option<[u8; 40]> {
     Some(b)
 }
 
+/// Construct a conservative Scarlett buffer record for already validated
+/// untyped byte-address or structured views. Typed views require a separate
+/// proof that component mapping and hardware format round-trip unchanged.
+pub fn encode_untyped_buffer(va: u64, stride: u32, records: u32) -> Option<[u32; 8]> {
+    if va == 0 || va >= (1u64 << 48) || stride >= (1 << 14) || records == 0 {
+        return None;
+    }
+    let mut words = [0u32; 8];
+    words[0] = va as u32;
+    words[1] = ((va >> 32) as u32) | (stride << 16);
+    words[2] = records;
+    words[3] = 0x0000_0fac; // selectors x,y,z,w encoded as 4,5,6,7
+    Some(words)
+}
+
+#[cfg(test)]
+#[test]
+fn untyped_scarlett_buffer_record_roundtrips_into_windows_view() {
+    let va = 0x1234_5678_9000;
+    for (stride, records) in [(0, 64), (16, 4)] {
+        let words = encode_untyped_buffer(va, stride, records).unwrap();
+        let Slot::Buffer(b) = decode_slot(FAMILY_SCARLETT, &words) else { panic!("not a buffer"); };
+        assert_eq!((b.va, b.stride, b.records), (va, stride, records));
+        let view = buffer_view(&b, 0, false).unwrap();
+        let field = |off| u32::from_le_bytes(view[off..off + 4].try_into().unwrap());
+        assert_eq!(field(0), if stride == 0 { 39 } else { 0 });
+        assert_eq!(field(24), if stride == 0 { 16 } else { 4 });
+        assert_eq!(field(28), stride);
+        assert_eq!(field(32), if stride == 0 { 1 } else { 0 });
+    }
+    assert!(encode_untyped_buffer(1u64 << 48, 16, 4).is_none());
+}
+
 pub fn accel_view(location: u64) -> [u8; 40] {
     let mut b = [0u8; 40];
     put32(&mut b, 4, 11);
@@ -816,10 +849,24 @@ fn root_of(list: usize, side: usize) -> Option<usize> {
 }
 
 pub fn on_table(list: usize, side: usize, param: u32, handle: u64) -> u64 {
+    on_table_for_root(list, param, handle, root_of(list, side))
+}
+
+pub(crate) fn compute_variant_table(list: usize, root: usize, param: u32, handle: u64) -> u64 {
+    // The command-list state records the PC handle after the title-heap hook.
+    let guest = heaps(|m| m.values().find_map(|h| {
+        let delta = handle.checked_sub(h.gpu)?;
+        let inc = u64::from(h.inc);
+        (inc != 0 && delta % inc == 0 && delta / inc < u64::from(h.num))
+            .then(|| h.slot0 + delta / inc * console_stride(h.ty))
+    }));
+    on_table_for_root(list, param, guest.unwrap_or(handle), Some(root))
+}
+
+fn on_table_for_root(list: usize, param: u32, handle: u64, rs: Option<usize>) -> u64 {
     let Some((heap, index, pc, ty)) = locate(handle) else {
         return handle;
     };
-    let rs = root_of(list, side);
     let ranges = rs.and_then(|rs| roots(|m| m.get(&rs).and_then(|l| l.tables.get(param as usize).cloned().flatten())));
     let new: Vec<Ref> = match ranges {
         Some(r) => r
@@ -1039,6 +1086,13 @@ unsafe extern "system" fn h_cmp_table(list: *mut c_void, i: u32, h: u64) {
 unsafe extern "system" fn h_gfx_table(list: *mut c_void, i: u32, h: u64) {
     let f: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(next(S_GTABLE));
     let table = on_table(list as usize, 1, i, h);
+    if i == 0 && std::env::var_os("TOMBOX_TRACE_FINAL_WRITER").is_some_and(|v| v == "1") {
+        let hashes = crate::cl2_state::bound_pso(list).and_then(crate::device_wrap::pso_summary)
+            .map(|(vs, ps, _)| (crate::shader_xlat::origin_hash(vs), crate::shader_xlat::origin_hash(ps)));
+        if hashes == Some((Some(0x7fda1be8fbc78299), Some(0xc1d5a4b8b07ccbce))) {
+            if let Some(cpu) = crate::bindtrace::scarlett_cpu_slot(table, 0) { crate::bindtrace::watch_descriptor_slot(cpu); }
+        }
+    }
     if i == 0 && root_of(list as usize, 1).is_some_and(|rs| roots(|m| {
         m.get(&rs).is_some_and(|l| l.scarlett_media)
     })) {
@@ -1062,12 +1116,37 @@ unsafe extern "system" fn h_gfx_table(list: *mut c_void, i: u32, h: u64) {
                         record(M, TAG, "materialized the directly copied Scarlett media SRV in the native shader-visible table");
                     }
                 }
-                // Diagnostic: dump raw 8xu32 at slot 0 of Scarlett guest heap at h_gfx_table call time.
-                // Scenario A -> nenulevy RDNA2 V# => patch srabotaet.
-                // Scenario B/C -> nuli => patch ne pomozhet, nuzhna drugaya strategiya.
-                if once(27) {
-                    let raw: [u32; 8] = unsafe { (table as *const [u32; 8]).read_unaligned() };
-                    record(M, TAG, &format!("slot0 raw at h_gfx_table call: {:08x?}", raw));
+                // GPU descriptor handles are not CPU pointers. Resolve the
+                // guest CPU alias and distinguish zero bytes from no alias.
+                if let Some(cpu) = crate::bindtrace::scarlett_cpu_slot(table, 0) {
+                    if once(27) {
+                        let raw = unsafe { (cpu as *const [u32; 8]).read_unaligned() };
+                        record(M, TAG, &format!("slot0 raw at h_gfx_table call: gpu={table:#x} cpu={cpu:#x} {raw:08x?}; first media table, not necessarily the target PSO"));
+                    }
+                }
+                if std::env::var_os("TOMBOX_TEST_FINAL_SLOT0").is_some_and(|v| v == "1") {
+                    let hashes = crate::cl2_state::bound_pso(list).and_then(crate::device_wrap::pso_summary)
+                        .map(|(vs, ps, _)| (crate::shader_xlat::origin_hash(vs), crate::shader_xlat::origin_hash(ps)));
+                    if hashes == Some((Some(0x7fda1be8fbc78299), Some(0xc1d5a4b8b07ccbce))) {
+                        if let Some(cpu) = crate::bindtrace::scarlett_cpu_slot(table, 0) {
+                            let words = unsafe { (cpu as *const [u32; 8]).read_unaligned() };
+                            let mat = cpu.checked_sub(64).filter(|&a| crate::heap_wrap::scarlett_shader_visible_cpu_range(a, 2));
+                            let expected = [0x3f800000u32, 0, 0, 0, 0, 0x3f800000, 0, 0, 0, 0, 0x3f800000, 0, 0, 0, 0, 0x3f800000];
+                            if words == [0; 8] && mat.is_some_and(|a| unsafe { (a as *const [u32; 16]).read_unaligned() } == expected) {
+                                let addr = mat.unwrap() as u64;
+                                match crate::gpu_va::lookup(addr) {
+                                    Some((entry, off)) if entry.buffer && off % 16 == 0 && off.checked_add(64).is_some_and(|end| end <= entry.len) => {
+                                        let buf = Buffer { va: addr, stride: 16, records: 4, hw: None, dst_sel: [0, 1, 2, 3] };
+                                        if let Some(desc) = buffer_view(&buf, off, false) {
+                                            materialize(cpu, entry.res, desc);
+                                            if once(28) { record(M, TAG, &format!("TEST_FINAL_SLOT0 bound matrix CPU={addr:#x} to resource={:#x} offset={off:#x}, SRV stride=16", entry.res)); }
+                                        }
+                                    }
+                                    other => if once(29) { record(M, TAG, &format!("TEST_FINAL_SLOT0 cannot bind CPU matrix {addr:#x}: mapped buffer or 64-byte range unavailable ({other:?})")); },
+                                }
+                            }
+                        }
+                    }
                 }
                 // Slot 0: StructuredBuffer SRV written directly by title (bypasses API interception)
                 if let Some((cpu, res, desc)) = crate::bindtrace::copied_scarlett_buffer(table, 0) {
@@ -1076,16 +1155,18 @@ unsafe extern "system" fn h_gfx_table(list: *mut c_void, i: u32, h: u64) {
                     if once(25) {
                         record(M, TAG, "materialized Scarlett StructuredBuffer SRV in slot 0 via API cache");
                     }
-                } else if let Some(words) = crate::bindtrace::scarlett_guest_slot_words(table, 0) {
+                } else if crate::bindtrace::copied_scarlett_cbv(table, 0).is_none() {
+                  if let Some(words) = crate::bindtrace::scarlett_guest_slot_words(table, 0) {
                     // Fallback: decode raw Scarlett guest V# (title wrote directly, not via API)
-                    unsafe {
-                        write_resource_slot(device, crate::heap_wrap::native_cpu_handle(
-                            crate::bindtrace::scarlett_cpu_slot(table, 0).unwrap_or(0)
-                        ) as u64, FAMILY_SCARLETT, &words, KIND_SRV);
+                    if matches!(decode_slot(FAMILY_SCARLETT, &words), Slot::Buffer(_)) {
+                        if let Some(cpu) = crate::bindtrace::scarlett_cpu_slot(table, 0) {
+                            let ok = unsafe { write_resource_slot(device, crate::heap_wrap::native_cpu_handle(cpu) as u64, FAMILY_SCARLETT, &words, KIND_SRV) };
+                            if once(26) {
+                                record(M, TAG, &format!("decoded Scarlett guest buffer descriptor at slot 0, materialization success={ok}"));
+                            }
+                        }
                     }
-                    if once(26) {
-                        record(M, TAG, "decoded Scarlett guest V# at slot 0 directly (bypassed write path)");
-                    }
+                  }
                 }
                 if crate::cbv_raw::copy_on() || crate::cbv_raw::enabled() {
                     for slot in 0..8 {
@@ -1108,6 +1189,13 @@ unsafe extern "system" fn h_gfx_table(list: *mut c_void, i: u32, h: u64) {
                     }
                 }
             }
+        }
+    }
+    if i == 0 && std::env::var_os("TOMBOX_TEST_DESCRIPTOR_GUARD").is_some() {
+        let hashes = crate::cl2_state::bound_pso(list).and_then(crate::device_wrap::pso_summary)
+            .map(|(vs, ps, _)| (crate::shader_xlat::origin_hash(vs), crate::shader_xlat::origin_hash(ps)));
+        if hashes == Some((Some(0x7fda1be8fbc78299), Some(0xc1d5a4b8b07ccbce))) {
+            if let Some(cpu) = crate::bindtrace::scarlett_cpu_slot(table, 0) { unsafe { crate::process_debug::arm_descriptor_guard(cpu) }; }
         }
     }
     f(list, i, table)

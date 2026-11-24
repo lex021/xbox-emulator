@@ -353,6 +353,15 @@ fn decode_operands(enc: Enc, raw: &[u32]) -> (Vec<Opnd>, Vec<Opnd>, InsnAux) {
             let s0 = d1 & 0x1ff;
             let s1 = (d1 >> 9) & 0x1ff;
             let s2 = (d1 >> 18) & 0x1ff;
+            if matches!(op, 0x342 | 0x343 | 0x35a) {
+                aux.imm = (s0 & 0x3f) as i64;
+                aux.imm2 = ((s0 >> 6) & 3) as i64;
+                let mut src = vec![src9(s1 as u16, l3)];
+                if op != 0x342 {
+                    src.push(src9(s2 as u16, l3));
+                }
+                return (vec![Opnd::Vgpr(vdst as u8)], src, aux);
+            }
             // abs[10:8] in dword0, neg[31:29] + omod[28:27] in dword1, clamp bit 15.
             aux.mask = (((w >> 8) & 7) | (((d1 >> 29) & 7) << 3)) as u8;
             aux.imm2 = ((d1 >> 27) & 3) as i64;
@@ -469,7 +478,8 @@ fn instr_len(enc: Enc, w: u32, next: Option<u32>) -> (usize, bool) {
         Enc::Vop3 => {
             // GFX10 allows a trailing 32-bit literal on VOP3 when any source == 255.
             let d1 = next.unwrap_or(0);
-            let any_lit = (d1 & 0x1ff) == 255 || ((d1 >> 9) & 0x1ff) == 255 || ((d1 >> 18) & 0x1ff) == 255;
+            let interp = w >> 26 != 0b110011 && matches!((w >> 16) & 0x3ff, 0x342 | 0x343 | 0x35a);
+            let any_lit = (!interp && (d1 & 0x1ff) == 255) || ((d1 >> 9) & 0x1ff) == 255 || ((d1 >> 18) & 0x1ff) == 255;
             (2, any_lit)
         }
         Enc::Vinterp => (1, false),

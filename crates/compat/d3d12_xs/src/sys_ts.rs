@@ -237,13 +237,19 @@ pub unsafe fn write(list: *mut c_void, va: u64) {
         }
         return;
     }
+    if unsafe { write_to(list, e.res, off, st) } {
+        crate::placed::note_gpu_write(e.res as *mut c_void);
+    }
+}
+
+pub(crate) unsafe fn write_to(list: *mut c_void, dst: usize, off: u64, st: u32) -> bool {
     let Some(cal) = (unsafe { calibration() }) else {
         if once(8) {
             record("d3d12_xs", "sys_ts", "SYSTEM_TIMESTAMP before any queue submission: no clock calibration yet, value not written");
         }
-        return;
+        return false;
     };
-    let Some(p) = (unsafe { pipeline(list) }) else { return };
+    let Some(p) = (unsafe { pipeline(list) }) else { return false };
     let slot = NEXT.fetch_add(1, Ordering::Relaxed) % SLOTS;
     let soff = slot as u64 * 8;
     let k = constants(&cal, slot);
@@ -251,7 +257,7 @@ pub unsafe fn write(list: *mut c_void, va: u64) {
         crate::fill::barrier_pub(list, p.buf, STATE_COMMON, STATE_COPY_DEST);
         if !crate::timestamp::resolve_into(list, p.buf, soff) {
             crate::fill::barrier_pub(list, p.buf, STATE_COPY_DEST, STATE_COMMON);
-            return;
+            return false;
         }
         crate::fill::barrier_pub(list, p.buf, STATE_COPY_DEST, STATE_UAV);
         let pred: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_PREDICATION));
@@ -267,14 +273,14 @@ pub unsafe fn write(list: *mut c_void, va: u64) {
         let d: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_DISPATCH));
         d(list, 1, 1, 1);
         crate::fill::barrier_pub(list, p.buf, STATE_UAV, STATE_COPY_SOURCE);
-        if st != STATE_COPY_DEST { crate::fill::barrier_pub(list, e.res, st, STATE_COPY_DEST); }
+        if st != STATE_COPY_DEST { crate::fill::barrier_pub(list, dst, st, STATE_COPY_DEST); }
         let cp: unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64) = core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_COPY_BUFFER_REGION));
-        cp(list, e.res, off, p.buf, soff, 8);
-        if st != STATE_COPY_DEST { crate::fill::barrier_pub(list, e.res, STATE_COPY_DEST, st); }
+        cp(list, dst, off, p.buf, soff, 8);
+        if st != STATE_COPY_DEST { crate::fill::barrier_pub(list, dst, STATE_COPY_DEST, st); }
         crate::fill::barrier_pub(list, p.buf, STATE_COPY_SOURCE, STATE_COMMON);
         crate::cl2_state::reapply(list);
     }
-    crate::placed::note_gpu_write(e.res as *mut c_void);
+    true
 }
 
 #[cfg(test)]

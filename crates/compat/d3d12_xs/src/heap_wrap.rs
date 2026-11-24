@@ -79,6 +79,11 @@ pub(crate) fn native_cpu_handle(handle: usize) -> usize {
     }).unwrap_or(handle)
 }
 
+pub(crate) fn guest_shadow_contains(handle: usize, len: usize) -> bool {
+    let aliases = SCARLETT_CPU.read().unwrap_or_else(|e| e.into_inner());
+    aliases.iter().any(|a| handle.checked_sub(a.start).is_some_and(|off| off <= a.bytes && len <= a.bytes - off))
+}
+
 extern "system" {
     fn VirtualAlloc(address: *mut c_void, bytes: usize, alloc_type: u32, protect: u32) -> *mut c_void;
     fn VirtualFree(address: *mut c_void, bytes: usize, free_type: u32) -> i32;
@@ -90,9 +95,12 @@ pub(crate) unsafe fn mirror_scarlett_cbv(dest: usize, gpu_va: u64, size: u32) {
         return;
     }
     let aliases = SCARLETT_CPU.read().unwrap_or_else(|e| e.into_inner());
-    if aliases.iter().any(|a| a.owned && dest.checked_sub(a.start).is_some_and(|o| o % 32 == 0 && o <= a.bytes.saturating_sub(32))) {
+    let owned = aliases.iter().any(|a| a.owned && dest.checked_sub(a.start).is_some_and(|o| o % 32 == 0 && o <= a.bytes.saturating_sub(32)));
+    if owned {
         let raw = [0x0010_0000_0000_0000 | gpu_va, 0x0002_403c_0000_0000 | u64::from(size / 16), 0, 0];
         unsafe { core::ptr::write_unaligned(dest as *mut [u64; 4], raw) };
+        drop(aliases);
+        crate::bindtrace::trace_guest_cbv_source(dest, raw);
     }
 }
 

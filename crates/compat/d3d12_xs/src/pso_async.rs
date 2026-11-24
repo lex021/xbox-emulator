@@ -77,6 +77,7 @@ impl Drop for Owned {
 
 static ASYNC_N: AtomicUsize = AtomicUsize::new(0);
 static INLINE_N: AtomicUsize = AtomicUsize::new(0);
+static PENDING_JOBS: AtomicUsize = AtomicUsize::new(0);
 static PENDING_BINDS: AtomicU64 = AtomicU64::new(0);
 static SWAPPED_BINDS: AtomicU64 = AtomicU64::new(0);
 static LATE_FAIL: AtomicUsize = AtomicUsize::new(0);
@@ -89,6 +90,25 @@ static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PREV_SET: AtomicUsize = AtomicUsize::new(0);
 static PREV_RESET: AtomicUsize = AtomicUsize::new(0);
 static PREV_CLEAR: AtomicUsize = AtomicUsize::new(0);
+
+struct PendingJob;
+
+impl PendingJob {
+    fn new() -> Self {
+        PENDING_JOBS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for PendingJob {
+    fn drop(&mut self) {
+        PENDING_JOBS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn pending_jobs() -> usize {
+    PENDING_JOBS.load(Ordering::Relaxed)
+}
 static HOOKED: AtomicBool = AtomicBool::new(false);
 
 fn bad_descs() -> &'static Mutex<std::collections::HashSet<u128>> {
@@ -489,7 +509,9 @@ unsafe fn launch(this: *mut DeviceWrapper, owned: Owned, num_ext: u32, riid: *co
     let slot = Arc::new(Slot { st: Mutex::new(Done { started: Some(std::time::Instant::now()), ..Default::default() }), cv: Condvar::new(), real: AtomicUsize::new(0), kind, retry: Mutex::new(None), aliased: AtomicBool::new(false), job: Mutex::new(None), refused: AtomicBool::new(false), bad_key });
     let riid_v: Guid = unsafe { core::ptr::read(riid) };
     let (dev, ws) = (this as usize, slot.clone());
+    let pending = PendingJob::new();
     let job: Job = Box::new(move || {
+        let _pending = pending;
         let owned = owned;
         let mut out: *mut c_void = core::ptr::null_mut();
         let ext = if owned.ext.is_empty() { core::ptr::null() } else { owned.ext.as_ptr() };

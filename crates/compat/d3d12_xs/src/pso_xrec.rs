@@ -638,6 +638,108 @@ unsafe fn root_obj(rp: &Replay, mask: u32, id: u64) -> Option<usize> {
     }
 }
 
+fn replay_one(rp: &Replay, r: &Rec, throttle: bool) -> Result<(), String> {
+    let root = match r.root {
+        Some((mask, id)) => unsafe { root_obj(rp, mask, id) },
+        None => Some(0),
+    };
+    let root = root.ok_or("could not create the saved root signature")?;
+    let b = build(r, &rp.blobs, root).ok_or("could not rebuild the saved pipeline description")?;
+    let _slot = throttle.then(|| crate::shader_xlat::bg_slot(rp.workers));
+    let mut out = 0;
+    let hr = unsafe { crate::device_wrap::replay_create(rp.wrapper as *mut c_void, r.kind == GFX, b.desc.as_ptr(), &IID_PSO, &mut out) };
+    if hr < 0 || out == 0 {
+        return Err(format!("CreatePipelineState hr={hr:#010x}, pipeline handle {out:#x}"));
+    }
+    crate::device_wrap::forget_pso(out);
+    unsafe { release(out) };
+    Ok(())
+}
+
+fn release_roots(rp: &Replay) {
+    let roots: Vec<usize> = crate::frame_ev::lock(&rp.roots).drain().map(|(_, o)| o).collect();
+    for o in roots {
+        unsafe { release(o) };
+    }
+}
+
+pub(crate) fn replay_offline(real: *mut c_void, wrapper: *mut c_void, limit: usize, jobs: usize) -> Result<(), String> {
+    let dir = crate::pso_lib::offline_dir(real).ok_or("driver pipeline library unavailable")?;
+    let path = dir.join("pso_xrec.bin");
+    let file = match std::fs::read(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            record("d3d12_xs", "pso_offline", "no title PSO journal yet; launch the game to capture its pipelines");
+            return Ok(());
+        }
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let mut journal = Journal::decode(&file).ok_or_else(|| format!("invalid journal {}", path.display()))?;
+    drop(file);
+    if limit != 0 {
+        journal.recs.truncate(limit);
+    }
+    let total = journal.recs.len();
+    if total == 0 {
+        record("d3d12_xs", "pso_offline", "the title PSO journal is empty");
+        return Ok(());
+    }
+    let jobs = if jobs == 0 { cores().clamp(1, 4) } else { jobs.clamp(1, 16) }.min(total);
+    let rp = Replay { recs: journal.recs, blobs: journal.blobs, next: AtomicUsize::new(0), wrapper: wrapper as usize, roots: Mutex::new(HashMap::new()), t0: std::time::Instant::now(), workers_left: AtomicUsize::new(0), workers: jobs };
+    let done = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+    let checkpoint = Mutex::new(std::time::Instant::now());
+    let before = tombox_xshader::shader_cache::stats();
+    record("d3d12_xs", "pso_offline", &format!("replaying {total} captured PSOs in order of first capture on {jobs} workers from {}", path.display()));
+    let worker = || {
+        REPLAYING.with(|r| r.set(true));
+        loop {
+            let i = rp.next.fetch_add(1, Relaxed);
+            let Some(r) = rp.recs.get(i) else { break };
+            if let Err(error) = replay_one(&rp, r, false) {
+                failed.fetch_add(1, Relaxed);
+                let shaders = r.shaders.iter().filter_map(|(_, id)| rp.blobs.get(id)).map(|blob| format!("{:016x}", crate::shader_xlat::fnv1a(blob))).collect::<Vec<_>>().join(",");
+                let kind = if r.kind == GFX { "graphics" } else { "compute" };
+                record("d3d12_xs", "pso_offline", &format!("record {} {kind} failed: {error}, shaders=[{shaders}]", i + 1));
+            }
+            let n = done.fetch_add(1, Relaxed) + 1;
+            if n == 1 || n == total || n % 32 == 0 {
+                record("d3d12_xs", "pso_offline", &format!("{n}/{total} processed, {} failed", failed.load(Relaxed)));
+            }
+            if let Ok(mut last) = checkpoint.try_lock() {
+                if last.elapsed().as_secs() >= 60 {
+                    if let Err(e) = crate::pso_lib::save_offline() {
+                        record("d3d12_xs", "pso_offline", &format!("periodic cache save failed: {e}"));
+                    }
+                    *last = std::time::Instant::now();
+                }
+            }
+        }
+    };
+    let replayed = std::thread::scope(|scope| -> Result<(), String> {
+        let mut threads = Vec::with_capacity(jobs);
+        for _ in 0..jobs {
+            match std::thread::Builder::new().name("tombox-pso-offline".into()).stack_size(64 << 20).spawn_scoped(scope, &worker) {
+                Ok(thread) => threads.push(thread),
+                Err(e) if threads.is_empty() => return Err(format!("start offline worker: {e}")),
+                Err(_) => break,
+            }
+        }
+        let mut panicked = false;
+        for thread in threads {
+            panicked |= thread.join().is_err();
+        }
+        if panicked { Err("an offline PSO worker panicked".into()) } else { Ok(()) }
+    });
+    release_roots(&rp);
+    let saved = crate::pso_lib::save_offline();
+    let stats = tombox_xshader::shader_cache::stats();
+    let n = done.load(Relaxed);
+    let bad = failed.load(Relaxed);
+    record("d3d12_xs", "pso_offline", &format!("finished {n}/{total} in {:.1}s: {} ready, {bad} failed, {} new DXIL writes, {} pack records", rp.t0.elapsed().as_secs_f64(), n - bad, stats.writes.saturating_sub(before.writes), stats.records));
+    replayed.and(saved)
+}
+
 fn replay_worker() {
     let Some(rp) = REPLAY.get() else { return };
     unsafe { SetThreadPriority(GetCurrentThread(), REPLAY_PRIORITY) };
@@ -646,24 +748,7 @@ fn replay_worker() {
         let i = rp.next.fetch_add(1, Relaxed);
         let Some(r) = rp.recs.get(i) else { break };
         let t = std::time::Instant::now();
-        let root = match r.root {
-            Some((mask, id)) => unsafe { root_obj(rp, mask, id) },
-            None => Some(0),
-        };
-        let hr = match root.and_then(|ro| build(r, &rp.blobs, ro)) {
-            Some(b) => {
-                let _slot = crate::shader_xlat::bg_slot(rp.workers);
-                let mut out = 0usize;
-                let hr = unsafe { crate::device_wrap::replay_create(rp.wrapper as *mut c_void, r.kind == GFX, b.desc.as_ptr(), &IID_PSO, &mut out) };
-                if hr >= 0 && out != 0 {
-                    crate::device_wrap::forget_pso(out);
-                    unsafe { release(out) };
-                }
-                hr
-            }
-            None => -1,
-        };
-        if hr >= 0 {
+        if replay_one(rp, r, true).is_ok() {
             REPLAY_OK.fetch_add(1, Relaxed);
             if t.elapsed().as_millis() >= 20 {
                 REPLAY_SLOW.fetch_add(1, Relaxed);
@@ -674,19 +759,20 @@ fn replay_worker() {
         REPLAY_LEFT.fetch_sub(1, Relaxed);
     }
     if rp.workers_left.fetch_sub(1, Relaxed) == 1 {
-        let roots: Vec<usize> = crate::frame_ev::lock(&rp.roots).drain().map(|(_, o)| o).collect();
-        for o in roots {
-            unsafe { release(o) };
-        }
+        release_roots(rp);
         record("d3d12_xs", "pso_xrec", &format!("replay finished in {:.1} s: {}", rp.t0.elapsed().as_secs_f64(), summary()));
     }
+}
+
+pub(crate) fn remaining() -> usize {
+    REPLAY_LEFT.load(Relaxed)
 }
 
 pub fn summary() -> String {
     format!(
         "xbox records {} (+{} this run; not recorded: {} with Xbox ext entries, {} with a title cached blob, {} with an unknown root signature, {} over caps); replayed {} ok ({} took >= 20 ms, i.e. compiled by the driver), {} failed, {} left",
         crate::frame_ev::lock(journal()).recs.len(), ADDED.load(Relaxed), SKIP_EXT.load(Relaxed), SKIP_CACHED.load(Relaxed), SKIP_ROOT.load(Relaxed), SKIP_CAP.load(Relaxed),
-        REPLAY_OK.load(Relaxed), REPLAY_SLOW.load(Relaxed), REPLAY_FAIL.load(Relaxed), REPLAY_LEFT.load(Relaxed))
+        REPLAY_OK.load(Relaxed), REPLAY_SLOW.load(Relaxed), REPLAY_FAIL.load(Relaxed), remaining())
 }
 
 pub struct Flights {

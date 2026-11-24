@@ -6,7 +6,7 @@
 
 use compat_common::record;
 use core::ffi::c_void;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use tombox_xshader::hlsl::InputInterp;
@@ -228,7 +228,7 @@ pub fn disable_loop_grad(hlsl: &str) -> String {
 }
 
 fn translate_uncached(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp) -> Result<Vec<u8>, String> {
-    translate_uncached_with(blob, hash, rtfmt, link, None, None)
+    translate_uncached_with(blob, hash, rtfmt, link, None, None, false)
 }
 
 pub(crate) fn translate_edited(blob: &[u8], hash: u64, rtfmt: &[u8; 8], edit: &dyn Fn(&str) -> Result<String, String>) -> Result<Vec<u8>, String> {
@@ -236,7 +236,7 @@ pub(crate) fn translate_edited(blob: &[u8], hash: u64, rtfmt: &[u8; 8], edit: &d
 }
 
 pub(crate) fn translate_edited_linked(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, edit: &dyn Fn(&str) -> Result<String, String>) -> Result<Vec<u8>, String> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| translate_uncached_with(blob, hash, rtfmt, link, Some(edit), None))).unwrap_or_else(|_| Err("translator panicked".to_string()))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| translate_uncached_with(blob, hash, rtfmt, link, Some(edit), None, false))).unwrap_or_else(|_| Err("translator panicked".to_string()))
 }
 
 pub(crate) struct RtSrc {
@@ -292,12 +292,16 @@ fn log_pack_miss(hash: u64, rtfmt: &[u8; 8], linked: bool, src: &str, profile: &
 }
 
 pub(crate) fn runtime_source(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, root: Option<&[u8]>, mode: &tombox_xshader::pack_key::Mode) -> Result<RtSrc, String> {
-    runtime_source_for(blob, hash, rtfmt, link, root, mode, false)
+    runtime_source_for(blob, hash, rtfmt, link, root, mode, false, false)
+}
+
+pub(crate) fn prewarm_compute_source(blob: &[u8], hash: u64, root: &[u8], mode: &tombox_xshader::pack_key::Mode) -> Result<RtSrc, String> {
+    runtime_source_for(blob, hash, &[0; 8], &InputInterp::default(), Some(root), mode, false, true)
 }
 
 pub(crate) fn compile_global_compute(blob: &[u8], root: Option<&[u8]>) -> Result<Vec<u8>, String> {
     let mode = runtime_mode();
-    let source = runtime_source_for(blob, fnv1a(blob), &[0; 8], &InputInterp::default(), root, mode, true)?;
+    let source = runtime_source_for(blob, fnv1a(blob), &[0; 8], &InputInterp::default(), root, mode, true, false)?;
     if !source.use_dxc {
         return Err("global compute translation requires DXC".into());
     }
@@ -309,15 +313,37 @@ pub(crate) fn compile_global_compute(blob: &[u8], root: Option<&[u8]>) -> Result
     }).map(|result| result.code)
 }
 
-fn runtime_source_for(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, root: Option<&[u8]>, mode: &tombox_xshader::pack_key::Mode, global_compute: bool) -> Result<RtSrc, String> {
+static COMPUTE_FSSM_RETRIES: LazyLock<Mutex<HashSet<u64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+pub(crate) fn used_compute_fssm_retry(hash: u64) -> bool {
+    COMPUTE_FSSM_RETRIES.lock().unwrap_or_else(|e| e.into_inner()).contains(&hash)
+}
+
+fn runtime_source_for(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, root: Option<&[u8]>, mode: &tombox_xshader::pack_key::Mode, global_compute: bool, inferred_compute: bool) -> Result<RtSrc, String> {
     let mut ex = tombox_xshader::extract(blob).map_err(|e| {
         dump_failure(hash, blob, None, &e);
         format!("extract: {e}")
     })?;
-    if let Some(root) = root.filter(|_| !ex.has_root_sig) {
+    if let Some(root) = root.filter(|_| !ex.has_root_sig && !inferred_compute) {
         ex.root_sig = Some(tombox_xshader::parse_root_signature(root).map_err(|e| format!("pipeline root signature: {e}"))?);
     }
-    let mut t = tombox_xshader::pack_key::translate(&ex, Some(link), mode.cbv_raw).map_err(|e| {
+    let translated = if inferred_compute {
+        let root = root.ok_or("FSSM compute translation requires the title's root signature")?;
+        let title = tombox_xshader::parse_root_signature(root).map_err(|e| format!("pipeline root signature: {e}"))?;
+        tombox_xshader::pack_key::translate_compute_fssm(&ex, mode.cbv_raw, &title)
+    } else {
+        tombox_xshader::pack_key::translate(&ex, Some(link), mode.cbv_raw).or_else(|error| {
+        let Some(retry) = tombox_xshader::pack_key::retry_compute_literal_sampler(&ex, mode.cbv_raw, &error) else {
+            return Err(error);
+        };
+        let translated = retry.map_err(|e| format!("{error}; FSSM retry: {e}"))?;
+        if COMPUTE_FSSM_RETRIES.lock().unwrap_or_else(|e| e.into_inner()).insert(hash) {
+            record("d3d12_xs", "shader_xlat", &format!("compute literal sampler FSSM fallback translated hash={hash:016x}"));
+        }
+            Ok(translated)
+        })
+    };
+    let mut t = translated.map_err(|e| {
         dump_failure(hash, blob, None, &e);
         e
     })?;
@@ -382,6 +408,15 @@ fn runtime_source_for(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInter
             record("d3d12_xs", "shader_xlat", &format!("STUB_AT: hash={hash:016x} has no ISA line {off:#06x}"));
         }
     }
+    // Development aid: TOMBOX_XS_DUMP_HLSL=<hash,...> writes the generated HLSL for those
+    // shaders to %TEMP%\tombox_shaders so it can be hand-edited and replayed via the override.
+    if dump_hashes().contains(&hash) {
+        let dir = std::env::temp_dir().join("tombox_shaders");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join(format!("{hash:016x}.hlsl"));
+        let _ = std::fs::write(&p, &t.hlsl);
+        record("d3d12_xs", "shader_xlat", &format!("DUMP: hash={hash:016x} HLSL {} bytes -> {}", t.hlsl.len(), p.display()));
+    }
     t.hlsl = tombox_xshader::pack_key::finalize(&t.hlsl, rtfmt, mode);
     // Compiler: DXC (SM6 DXIL) when dxcompiler.dll + dxil.dll are available, otherwise FXC
     // (SM5 DXBC). FXC needs minutes for some of the generated compute shaders; DXC about a
@@ -400,10 +435,10 @@ fn runtime_source_for(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInter
     Ok(RtSrc { hlsl: t.hlsl, profile, use_dxc })
 }
 
-fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, edit: Option<&dyn Fn(&str) -> Result<String, String>>, root: Option<&[u8]>) -> Result<Vec<u8>, String> {
+fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, edit: Option<&dyn Fn(&str) -> Result<String, String>>, root: Option<&[u8]>, inferred_compute: bool) -> Result<Vec<u8>, String> {
     let t_start = std::time::Instant::now();
     let mode = runtime_mode();
-    let t = runtime_source(blob, hash, rtfmt, link, root, mode)?;
+    let t = runtime_source_for(blob, hash, rtfmt, link, root, mode, false, inferred_compute)?;
     let (profile, use_dxc) = (t.profile.clone(), t.use_dxc);
     if let Some(edit) = edit {
         if !use_dxc {
@@ -725,7 +760,10 @@ fn produce(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, _key: u6
     if let Ok(v) = &r {
         crate::dbcount::note_translated(v, blob, hash, rtfmt);
         let sp = src_path(hash, rtfmt);
-        if link.0.is_empty() && !GUESS.with(|g| g.get()) && !sp.exists() {
+        // Write the console blob for every successfully translated shader, linked variants
+        // included: the offline tools (`xshader <blob> --hlsl-out f`) are the only way to read
+        // a linked shader's generated HLSL, and a linked variant has no other copy on disk.
+        if !GUESS.with(|g| g.get()) && !sp.exists() {
             write_atomic(&sp, blob);
         }
     }
@@ -1084,10 +1122,21 @@ pub fn translate_with_pipeline_root(blob: &[u8], root: &[u8], rtfmt: [u8; 8], li
     let entry = mesh_root_cell(link_key(cache_key(hash, &rtfmt), link), root);
     entry.get_or_init(|| {
         crate::perf::timed(crate::perf::SHADER, || {
-            let result = std::panic::catch_unwind(|| translate_uncached_with(blob, hash, &rtfmt, link, None, Some(root)))
+            let result = std::panic::catch_unwind(|| translate_uncached_with(blob, hash, &rtfmt, link, None, Some(root), false))
                 .unwrap_or_else(|_| Err("translator panicked".to_string()));
             finish_with(result, hash, blob.len(), None)
         })
+    }).clone()
+}
+
+pub(crate) fn translate_compute_fssm(blob: &[u8], root: &[u8]) -> Cached {
+    let hash = fnv1a(blob);
+    let formats = [0; 8];
+    let entry = mesh_root_cell(cache_key(hash, &formats) ^ 0xe4f4_f21c_6313_bfd2, root);
+    entry.get_or_init(|| {
+        let result = std::panic::catch_unwind(|| translate_uncached_with(blob, hash, &formats, &no_link(), None, Some(root), true))
+            .unwrap_or_else(|_| Err("FSSM compute translator panicked".to_string()));
+        finish_with(result, hash, blob.len(), None)
     }).clone()
 }
 
@@ -1439,4 +1488,9 @@ pub fn drop_read_lines(hlsl: &str, lo: u32, hi: u32) -> (String, usize) {
 fn drop_ops() -> &'static Vec<String> {
     static S: OnceLock<Vec<String>> = OnceLock::new();
     S.get_or_init(|| std::env::var("TOMBOX_XS_DROP_OPS").unwrap_or_else(|_| "image_,buffer_,tbuffer_".into()).split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+}
+
+fn dump_hashes() -> &'static Vec<u64> {
+    static S: OnceLock<Vec<u64>> = OnceLock::new();
+    S.get_or_init(|| std::env::var("TOMBOX_XS_DUMP_HLSL").map(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect()).unwrap_or_default())
 }

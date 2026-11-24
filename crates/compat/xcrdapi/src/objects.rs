@@ -778,6 +778,19 @@ impl QueueInner {
                     Some(hr) => hr,
                     None => self.request_hr(seq, &req, file.as_deref(), pre_error),
                 };
+                if std::env::var_os("TOMBOX_BINK_TRACE").is_some() {
+                    if let Some(f) = file.as_ref() {
+                        let path = String::from_utf16_lossy(&f.path);
+                        if path.trim_end_matches('\0').to_ascii_lowercase().ends_with("movies.rpf") {
+                            static MOVIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                            if MOVIES.fetch_add(1, Ordering::Relaxed) < 12 {
+                                crate::log("[movies]", &format!(
+                                    "read off={:#x} input={} output={} compression={} hr={hr:#010x}",
+                                    req.source_offset, req.source_size, req.destination_size, req.compression()));
+                            }
+                        }
+                    }
+                }
                 if hr < 0 {
                     if err_since_status.is_none() {
                         *err_since_status = Some(hr);

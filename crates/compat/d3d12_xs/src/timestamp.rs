@@ -84,6 +84,20 @@ pub unsafe fn resolve_into(list: *mut c_void, res: usize, off: u64) -> bool {
     true
 }
 
+pub(crate) unsafe fn resolve_console_into_readback(list: *mut c_void, res: usize) -> bool {
+    let Some((heap, _, _)) = (unsafe { heaps(list) }) else { return false };
+    if heap == 0 {
+        return false;
+    }
+    let idx = next_index(&NEXT_DIRECT);
+    let end: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) =
+        unsafe { core::mem::transmute(crate::cmdlist_wrap::pc_method(list, 53)) };
+    unsafe {
+        end(list, heap as *mut c_void, QUERY_TYPE_TIMESTAMP, idx);
+        crate::ts99::emit(list, heap as *mut c_void, idx, 1, res, 0, None)
+    }
+}
+
 pub unsafe fn write(list: *mut c_void, copy_list: bool, addr: u64, a: u32, b: u32, c: u32) {
     let _ij = unsafe { crate::inject::scope(list, crate::inject::QUERY) };
     static MISS: AtomicUsize = AtomicUsize::new(0);

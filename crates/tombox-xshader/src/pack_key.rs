@@ -121,8 +121,30 @@ impl Mode {
 }
 
 pub fn translate(ex: &ShaderExtract, link: Option<&InputInterp>, cbv: CbvRaw) -> Result<Translated, String> {
+    translate_impl(ex, link, cbv, false, None)
+}
+
+pub fn translate_compute_fssm(ex: &ShaderExtract, cbv: CbvRaw, title: &crate::meta::RootSig) -> Result<Translated, String> {
+    if ex.stage != crate::Stage::Compute || ex.has_root_sig || ex.root_sig.is_some() {
+        return Err("FSSM compute layout requires a compute shader without an embedded root".into());
+    }
+    translate_impl(ex, None, cbv, true, Some(title))
+}
+
+pub fn retry_compute_literal_sampler(ex: &ShaderExtract, cbv: CbvRaw, error: &str) -> Option<Result<Translated, String>> {
+    if ex.stage != crate::Stage::Compute || ex.has_root_sig || ex.root_sig.is_some()
+        || !error.starts_with("translate: mimg at ") || !error.contains("not a sampler descriptor (Some(Literal(")
+        || !matches!(crate::fssm_bind::parse(&ex.fssm), Ok(Some(_)))
+    {
+        return None;
+    }
+    Some(translate_impl(ex, None, cbv, true, None))
+}
+
+fn translate_impl(ex: &ShaderExtract, link: Option<&InputInterp>, cbv: CbvRaw, fssm: bool, title: Option<&crate::meta::RootSig>) -> Result<Translated, String> {
     let link = link.filter(|l| !l.0.is_empty());
-    let mut t = hlsl::translate_linked(ex, link).map_err(|e| format!("translate: {e}"))?;
+    let mut t = if fssm { hlsl::translate_fssm_layout(ex, link, title) } else { hlsl::translate_linked(ex, link) }
+        .map_err(|e| format!("translate: {e}"))?;
     if cbv.rewrites() {
         if cbv == CbvRaw::On && !gcn::is_durango(&ex.fssm) {
             return Err("bind: Xbox One title shader is not a Durango program; its constant buffers cannot follow the raw-SRV binding".into());
@@ -130,7 +152,12 @@ pub fn translate(ex: &ShaderExtract, link: Option<&InputInterp>, cbv: CbvRaw) ->
         t.hlsl = cbv_raw_hlsl::rewrite_hlsl(&t.hlsl).map_err(|e| format!("bind: {e}"))?;
     }
     if cbv == CbvRaw::Copy {
-        t.hlsl = cbv_raw_hlsl::rewrite_tables(&t.hlsl, ex.root_sig.as_ref()).map_err(|e| format!("bind: {e}"))?;
+        let synthetic = if ex.root_sig.is_none() && !ex.has_root_sig
+            && (fssm || std::env::var_os("TOMBOX_FSSM_ROOT_SIG").is_some_and(|v| v != "0")) {
+            crate::fssm_bind::parse(&ex.fssm).ok().flatten()
+                .map(|b| hlsl::fssm_root_signature(ex, &b)).transpose().map_err(|e| format!("bind: {e}"))?
+        } else { None };
+        t.hlsl = cbv_raw_hlsl::rewrite_tables(&t.hlsl, ex.root_sig.as_ref().or(synthetic.as_ref())).map_err(|e| format!("bind: {e}"))?;
     }
     Ok(t)
 }
@@ -225,6 +252,33 @@ pub fn prelaunch_ex(ex: &ShaderExtract, rtfmt: &[u8; 8], link: Option<&InputInte
     let profile = dxc::profile_for(t.profile);
     let parts = KeyParts::of(&src, &profile, mode, &[]);
     Ok(Keyed { stage: ex.stage.clone(), src, profile, parts })
+}
+
+pub fn prelaunch_fssm(ex: &ShaderExtract, rtfmt: &[u8; 8], mode: &Mode, error: &str) -> Option<Result<Keyed, String>> {
+    if ex.has_root_sig || ex.root_sig.is_some() {
+        return None;
+    }
+    let table = crate::fssm_bind::parse(&ex.fssm).ok().flatten()?;
+    let has_metadata = if let Some(text) = error.strip_prefix("translate: bindless: s") {
+        let slot = text.strip_suffix(" is not a root parameter")?.parse::<u8>().ok()?;
+        table.resource_heap == Some(slot) || table.sampler_heap == Some(slot)
+    } else if error.starts_with("translate: image_store to a non-UAV table")
+        || error.starts_with("translate: image atomic on a non-UAV table") {
+        table.resource_heap.is_some() || table.uses.iter().any(|entry| entry.class == crate::fssm_bind::Class::Uav)
+    } else if error.starts_with("translate: mimg at ") && error.contains("not a sampler descriptor (Some(Literal(") {
+        table.uses.iter().any(|entry| entry.source == crate::fssm_bind::Source::StaticSampler)
+    } else {
+        false
+    };
+    if !has_metadata {
+        return None;
+    }
+    Some(translate_impl(ex, None, mode.cbv_raw, true, None).map(|t| {
+        let src = finalize(&t.hlsl, rtfmt, mode);
+        let profile = dxc::profile_for(t.profile);
+        let parts = KeyParts::of(&src, &profile, mode, &[]);
+        Keyed { stage: ex.stage, src, profile, parts }
+    }))
 }
 
 #[cfg(test)]

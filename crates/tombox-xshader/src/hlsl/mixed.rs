@@ -4,14 +4,14 @@ use crate::meta::RootParamKind;
 impl Emitter<'_> {
     pub(super) fn scarlett_packed_table_kind(&self, table: u8, off: u32) -> Option<u32> {
         let root = self.ex.root_sig.as_ref()?;
-        let slots = crate::meta::scarlett_graphics_table_slots(root)?;
-        if table != 8 || !matches!(self.ex.stage, crate::Stage::Vertex | crate::Stage::Pixel)
+        let (param, slots) = crate::meta::scarlett_graphics_table(root)?;
+        if self.root_param_at(table, self.user_base()) != Some((param, 0)) || !matches!(self.ex.stage, crate::Stage::Vertex | crate::Stage::Pixel)
             || off / 32 >= slots
         {
             return None;
         }
         let kind = crate::meta::scarlett_fssm_table_kind(&self.ex.fssm, table, off)?;
-        if kind == 1 && !(off / 32 == crate::meta::SCARLETT_MEDIA_UAV_SLOT && crate::meta::scarlett_media_table(root)) {
+        if kind == 1 && !crate::meta::scarlett_media_table(root) {
             return None;
         }
         Some(kind)

@@ -94,6 +94,37 @@ fn user_change_events_reach_the_registered_callback_in_order_and_stop_after_unre
     }
 }
 
+#[test]
+fn base_user_interface_exposes_startup_identity_and_privilege_slots() {
+    let u = iface(user::CLSID, user::CLSID);
+    unsafe {
+        let local: unsafe extern "system" fn(usize, usize, *mut u64) -> i32 = core::mem::transmute(slot(u, 9));
+        let guest: unsafe extern "system" fn(usize, usize, *mut bool) -> i32 = core::mem::transmute(slot(u, 13));
+        let age: unsafe extern "system" fn(usize, usize, *mut u32) -> i32 = core::mem::transmute(slot(u, 19));
+        let privilege: unsafe extern "system" fn(usize, usize, u32, u32, *mut bool, *mut u32) -> i32 = core::mem::transmute(slot(u, 20));
+        let mut local_id = 0;
+        let mut is_guest = true;
+        let mut age_group = 0;
+        let mut allowed = false;
+        let mut reason = 1;
+        assert_eq!(local(u, 1, &mut local_id), 0);
+        assert_ne!(local_id, 0);
+        assert_eq!(guest(u, 1, &mut is_guest), 0);
+        assert!(!is_guest);
+        assert_eq!(age(u, 1, &mut age_group), 0);
+        assert_eq!(privilege(u, 1, 0, 1, &mut allowed, &mut reason), 0);
+        assert!(allowed);
+        assert_eq!(reason, 0);
+        let q = manual_completion_queue();
+        let register: Register = core::mem::transmute(slot(u, 33));
+        let unregister: Unregister = core::mem::transmute(slot(u, 34));
+        let mut token = 0;
+        assert_eq!(register(u, q, core::ptr::null_mut(), on_change as *const () as usize, &mut token), 0);
+        assert_ne!(token, 0);
+        assert!(unregister(u, token, true));
+    }
+}
+
 static ASSOC: Mutex<Vec<([u8; 32], u64, u64, usize)>> = Mutex::new(Vec::new());
 
 #[repr(C)]

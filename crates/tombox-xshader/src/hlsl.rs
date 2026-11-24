@@ -36,6 +36,8 @@ mod mimg_d16;
 mod atomic;
 mod user_data;
 mod smem_bounds;
+mod static_sampler;
+pub use static_sampler::single_literal_sampler;
 pub use smem_bounds::{CBFIT_CBUFFER, CBFIT_RAW};
 pub mod infer;
 use mimg_d16::{mimg_data_regs, Lane};
@@ -467,7 +469,7 @@ fn ps_input_modifier(ex: &ShaderExtract, ei: usize, e: &SigElement) -> &'static 
     };
     if e.sysval == 1 && cons_depth() {
         "linear noperspective centroid "
-    } else if e.comp_type != 3 {
+    } else if !matches!(e.comp_type, 3 | 6) {
         "nointerpolation "
     } else if e.name.contains("_centroid") {
         centroid::qualifier(ex, ei)
@@ -482,7 +484,7 @@ pub fn ps_input_interp(ex: &ShaderExtract) -> InputInterp {
     }
     let modifiers = ex.input_sig.iter().enumerate().filter(|(_, e)| e.sysval != 1).filter_map(|(ei, e)| {
         let m = ps_input_modifier(ex, ei, e).trim_end();
-        let default = if e.comp_type == 3 { "" } else { "nointerpolation" };
+        let default = if matches!(e.comp_type, 3 | 6) { "" } else { "nointerpolation" };
         (m != default).then(|| (semantic(e), m.to_string()))
     });
     InputInterp(modifiers.collect())
@@ -494,6 +496,9 @@ struct Emitter<'a> {
     res: HashMap<usize, Vec<Res>>, // per-instruction resolved resources
     cb_size: BTreeMap<u32, u32>,   // slot -> dwords
     vs_lat: HashMap<usize, [smem_bounds::Lat; 3]>,
+    cfg: Option<(Vec<std::ops::Range<usize>>, Vec<Vec<usize>>)>,
+    sampler_literals: Option<HashMap<usize, [u32; 4]>>,
+    direct_heap_slots: std::cell::OnceCell<Option<(Option<u8>, Option<u8>)>>,
     uses_smem_bounds: bool,
     cb_lim: HashMap<u32, Option<u64>>,
     tex: BTreeMap<u32, u32>,       // slot -> dim
@@ -1174,6 +1179,9 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
 }
 
 pub fn translate_linked(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>) -> Result<Translated, String> {
+    if ex.root_sig.is_none() && !ex.has_root_sig && std::env::var_os("TOMBOX_FSSM_ROOT_SIG").is_some_and(|v| v != "0") && matches!(crate::fssm_bind::parse(&ex.fssm), Ok(Some(_))) {
+        return translate_linked_with_fssm_root(ex, feeds_ps);
+    }
     if ex.root_sig.is_none() && std::env::var_os("TOMBOX_INFER_ROOT_SIG").is_some() {
         if let Ok(sig) = infer::infer_root_signature(ex) {
             let mut inferred = ex.clone();
@@ -1203,11 +1211,77 @@ pub fn translate_with_inference(ex: &ShaderExtract) -> Result<Translated, String
     translate(&inferred)
 }
 
-fn translate_linked_with(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, user_data: bool) -> Result<Translated, String> {
-    let out_interp = match ex.stage {
+pub fn translate_with_fssm_root(ex: &ShaderExtract) -> Result<Translated, String> {
+    translate_linked_with_fssm_root(ex, None)
+}
+
+pub fn translate_linked_with_fssm_root(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>) -> Result<Translated, String> {
+    if ex.root_sig.is_some() || ex.has_root_sig {
+        return translate_linked_with(ex, feeds_ps, false);
+    }
+    translate_fssm_layout(ex, feeds_ps, None)
+}
+
+pub(crate) fn translate_fssm_layout(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, title: Option<&crate::meta::RootSig>) -> Result<Translated, String> {
+    let b = crate::fssm_bind::parse(&ex.fssm)?.ok_or("no root signature and no FSSM binding table")?;
+    let mut with = ex.clone();
+    let mut root = fssm_root_signature(ex, &b)?;
+    if let Some(title) = title {
+        root.flags = title.flags;
+        root.num_static_samplers = title.num_static_samplers;
+        root.static_samplers.clone_from(&title.static_samplers);
+    }
+    with.root_sig = Some(root);
+    match b.user_base(ex.stage)? {
+        Some(base) => translate_with(&with, &out_interp_for(ex, feeds_ps), Some(base), BTreeSet::new(), false, None),
+        None => translate_linked_with(&with, feeds_ps, false),
+    }
+}
+
+pub fn fssm_root_signature(ex: &ShaderExtract, b: &crate::fssm_bind::Bindings) -> Result<crate::meta::RootSig, String> {
+    use crate::meta::RootParamKind;
+    let mut root = b.root_signature();
+    if b.resource_heap.is_some() {
+        root.flags |= 0x400;
+    }
+    if b.sampler_heap.is_some() {
+        root.flags |= 0x800;
+    }
+    // FSSM identifies registers but does not encode the D3D register space.
+    // Recover unambiguous spaces from the shader's PSV resource bindings.
+    for param in &mut root.params {
+        let fill = |kind: u32, reg: u32, space: &mut u32| -> Result<(), String> {
+            let mut spaces: Vec<u32> = ex.resources.iter().filter(|r| {
+                let class = match kind { 0 => (3..=5).contains(&r.res_type), 1 => (6..=8).contains(&r.res_type), 2 => r.res_type == 2, 3 => r.res_type == 1, _ => false };
+                class && r.lower <= reg && reg <= r.upper
+            }).map(|r| r.space).collect();
+            spaces.sort_unstable();
+            spaces.dedup();
+            match spaces.as_slice() {
+                [one] => *space = *one,
+                [] => {},
+                _ => return Err(format!("FSSM register {reg} has ambiguous PSV register spaces {spaces:?}")),
+            }
+            Ok(())
+        };
+        match &mut param.kind {
+            RootParamKind::Table(ranges) => for r in ranges { fill(r.range_type, r.base_register, &mut r.space)?; },
+            RootParamKind::Descriptor { kind, register, space } => fill(match kind { 2 => 2, 3 => 0, _ => 1 }, *register, space)?,
+            RootParamKind::Constants { register, space, .. } => fill(2, *register, space)?,
+        }
+    }
+    Ok(root)
+}
+
+fn out_interp_for(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>) -> InputInterp {
+    match ex.stage {
         Stage::Vertex | Stage::Geometry | Stage::Mesh => feeds_ps.cloned().unwrap_or_default(),
         _ => InputInterp::default(),
-    };
+    }
+}
+
+fn translate_linked_with(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, user_data: bool) -> Result<Translated, String> {
+    let out_interp = out_interp_for(ex, feeds_ps);
     match translate_with(ex, &out_interp, None, BTreeSet::new(), user_data, None) {
         Err(e) if disassemble(&ex.isa).iter().take(16).any(|i| i.mnemonic == "s_swappc_b64") => translate_with(ex, &out_interp, Some(8), BTreeSet::new(), user_data, None).map_err(|e2| if e2.contains("not a buffer descriptor") || e2.contains("not a root table") { e } else { e2 }),
         r => r,
@@ -1294,6 +1368,9 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
         res: HashMap::new(),
         cb_size: BTreeMap::new(),
         vs_lat: HashMap::new(),
+        cfg: None,
+        sampler_literals: None,
+        direct_heap_slots: std::cell::OnceCell::new(),
         uses_smem_bounds: false,
         cb_lim: HashMap::new(),
         tex: BTreeMap::new(),
@@ -1402,10 +1479,12 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
     } else {
         em.emit_body(is_ps)?;
     }
-    if em.cb_size.keys().any(|&slot| em.direct_resource_heap(slot)) {
+    let mut hlsl = em.finish(is_ps, cooperative_gws)?;
+    // Both instruction lowering and resource declarations can emit heap lookups.
+    // Select the profile after both have been generated.
+    if hlsl.contains("ResourceDescriptorHeap[") || hlsl.contains("SamplerDescriptorHeap[") {
         em.sm6_minor = em.sm6_minor.max(6);
     }
-    let mut hlsl = em.finish(is_ps, cooperative_gws)?;
     hlsl.insert_str(0, &format!("// entry-live registers (read before written): {}
 ", live_in.join(" ")));
     // ps_5_0 forces UAV slots to start after the render-target outputs (FXC X4509);
@@ -1650,13 +1729,21 @@ impl<'a> Emitter<'a> {
         self.direct_heap(slot, 0x400)
     }
 
-    // With one directly indexed heap, Scarlett passes its base after the root arguments.
     fn direct_heap(&self, slot: u32, flag: u32) -> bool {
         let Some(rs) = self.ex.root_sig.as_ref() else { return false };
-        if rs.flags & 0xc00 != flag || slot & BINDLESS == 0 || self.rootmem() || self.dg().is_some() {
+        if rs.flags & flag == 0 || slot & BINDLESS == 0 || self.rootmem() || self.dg().is_some() {
             return false;
         }
         let Some(&(table, _)) = self.bl.get((slot & BINDLESS_LOAD_MASK) as usize) else { return false };
+        if let Some((resource, sampler)) = self.direct_heap_slots.get_or_init(|| {
+            crate::fssm_bind::parse(&self.ex.fssm).ok().flatten().map(|b| (b.resource_heap, b.sampler_heap))
+        }) {
+            return (if flag == 0x400 { *resource } else { *sampler }) == Some(table);
+        }
+        // Without FSSM metadata the layout is known only for one directly indexed heap.
+        if rs.flags & 0xc00 != flag {
+            return false;
+        }
         let root_dwords: usize = rs.params.iter().map(|p| match &p.kind {
             crate::meta::RootParamKind::Table(_) => 1,
             crate::meta::RootParamKind::Descriptor { .. } => 2,
@@ -1744,18 +1831,14 @@ impl<'a> Emitter<'a> {
     /// the control-flow graph: state = (known symbolic values, set of written SGPRs), join =
     /// keep only values every predecessor agrees on / union of written sets. A final pass
     /// then walks each block with its entry state and records the resources.
-    fn resolve_resources(&mut self) -> Result<(), String> {
-        type State = (HashMap<u16, Sym>, BTreeSet<u16>);
-        let n = self.insns.len();
-        if n == 0 {
-            return Ok(());
-        }
-        let off2idx: HashMap<usize, usize> = self.insns.iter().enumerate().map(|(i, x)| (x.offset, i)).collect();
+    fn instruction_cfg(insns: &[Insn]) -> (Vec<std::ops::Range<usize>>, Vec<Vec<usize>>) {
+        let n = insns.len();
+        let off2idx: HashMap<usize, usize> = insns.iter().enumerate().map(|(i, x)| (x.offset, i)).collect();
         // Block leaders and per-instruction branch targets.
         let mut leaders: BTreeSet<usize> = BTreeSet::new();
         leaders.insert(0);
         let mut tgt: HashMap<usize, usize> = HashMap::new();
-        for (i, ins) in self.insns.iter().enumerate() {
+        for (i, ins) in insns.iter().enumerate() {
             if ins.enc != Enc::Sopp {
                 continue;
             }
@@ -1778,7 +1861,7 @@ impl<'a> Emitter<'a> {
             .iter()
             .map(|r| {
                 let last = r.end - 1;
-                let ins = &self.insns[last];
+                let ins = &insns[last];
                 let mut v = Vec::new();
                 let is_sopp = ins.enc == Enc::Sopp;
                 if let Some(&t) = tgt.get(&last) {
@@ -1791,6 +1874,17 @@ impl<'a> Emitter<'a> {
                 v
             })
             .collect();
+        (ranges, succs)
+    }
+
+    fn resolve_resources(&mut self) -> Result<(), String> {
+        type State = (HashMap<u16, Sym>, BTreeSet<u16>);
+        if self.insns.is_empty() {
+            return Ok(());
+        }
+        let (ranges, succs) = Self::instruction_cfg(&self.insns);
+        self.cfg = Some((ranges.clone(), succs.clone()));
+        self.sampler_literals = None;
 
         // Fixpoint (analysis only: recordings are rolled back afterwards).
         let saved = (
@@ -2238,7 +2332,11 @@ impl<'a> Emitter<'a> {
             return self.mtbuf_res(ins, slot, table, off);
         }
         let writes = ins.mnemonic.contains("store") || ins.mnemonic.contains("atomic") || self.uav_force.contains(&slot);
-        let kind = self.kind_at(table, off, writes)?;
+        let kind = if self.direct_resource_heap(slot) {
+            Some(u32::from(writes))
+        } else {
+            self.kind_at(table, off, writes)?
+        };
         if slot & BINDLESS != 0 && kind.is_some_and(|k| k <= 1) {
             if kind == Some(1) { self.bl_uav.insert(slot); } else { self.bl_srv.insert(slot); }
         }
@@ -2668,7 +2766,11 @@ impl<'a> Emitter<'a> {
                     for (ttable, off) in &tex_c {
                         let tslot = self.bind_id(*ttable, *off, 32);
                         let writes = ins.mnemonic.contains("store") || ins.mnemonic.contains("atomic") || self.uav_force.contains(&tslot);
-                        let is_uav = self.kind_at(*ttable, *off, writes)? == Some(1);
+                        let is_uav = if self.direct_resource_heap(tslot) && writes {
+                            true
+                        } else {
+                            self.kind_at(*ttable, *off, writes)? == Some(1)
+                        };
                         let dim = self.gcn_image_dim(*ttable, *off, is_uav, da_dim);
                         let tslot = if self.direct_resource_heap(tslot) {
                             self.sm6_minor = self.sm6_minor.max(6);
@@ -2716,7 +2818,10 @@ impl<'a> Emitter<'a> {
                             });
                             match self.scarlett_media_sampler(idx, descriptor) {
                                 Some(sampler) => Some(sampler),
-                                None => self.literal_static_sampler(idx, ss)?,
+                                None => match self.fssm_static_sampler(idx, ss)? {
+                                    Some(slot) => Some(slot),
+                                    None => self.literal_static_sampler(idx, ss)?,
+                                },
                             }
                         } else {
                             None
@@ -3465,6 +3570,9 @@ impl<'a> Emitter<'a> {
         let d = ins.dst.first().cloned();
         self.line(&format!("// {:#06x} {m}", ins.offset));
         self.cur_idx = idx;
+        if ins.enc == Enc::Vop3 && matches!(ins.op, 0x342 | 0x343 | 0x35a) {
+            return self.emit_half_interp(idx, ins, is_ps);
+        }
         if let Some(&id) = self.epilog_pack.get(&idx) {
             // Export epilogue: keep the unpacked operands (see `find_export_epilogs`).
             for (k, sfx) in ["a", "b"].iter().enumerate() {
@@ -3951,6 +4059,20 @@ impl<'a> Emitter<'a> {
                     "s_swappc_b64" => {
                         // Vertex-fetch shader call: inputs are materialised from the D3D input layout.
                         self.line("// (fetch-shader call: vertex attributes come from the input layout)");
+                        Ok(())
+                    }
+                    "s_andn1_wrexec_b32" | "s_andn2_wrexec_b32" => {
+                        let e = if m == "s_andn1_wrexec_b32" {
+                            format!("(~{a} & exec_lo)")
+                        } else {
+                            format!("({a} & ~exec_lo)")
+                        };
+                        let t = self.tmp;
+                        self.tmp += 1;
+                        // Keep the new mask in a temporary when source and destination alias.
+                        self.line(&format!("uint t{t} = {e} & 1u;"));
+                        self.ws(&d, &format!("t{t}"))?;
+                        self.line(&format!("exec_lo = t{t}; scc = t{t};"));
                         Ok(())
                     }
                     _ if m.contains("saveexec") => {
@@ -4540,25 +4662,7 @@ impl<'a> Emitter<'a> {
                 if !is_ps {
                     return Err("v_interp outside a pixel shader".into());
                 }
-                let attr = ins.aux.imm as usize;
-                let chan = ins.aux.imm2 as usize;
-                let layer_or_viewport = |e: &SigElement| matches!(e.sysval, 4 | 5) && e.rw_mask != 0;
-                let (reg, system_value) = match self.ps_attrs.get(attr) {
-                    Some(r) => (*r, false),
-                    None => (*distinct_regs(self.ex.input_sig.iter().filter(|e| layer_or_viewport(e)))
-                        .get(attr - self.ps_attrs.len())
-                        .ok_or_else(|| format!("PS attr{attr} has no signature register"))?, true),
-                };
-                let val = if let Some((ei, k)) = sig_lookup(&self.ex.input_sig, reg, chan, |e| {
-                    if system_value { layer_or_viewport(e) } else { e.sysval == 0 }
-                }) {
-                    let acc = format!("i.i{ei}.{}", XYZW[k]);
-                    if self.ex.input_sig[ei].comp_type == 3 { format!("asuint({acc})") } else { format!("(uint)({acc})") }
-                } else if chan == 3 {
-                    "0x3f800000u".to_string()
-                } else {
-                    "0u".to_string()
-                };
+                let val = self.ps_attr_bits(ins.aux.imm as usize, ins.aux.imm2 as usize)?;
                 // p1 computes a partial term in hardware; the full interpolated value is
                 // already available per-pixel here, so both steps assign it.
                 self.wv(&d.ok_or("no dst")?, &val)
@@ -4566,6 +4670,85 @@ impl<'a> Emitter<'a> {
             Enc::Exp => self.emit_exp(ins, is_ps),
             _ => Err("unsupported encoding".into()),
         }
+    }
+
+    fn ps_attr_bits(&self, attr: usize, chan: usize) -> Result<String, String> {
+        let layer_or_viewport = |e: &SigElement| matches!(e.sysval, 4 | 5) && e.rw_mask != 0;
+        let (reg, system_value) = match self.ps_attrs.get(attr) {
+            Some(r) => (*r, false),
+            None => (*distinct_regs(self.ex.input_sig.iter().filter(|e| layer_or_viewport(e)))
+                .get(attr - self.ps_attrs.len())
+                .ok_or_else(|| format!("PS attr{attr} has no signature register"))?, true),
+        };
+        Ok(if let Some((ei, k)) = sig_lookup(&self.ex.input_sig, reg, chan, |e| {
+            if system_value { layer_or_viewport(e) } else { e.sysval == 0 }
+        }) {
+            let acc = format!("i.i{ei}.{}", XYZW[k]);
+            if matches!(self.ex.input_sig[ei].comp_type, 3 | 6) { format!("asuint({acc})") } else { format!("(uint)({acc})") }
+        } else if chan == 3 {
+            "0x3f800000u".into()
+        } else {
+            "0u".into()
+        })
+    }
+
+    fn emit_half_interp(&mut self, idx: usize, ins: &Insn, is_ps: bool) -> Result<(), String> {
+        if !is_ps {
+            return Err("FP16 interpolation outside a pixel shader".into());
+        }
+        if ins.raw[1] & 0x100 != 0 {
+            return Err("FP16 interpolation of the upper packed attribute needs a signature mapping".into());
+        }
+        let dst = *ins.dst.first().ok_or("FP16 interpolation has no destination")?;
+        let (ranges, successors) = self.cfg.as_ref().ok_or("FP16 interpolation needs a control-flow graph")?;
+        let (block_index, block) = ranges.iter().enumerate().find(|(_, range)| range.contains(&idx)).ok_or("FP16 interpolation needs a basic block")?;
+        let matches_attribute = |other: &Insn| {
+            other.enc == Enc::Vop3 && (other.raw[1] & 0x1ff) == (ins.raw[1] & 0x1ff)
+        };
+        // The host rasterizer provides the final interpolant. Fold the RDNA2 pair
+        // only when its partial value flows directly into the matching second step.
+        if ins.op == 0x343 {
+            return Err("FP16 interpolation with a VGPR coefficient needs its P0 value traced".into());
+        }
+        if ins.op == 0x342 {
+            let access = |next: &Insn| next.src.contains(&dst) || next.dst.contains(&dst);
+            let consumer = (idx + 1..block.end).find(|&at| access(&self.insns[at]));
+            let at = consumer.filter(|&at| {
+                let next = &self.insns[at];
+                matches_attribute(next) && next.op == 0x35a && next.src.get(1) == Some(&dst)
+                    && next.dst.first() != Some(&dst) && next.src.first() != Some(&dst)
+            }).ok_or("FP16 interpolation has a partial result used outside its matching second step")?;
+            let mut seen = BTreeSet::new();
+            let mut pending = vec![(block_index, at + 1)];
+            while let Some((block, start)) = pending.pop() {
+                let range = &ranges[block];
+                if start == range.start && !seen.insert(block) {
+                    continue;
+                }
+                if let Some(next) = self.insns[start..range.end].iter().find(|next| access(next)) {
+                    if next.src.contains(&dst) {
+                        return Err("FP16 interpolation partial result is read after its matching second step".into());
+                    }
+                } else {
+                    pending.extend(successors[block].iter().map(|&next| (next, ranges[next].start)));
+                }
+            }
+            return Ok(());
+        }
+        let partial = ins.src.get(1).ok_or("FP16 interpolation has no partial input")?;
+        let producer = self.insns[block.start..idx].iter().rev().find(|prev| prev.dst.contains(partial));
+        if !producer.is_some_and(|prev| matches_attribute(prev) && prev.op == 0x342) {
+            return Err("FP16 interpolation has no matching first step".into());
+        }
+        let bits = self.ps_attr_bits(ins.aux.imm as usize, ins.aux.imm2 as usize)?;
+        let old = r(&dst)?;
+        let half = format!("f32tof16(asfloat({bits}))");
+        let value = if ins.raw[0] & (1 << 14) != 0 {
+            format!("(({old} & 0xffffu) | ({half} << 16))")
+        } else {
+            format!("(({old} & 0xffff0000u) | {half})")
+        };
+        self.wv(&dst, &value)
     }
 
     fn vcmp_cond(&mut self, ins: &Insn, base: &str) -> Result<String, String> {
@@ -5897,27 +6080,34 @@ impl<'a> Emitter<'a> {
                 _ => return Err("bad vdata".into()),
             };
             let nm = if is_uav { format!("utb{slot}") } else { format!("stb{slot}") };
+            let d16 = (0x80..=0x87).contains(&ins.op);
             if ins.mnemonic.starts_with("buffer_store") {
                 if !is_uav {
                     return Err("buffer_store_format to a non-UAV table".into());
                 }
-                let mut c = vec![];
+                let kind = self.tbuf_ty.get(&(is_uav, slot)).copied();
+                let mut c = Vec::with_capacity(4);
                 for k in 0..4u8 {
                     if k < n {
-                        let o = Opnd::Vgpr(vd + k);
+                        let o = Opnd::Vgpr(vd + if d16 { k / 2 } else { k });
                         self.touch(&o);
-                        c.push(f(&o)?);
+                        let value = if d16 {
+                            let word = r(&o)?;
+                            let part = if k & 1 == 0 { format!("({word} & 0xffffu)") } else { format!("({word} >> 16)") };
+                            match kind {
+                                Some(2) => format!("(asint({part} << 16) >> 16)"),
+                                Some(_) => part,
+                                None => format!("f16tof32({part})"),
+                            }
+                        } else if kind.is_some() { r(&o)? } else { f(&o)? };
+                        c.push(value);
                     } else {
-                        c.push("0.0".into());
+                        c.push(if kind.is_some() { "0u" } else { "0.0" }.into());
                     }
                 }
-                match self.tbuf_ty.get(&(is_uav, slot)) {
+                match kind {
                     Some(t) => {
-                        let mut c = vec![];
-                        for k in 0..4u8 {
-                            c.push(if k < n { r(&Opnd::Vgpr(vd + k))? } else { "0u".into() });
-                        }
-                        let ctor = if *t == 2 { "int4" } else { "uint4" };
+                        let ctor = if t == 2 { "int4" } else { "uint4" };
                         self.line(&format!("if (exec_lo & 1u) {nm}[{index}] = {ctor}({});", c.join(", ")));
                     }
                     None => {
@@ -5937,6 +6127,25 @@ impl<'a> Emitter<'a> {
                     None => "float4",
                 };
                 self.line(&format!("{ety} t{t} = {nm}[{index}];"));
+                if d16 {
+                    for pair in 0..n.div_ceil(2) {
+                        let dst = Opnd::Vgpr(vd + pair);
+                        let half = |k: u8| {
+                            let c = XYZW[k as usize];
+                            if ety == "float4" { format!("tb_f2h(t{t}.{c})") }
+                            else { format!("((uint)t{t}.{c} & 0xffffu)") }
+                        };
+                        let low = half(pair * 2);
+                        let high = if pair * 2 + 1 < n {
+                            format!("({} << 16)", half(pair * 2 + 1))
+                        } else {
+                            self.touch(&dst);
+                            format!("({} & 0xffff0000u)", r(&dst)?)
+                        };
+                        self.wv(&dst, &format!("({low} | {high})"))?;
+                    }
+                    return Ok(());
+                }
                 for k in 0..n {
                     let c = XYZW[k as usize];
                     let e = match ety {
@@ -6925,6 +7134,10 @@ impl<'a> Emitter<'a> {
         // control flow; there is no SM5 equivalent, so inside emitted loops such samples
         // are APPROXIMATED with LOD 0 (exact for single-mip textures, too sharp otherwise).
         let in_loop = self.loop_depth > 0;
+        if self.is_cs && !in_loop && matches!(modi, 0 | 1 | 5 | 6) {
+            // Compute, mesh and amplification need SM 6.6 for implicit derivatives.
+            self.sm6_minor = self.sm6_minor.max(6);
+        }
         let call = if let Some(z) = &zref {
             // Depth-compare sampling returns a single value.
             match modi {

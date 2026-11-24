@@ -61,6 +61,7 @@ mod xlat_index;
 mod pso_lib;
 mod pso_prewarm;
 mod pso_xrec;
+mod shader_archive;
 mod overlay_font;
 mod overlay_sensors;
 mod vram_log;
@@ -117,6 +118,7 @@ mod dbcount;
 mod cl_fw;
 mod gds;
 mod gws_dispatch;
+mod fssm_compute;
 mod gws_scratch;
 pub mod centroid_bind;
 mod list_split;
@@ -286,12 +288,32 @@ pub extern "system" fn D3D12XboxCreateDevice(
         unsafe { *pp_device = core::ptr::null_mut() };
     }
     process_debug::install_native_exception_log();
+    compat_common::os_host::install_bink_probe();
     let _ = xgs_kmd_emu::api();
     present::start_window_clamp();
+    overlay::start_shader_title();
     agility::select();
     enable_experimental_shader_models();
     let driver = maybe_enable_debug_layer(_params);
     dred::enable_before_create();
+    let hr = create_host_device(riid, pp_device);
+    process_debug::mark_device_created();
+    if hr == S_OK && !pp_device.is_null() {
+        let real = unsafe { *pp_device };
+        if !real.is_null() {
+            unsafe { process_debug::capture_messages(real) };
+            dred::watch(real);
+            let wrapped = device_wrap::wrap_device_for_driver(real, driver);
+            unsafe { *pp_device = wrapped };
+            record(M, "D3D12XboxCreateDevice", &format!("host device {real:p} wrapped as {wrapped:p} (hr={hr:#010x})"));
+            return hr;
+        }
+    }
+    record(M, "D3D12XboxCreateDevice", &format!("host device create -> hr={hr:#010x} (unwrapped)"));
+    hr
+}
+
+fn create_host_device(riid: *const c_void, pp_device: *mut *mut c_void) -> i32 {
     let p = host_proc(b"D3D12CreateDevice\0");
     if p == 0 {
         record(M, "D3D12XboxCreateDevice", "host D3D12CreateDevice missing -> E_FAIL");
@@ -317,20 +339,74 @@ pub extern "system" fn D3D12XboxCreateDevice(
     let hr = agility::create_device(adapter, D3D_FEATURE_LEVEL_12_0, riid, pp_device)
         .unwrap_or_else(|| f(adapter, D3D_FEATURE_LEVEL_12_0, riid, pp_device));
     unsafe { xone_dxgi::com_release(adapter as usize) };
+    hr
+}
+
+/// Run in a dedicated helper named after the title, with the same cache and
+/// graphics settings. A limit of zero replays the whole captured journal.
+#[no_mangle]
+pub extern "system" fn TomBoxPrewarmPipelines(limit: u32, jobs: u32) -> i32 {
+    agility::select();
+    enable_experimental_shader_models();
+    maybe_enable_debug_layer(core::ptr::null());
+    let mut real = core::ptr::null_mut();
+    let hr = create_host_device(IID_ID3D12Device.as_ptr().cast(), &mut real);
+    if hr < 0 || real.is_null() {
+        return if hr < 0 { hr } else { E_FAIL };
+    }
     process_debug::mark_device_created();
-    if hr == S_OK && !pp_device.is_null() {
-        let real = unsafe { *pp_device };
-        if !real.is_null() {
-            unsafe { process_debug::capture_messages(real) };
-            dred::watch(real);
-            let wrapped = device_wrap::wrap_device_for_driver(real, driver);
-            unsafe { *pp_device = wrapped };
-            record(M, "D3D12XboxCreateDevice", &format!("host device {real:p} wrapped as {wrapped:p} (hr={hr:#010x})"));
-            return hr;
+    if process_debug::debug_layer_enabled() {
+        unsafe { process_debug::capture_messages(real) };
+    }
+    let wrapped = device_wrap::wrap_device_offline(real);
+    let result = pso_xrec::replay_offline(real, wrapped, limit as usize, jobs as usize);
+    unsafe { xone_dxgi::com_release(wrapped as usize) };
+    match result {
+        Ok(()) => S_OK,
+        Err(error) => {
+            record(M, "pso_offline", &error);
+            E_FAIL
         }
     }
-    record(M, "D3D12XboxCreateDevice", &format!("host device create -> hr={hr:#010x} (unwrapped)"));
-    hr
+}
+
+/// The paths are NUL-terminated UTF-16 strings. A count of zero creates the
+/// index. Other calls compile a range of entries from that index.
+#[no_mangle]
+pub unsafe extern "system" fn TomBoxPrewarmShaderArchive(archive: *const u16, index: *const u16, start: u32, count: u32, jobs: u32) -> i32 {
+    use std::os::windows::ffi::OsStringExt;
+
+    unsafe fn read_path(path: *const u16) -> Option<std::path::PathBuf> {
+        if path.is_null() {
+            return None;
+        }
+        let length = (0..32768).find(|&i| unsafe { *path.add(i) == 0 })?;
+        let text = unsafe { core::slice::from_raw_parts(path, length) };
+        Some(std::ffi::OsString::from_wide(text).into())
+    }
+
+    let (Some(archive), Some(index)) = (unsafe { read_path(archive) }, unsafe { read_path(index) }) else { return E_INVALIDARG };
+    let result = if count == 0 {
+        shader_archive::index(&archive, &index).map(|_| ())
+    } else {
+        agility::select();
+        enable_experimental_shader_models();
+        let mut real = core::ptr::null_mut();
+        let hr = create_host_device(IID_ID3D12Device.as_ptr().cast(), &mut real);
+        if hr < 0 || real.is_null() {
+            return if hr < 0 { hr } else { E_FAIL };
+        }
+        unsafe { shader_xlat::probe_typed_atomic64(real) };
+        unsafe { xone_dxgi::com_release(real as usize) };
+        shader_archive::warm(&archive, &index, start as usize, count as usize, jobs as usize)
+    };
+    match result {
+        Ok(()) => S_OK,
+        Err(error) => {
+            record(M, "shader_archive", &error);
+            E_FAIL
+        }
+    }
 }
 
 #[no_mangle]

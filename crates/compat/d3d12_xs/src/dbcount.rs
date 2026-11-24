@@ -627,6 +627,26 @@ fn stream_rec(pso: usize) -> Option<Arc<StreamRec>> {
     STREAMS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&pso).cloned()
 }
 
+pub(crate) fn stream_summary(pso: usize) -> Option<(usize, usize, String)> {
+    let record = stream_rec(pso)?;
+    let stage = |ty| {
+        find_sub(&record.subs, ty)
+            .map_or(0, |offset| u64_at(&record.stream, offset) as usize)
+    };
+    let field = |ty, byte| {
+        find_sub(&record.subs, ty).map(|offset| u32_at(&record.stream, offset + byte))
+    };
+    let blend = find_sub(&record.subs, SUB_BLEND).map(|o| &record.stream[o..o + BLEND_LEN]).map_or_else(default_blend, |b| b.to_vec());
+    let depth = info_from_stream(&record.stream, &record.subs).ds;
+    let state = format!(
+        "pipeline-state stream: fill={:?} cull={:?} front_ccw={:?} sample_mask={:?} forced_samples={:?} input_elements={:?} blend0(en={} src={} dst={} op={} srcA={} dstA={} mask={:#x}) depth_stencil={depth:?}",
+        field(10, 0), field(10, 4), field(10, 8), field(9, 0), field(10, 36),
+        field(SUB_INPUT_LAYOUT, 8),
+        u32_at(&blend, 8), u32_at(&blend, 16), u32_at(&blend, 20), u32_at(&blend, 24), u32_at(&blend, 28), u32_at(&blend, 32), blend[44],
+    );
+    Some((stage(SUB_VS), stage(SUB_PS), state))
+}
+
 #[derive(Clone)]
 enum Src {
     Desc { desc: Vec<u8>, id: usize, _keep: Arc<dyn Send + Sync> },
@@ -1145,18 +1165,21 @@ unsafe fn create_pc_stream(
     Ok(hr)
 }
 
-pub(crate) unsafe fn rect_stream_pso(dev: *mut c_void, pso: usize) -> Option<usize> {
+pub(crate) unsafe fn rect_stream_pso(pso: usize) -> Option<usize> {
     static RECT: Mutex<Option<HashMap<usize, (Arc<StreamRec>, usize)>>> = Mutex::new(None);
     let source = stream_rec(pso)?;
-    if dev.is_null() {
-        return Some(0);
-    }
     let mut cache = RECT.lock().unwrap_or_else(|e| e.into_inner());
     let variants = cache.get_or_insert_with(HashMap::new);
     if let Some((saved, variant)) = variants.get(&pso) {
         if Arc::ptr_eq(saved, &source) {
             return Some(*variant);
         }
+    }
+    // Stream-only callers may never create a legacy graphics PSO. Get the
+    // device from this PSO, which also keeps the variant on its owning device.
+    let dev = unsafe { device_of(pso as *mut c_void) };
+    if dev.is_null() {
+        return None;
     }
     let result = crate::rectlist::expand_stream(&source).and_then(|stream| {
         let mut out = core::ptr::null_mut();

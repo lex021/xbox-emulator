@@ -65,6 +65,25 @@ struct State {
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+static TRACE_SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TRACE_EVENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn watch_descriptor_slot(cpu: usize) {
+    use std::sync::atomic::Ordering;
+    if !std::env::var_os("TOMBOX_TRACE_FINAL_WRITER").is_some_and(|v| v == "1") { return; }
+    if TRACE_SLOT.compare_exchange(0, cpu, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+        compat_common::record("d3d12_xs", "descriptor_writer", &format!("watching slot {cpu:#x} from this bind onward; earlier writes are not observed; bind stack:\n{}", std::backtrace::Backtrace::force_capture()));
+    }
+}
+
+fn trace_watched_write(dest: usize, count: usize, increment: usize, label: &str) {
+    use std::sync::atomic::Ordering;
+    let target = TRACE_SLOT.load(Ordering::Acquire);
+    if target == 0 || increment == 0 || count == 0 || target < dest || target.saturating_sub(dest) >= count.saturating_mul(increment) { return; }
+    if TRACE_EVENTS.fetch_add(1, Ordering::Relaxed) < 8 {
+        compat_common::record("d3d12_xs", "descriptor_writer", &format!("{label} covers watched slot={target:#x}, dest={dest:#x}, count={count}, increment={increment}; stack:\n{}", std::backtrace::Backtrace::force_capture()));
+    }
+}
 
 fn history_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -79,12 +98,14 @@ fn history(s: &mut State, dest: usize, event: String) {
 }
 
 pub(crate) fn trace_raw_cbv_request(dest: usize, va: u64, size: u32) {
+    trace_watched_write(dest, 1, 32, "CBV request");
     if history_on() {
         with(|s| { let frame = s.frame; history(s, dest, format!("frame {frame} CBV request va={va:#x} size={size}")); });
     }
 }
 
 pub(crate) fn trace_media_write(dest: usize, source: &str) {
+    trace_watched_write(dest, 1, 32, source);
     if history_on() {
         with(|s| { let frame = s.frame; history(s, dest, format!("frame {frame} media materialization: {source}")); });
     }
@@ -174,6 +195,7 @@ pub fn all_views() -> Vec<(usize, bool)> {
 }
 
 pub fn note_desc(dest: usize, d: Desc) {
+    trace_watched_write(dest, 1, 32, "Create descriptor");
     match &d {
         Desc::Srv { res, .. } => crate::firstuse::note(*res, crate::firstuse::SRV),
         Desc::Uav { res, .. } => crate::firstuse::note(*res, crate::firstuse::UAV),
@@ -193,10 +215,32 @@ pub fn copy_desc(dest: usize, src: usize, n: u32, heap_type: u32) {
 }
 
 pub fn copy_desc_api(dest: usize, src: usize, n: u32, heap_type: u32, operation: &str) {
+    trace_watched_write(dest, n as usize, increment(heap_type), operation);
     with(|s| {
         let inc = s.inc.get(heap_type as usize).copied().unwrap_or(0);
         if inc == 0 {
             return;
+        }
+        if std::env::var_os("TOMBOX_TRACE_DESCRIPTOR_WINDOW").is_some_and(|v| v == "1") && heap_type == 0 {
+            for heap in &s.heaps {
+                if heap.count != 802816 || heap.inc == 0 { continue; }
+                let start = heap.cpu.saturating_add(386800usize.saturating_mul(heap.inc));
+                let end = start.saturating_add(11usize.saturating_mul(heap.inc));
+                let copy_end = dest.saturating_add((n as usize).saturating_mul(inc));
+                let lo = dest.max(start);
+                let hi = copy_end.min(end);
+                if lo >= hi { continue; }
+                for i in 0..n as usize {
+                    let dst = dest.saturating_add(i.saturating_mul(inc));
+                    if dst < start || dst >= end { continue; }
+                    let source = src.saturating_add(i.saturating_mul(inc));
+                    let words = if crate::heap_wrap::guest_shadow_contains(source, 32) && crate::title_shadow::is_readable_range(source, 32) {
+                        let data = unsafe { core::slice::from_raw_parts(source as *const u8, 32) };
+                        format!("{data:02x?}")
+                    } else { "unavailable (not a readable tracked guest shadow)".to_string() };
+                    compat_common::record("d3d12_xs", "descriptor_window", &format!("{operation} index={} dst_guest={dst:#x} dst_native={:#x} src_guest={source:#x} src_native={:#x} guest_source={words}", (dst-heap.cpu)/heap.inc, crate::heap_wrap::native_cpu_handle(dst), crate::heap_wrap::native_cpu_handle(source)));
+                }
+            }
         }
         let frame = s.frame;
         for i in 0..n as usize {
@@ -703,16 +747,16 @@ pub(crate) fn guest_table_neighbors(list: usize, param: usize) -> Vec<String> {
     }).collect()
 }
 
-pub(crate) fn neighbor_probe_wanted(h: u64) -> bool {
+pub(crate) fn neighbor_probe_wanted(ps_hash: u64, vs_hash: u64) -> bool {
     if !history_on() {
         return false;
     }
     let vs = crate::passcap::neighbor_probe_vs();
     let ps = crate::passcap::probe_hashes();
     if !vs.is_empty() {
-        vs.contains(&h)
+        vs.contains(&vs_hash)
     } else if !ps.is_empty() {
-        ps.contains(&h)
+        ps.contains(&ps_hash)
     } else {
         false
     }

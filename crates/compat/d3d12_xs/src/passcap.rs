@@ -126,6 +126,19 @@ pub fn parse(v: &str) -> Option<Sel> {
         return None;
     }
     let mut s = Sel { secs: Vec::new(), presents: Vec::new(), file: false, frames: 1, budget_mb: 1200, max_caps: 400, chain_every: 600, all: false, raw: false, unknown: Vec::new(), ps_ms: None, ps_draw: None };
+    // `early` selects the present schedule that is actually reachable: startup
+    // cost makes the title's own watchdog trap before present 120, so the
+    // diagnostic frames are 2 and 12 where the media passes are already drawn.
+    // An explicit f:/frame:/present: token always wins over this default.
+    let toks: Vec<&str> = v.split([',', ';', ' ']).map(str::trim).filter(|t| !t.is_empty()).collect();
+    let explicit_present = toks.iter().any(|t| {
+        let key = t.split([':', '=']).next().unwrap_or("").to_ascii_lowercase();
+        matches!(key.as_str(), "f" | "frame" | "present")
+    });
+    let early = toks.iter().any(|t| matches!(t.to_ascii_lowercase().as_str(), "early" | "e"));
+    if early && !explicit_present {
+        s.presents = vec![2, 12];
+    }
     for tok in v.split([',', ';', ' ']).map(str::trim).filter(|t| !t.is_empty()) {
         let (k, val) = match tok.find([':', '=']) {
             Some(i) => (tok[..i].to_ascii_lowercase(), Some(tok[i + 1..].trim())),
@@ -150,10 +163,15 @@ pub fn parse(v: &str) -> Option<Sel> {
             }
             ("ps_ms" | "psms", Some(v)) => parse_ps_ms(v).map(|x| s.ps_ms = Some(x)).is_some(),
             ("ps", Some(v)) => parse_ps_draw(v).map(|x| s.ps_draw = Some(x)).is_some(),
+            // `vs:<hash>` names the vertex shader whose guest descriptor
+            // neighbourhood should be dumped. Accepted here (and kept in
+            // `TOMBOX_PASSCAP_VS`) so one env var describes the whole probe.
+            ("vs", Some(v)) => parse_hex_list(v).is_some_and(|l| { push_vs(&l); true }),
             ("raw", None) => {
                 s.raw = true;
                 true
             }
+            ("early", None) | ("e", None) => true,
             (_, None) => num(Some(k.as_str())).map(|f| s.secs.push(f)).is_some(),
             _ => false,
         };
@@ -613,6 +631,7 @@ struct LState {
     probe_notes: Vec<String>,
     probe_q: usize,
     probe_oq: usize,
+    probe_extra: Vec<(String, u64, usize)>,
 }
 
 struct ProbeBuf {
@@ -673,7 +692,7 @@ struct Shot {
     budget_note: Option<String>,
     ps_cache: HashMap<usize, u64>,
     probes: Vec<ProbeBuf>,
-    cpu_pending: Vec<(usize, u64, String)>,
+    cpu_pending: Vec<(usize, u64, String, Option<usize>)>,
     cpu_submit: Vec<String>,
 }
 
@@ -891,6 +910,73 @@ pub fn probe_hashes() -> &'static [u64] {
     P.get_or_init(|| std::env::var("TOMBOX_PASSCAP_PS").map(|v| v.split(|c: char| c == ',' || c.is_whitespace()).filter_map(|w| u64::from_str_radix(w.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default())
 }
 
+/// Parse a comma/space separated list of hex hashes, ignoring empty items.
+pub fn parse_hex_list(v: &str) -> Option<Vec<u64>> {
+    let list: Vec<u64> = v
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(|w| w.trim())
+        .filter(|w| !w.is_empty())
+        .filter_map(|w| u64::from_str_radix(w.trim_start_matches("0x"), 16).ok())
+        .filter(|x| *x != 0)
+        .collect();
+    (!list.is_empty()).then_some(list)
+}
+
+/// Append a `vs:` hash from `TOMBOX_PASSCAP` to the VS probe list, which is the
+/// same static the banner and `bindtrace::neighbor_probe_wanted` read.
+fn push_vs(list: &[u64]) {
+    let target = NEIGHBOR_VS.get_or_init(|| {
+        std::env::var("TOMBOX_PASSCAP_VS").ok().and_then(|v| parse_hex_list(&v)).unwrap_or_default()
+    });
+    // The OnceLock is frozen after first read; store extras separately so a
+    // `vs:` token still works when `TOMBOX_PASSCAP_VS` was read first.
+    let extra = VS_FROM_SEL.get_or_init(|| Mutex::new(Vec::new()));
+    let mut extra = extra.lock().unwrap();
+    for h in list {
+        if !target.contains(h) && !extra.contains(h) {
+            extra.push(*h);
+        }
+    }
+}
+
+static NEIGHBOR_VS: OnceLock<Vec<u64>> = OnceLock::new();
+static VS_FROM_SEL: OnceLock<Mutex<Vec<u64>>> = OnceLock::new();
+
+/// VS/PS hashes whose guest descriptor neighbourhood should be dumped.
+///
+/// `TOMBOX_PASSCAP_VS` takes VS origin hashes; `vs:` inside `TOMBOX_PASSCAP`
+/// adds to the same set. The PS list from `TOMBOX_PASSCAP_PS` is accepted too,
+/// so a probe can be aimed at whichever hash the caller knows. Empty means the
+/// fallback in `bindtrace::neighbor_probe_wanted` decides (media PS only).
+pub fn neighbor_probe_vs() -> Vec<u64> {
+    let base = NEIGHBOR_VS.get_or_init(|| {
+        std::env::var("TOMBOX_PASSCAP_VS").ok().and_then(|v| parse_hex_list(&v)).unwrap_or_default()
+    });
+    let mut out = base.clone();
+    if let Some(extra) = VS_FROM_SEL.get() {
+        for h in extra.lock().unwrap().iter() {
+            if !out.contains(h) {
+                out.push(*h);
+            }
+        }
+    }
+    out
+}
+
+/// Emitted once per capture so the armed target is visible in the log even when
+/// the probed draw never happens.
+fn neighbor_banner() -> String {
+    let vs = neighbor_probe_vs();
+    let ps = probe_hashes();
+    if !vs.is_empty() {
+        format!("neighbour dump armed for VS {vs:016x?} (final-pass shader)")
+    } else if !ps.is_empty() {
+        format!("neighbour dump armed for probed PS {ps:016x?} (structural final-pass match)")
+    } else {
+        "neighbour dump disarmed: set TOMBOX_PASSCAP_VS= or TOMBOX_PASSCAP_PS= to name the final pass".to_string()
+    }
+}
+
 unsafe fn probe_draw(g: &mut G, list: *mut c_void, k: usize, h: u64) {
     let Some(st) = g.lists.get(&k) else { return };
     let mine = format!("probe PS {h:016x}:");
@@ -930,7 +1016,7 @@ unsafe fn probe_draw(g: &mut G, list: *mut c_void, k: usize, h: u64) {
         let path = if crate::cbv_raw::copy_on() { "cbv_raw copy mode: ring copy of the source recorded as a GPU CopyBufferRegion in this list, so it reads the source when the GPU runs it" } else if crate::cbv_raw::enabled() { "cbv_raw raw-view mode" } else { "direct root CBV" };
         notes.push(format!("  root[{i}] bind path: {path}; title va alignment {} (va & 0xff = {:#x})", if *va & 0xff == 0 { "256-byte aligned" } else { "NOT 256-byte aligned" }, *va & 0xff));
         if let Some(shot) = g.shot.as_mut() {
-            shot.cpu_pending.push((k, *va, format!("probe PS {h:016x} root[{i}] title va={va:#x}")));
+            shot.cpu_pending.push((k, *va, format!("probe PS {h:016x} root[{i}] title va={va:#x}"), None));
         }
         match crate::bindtrace::read_va(*va, cb_bytes()) {
             Some(bytes) => {
@@ -945,7 +1031,10 @@ unsafe fn probe_draw(g: &mut G, list: *mut c_void, k: usize, h: u64) {
     let rt_l: Vec<String> = rts.iter().map(|r| if *r == 0 { "-".into() } else { cached_label(g, *r) }).collect();
     let ds_l = if dsv == 0 { "-".to_string() } else { cached_label(g, dsv) };
     notes.push(format!("  bound RTs [{}] DSV {ds_l}", rt_l.join(" | ")));
-    notes.push(format!("  PSO {pso:#x}: {}", crate::device_wrap::pso_desc_text(pso).unwrap_or_else(|| "no PSO desc recorded".into())));
+    if let Some((vs, _, state)) = crate::device_wrap::pso_summary(pso) {
+        notes.push(format!("  PSO {pso:#x} VS={:016x}: {state}", crate::shader_xlat::origin_hash(vs).unwrap_or(0)));
+    }
+    notes.push(format!("  {}", crate::cl2_state::raster_diagnostic(list)));
     for param in 0..crate::bindtrace::table_count(list as usize, false).min(32) as u32 {
         let mut d3 = Vec::new();
         let mut n = 0usize;
@@ -959,6 +1048,40 @@ unsafe fn probe_draw(g: &mut G, list: *mut c_void, k: usize, h: u64) {
         }
         if !d3.is_empty() {
             notes.push(format!("  table param {param}: {n} SRVs resolved, Texture3D views: {}", d3.join("; ")));
+        }
+    }
+    for param in 0..crate::bindtrace::table_count(list as usize, false).min(4) as u32 {
+        // Neighbour dump for the final pass: gated on the pass being probed and on
+        // history being on (guest_cbv_source needs it to resolve byte matches).
+        let vs_hash = crate::device_wrap::pso_summary(pso).and_then(|(vs, _, _)| crate::shader_xlat::origin_hash(vs)).unwrap_or(0);
+        if param == 0 && crate::bindtrace::neighbor_probe_wanted(h, vs_hash) {
+            notes.extend(crate::bindtrace::guest_table_neighbors(list as usize, param as usize));
+        }
+        if let Some(history) = crate::bindtrace::table_write_history(list as usize, param) {
+            notes.push(format!("  {history}"));
+        }
+        if let Some(slots) = crate::bindtrace::scarlett_guest_table(list as usize, param, 8) {
+            for (i, data) in slots.iter().enumerate() {
+                notes.push(format!("  guest table[{param}]+{i} {data:08x?}"));
+                if let Some(source) = crate::bindtrace::guest_cbv_source(data) {
+                    notes.push(format!("  guest table[{param}]+{i} matches CBV bytes produced at CPU handle {source:#x}; byte match does not prove a copy"));
+                }
+            }
+        }
+    }
+    if h == 0xe2bcc91e569d6d13 {
+        if let Some((va, len)) = crate::bindtrace::guest_table_cbv(list as usize, 0, 0) {
+            let n = (len as usize).min(96);
+            let bytes = unsafe { crate::bindtrace::read_va(va, n) }.or_else(|| {
+                if crate::title_shadow::is_writable_range(va as usize, n) {
+                    Some(unsafe { core::slice::from_raw_parts(va as *const u8, n).to_vec() })
+                } else { None }
+            });
+            match bytes {
+                Some(bytes) => notes.push(format!("guest table[0]+0 CPU CBV va={va:#x} at draw record: {}", bytes.chunks_exact(4).map(|w| format!("{:08x}", u32::from_le_bytes(w.try_into().unwrap()))).collect::<Vec<_>>().join(" "))),
+                None => notes.push(format!("guest table[0]+0 CPU CBV va={va:#x} unreadable at draw record")),
+            }
+            if let Some(shot) = g.shot.as_mut() { shot.cpu_pending.push((k, va, format!("probe PS {h:016x} guest table[0]+0 CBV va={va:#x}"), Some(n))); }
         }
     }
     notes.push(format!("  translation: {}", crate::fmask_check::translation_text(h)));
@@ -1022,11 +1145,21 @@ unsafe fn probe_draw(g: &mut G, list: *mut c_void, k: usize, h: u64) {
             notes.push(format!("  occlusion query heap creation failed hr={hr:#x}"));
         }
     }
+    let mut extra = Vec::new();
+    if h == 0xe2bcc91e569d6d13 {
+        if let Some((va, len)) = crate::cl2_state::vertex_buffer_zero(list) {
+            extra.push(("vertex buffer slot 0".to_string(), va, (len as usize).min(144)));
+        }
+        if let Some((va, len)) = crate::bindtrace::guest_table_cbv(list as usize, 0, 0) {
+            extra.push(("guest table[0]+0 CBV".to_string(), va, (len as usize).min(96)));
+        }
+    }
     if let Some(st) = g.lists.get_mut(&k) {
         st.probe_caps.extend(caps);
         st.probe_notes.extend(notes);
         st.probe_q = qh;
         st.probe_oq = oq;
+        st.probe_extra = extra;
     }
 }
 
@@ -1042,6 +1175,7 @@ unsafe fn probe_after(this: *mut c_void) {
             return;
         }
         let mut cbv: Vec<(u32, u64)> = st.cbv.iter().map(|(a, b)| (*a, *b)).collect();
+        let extra = core::mem::take(&mut st.probe_extra);
         cbv.sort();
         let seq = st.seq;
         let dev = g.device;
@@ -1092,6 +1226,21 @@ unsafe fn probe_after(this: *mut c_void) {
                 list_call_barrier(list, &[barrier_sub0(src.res, during, before)]);
             }
             out.push(ProbeBuf { rb, qh: 0, n: n as usize, kind: 1, label: format!("list {list:#x} pass seq {seq} root[{i}] title va={va:#x} = PC buffer {:#x}+{:#x} (left {:#x}, state {:#x}), copied after the draw on the GPU timeline", src.res, src.off, src.left, src.state) });
+        }
+        for (label, va, wanted) in extra {
+            let Some(src) = crate::cbv_copy::lookup_source(va) else {
+                out.push(ProbeBuf { rb: 0, qh: 0, n: 0, kind: 2, label: format!("{label} va={va:#x}: source not tracked") });
+                continue;
+            };
+            let n = src.left.min(wanted as u64);
+            if n == 0 { continue; }
+            let Ok(rb) = committed(dev, 3, &buffer_desc(256), 0x400) else { continue };
+            let bar = crate::cbv_copy::source_barrier(src.state);
+            if let Some((before, during)) = bar { list_call_barrier(list, &[barrier_sub0(src.res, before, during)]); }
+            let cp: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u64) = core::mem::transmute(crate::cmdlist_wrap::pc_method(this, 15));
+            cp(this, rb as *mut c_void, 0, src.res as *mut c_void, src.off, n);
+            if let Some((before, during)) = bar { list_call_barrier(list, &[barrier_sub0(src.res, during, before)]); }
+            out.push(ProbeBuf { rb, qh: 0, n: n as usize, kind: 1, label: format!("{label} va={va:#x} copied after draw, source state {:#x}", src.state) });
         }
         if let Some(shot) = g.shot.as_mut() {
             shot.probes.extend(out);
@@ -1372,7 +1521,17 @@ unsafe extern "system" fn draw(this: *mut c_void, a: u32, b: u32, c: u32, d: u32
     note_draw(this, 0);
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32) = core::mem::transmute(prev(12));
     f(this, a, b, c, d);
-    probe_after(this)
+    probe_after(this);
+    if ACTIVE.load(Ordering::Relaxed) && std::env::var_os("TOMBOX_PASSCAP_AFTER_FIRST_MEDIA").is_some_and(|v| v == "1") {
+        with(|g| {
+            let k = key(this);
+            let pso = g.lists.get(&k).map_or(0, |s| s.pso);
+            if pso != 0 && ps_of(pso) == 0x7ba0e3e2345b876d {
+                boundary(g, this, "after PS 7ba0e3e2345b876d draw, before next draw");
+                if let Some(st) = g.lists.get_mut(&k) { reset_pass(st); }
+            }
+        });
+    }
 }
 unsafe extern "system" fn draw_indexed(this: *mut c_void, a: u32, b: u32, c: u32, d: i32, e: u32) {
     note_draw(this, 1);
@@ -1626,6 +1785,7 @@ pub fn install(vt: &[AtomicUsize]) {
         s.secs, s.presents, s.file, out_root().display(), s.frames, s.budget_mb, s.max_caps, s.chain_every, out_root().display(), probe_hashes(),
         if missing.is_empty() { String::new() } else { format!("; empty slots left alone: {missing:?}") },
         if s.unknown.is_empty() { String::new() } else { format!("; ignored tokens {:?}", s.unknown) }));
+    record("d3d12_xs", "passcap", &format!("{}; history={}", neighbor_banner(), crate::bindtrace::neighbor_history_state()));
 }
 
 pub fn note_submit(queue: usize, real: &[*mut c_void]) {
@@ -1636,15 +1796,24 @@ pub fn note_submit(queue: usize, real: &[*mut c_void]) {
         let Some(shot) = g.shot.as_mut() else { return };
         let keys: Vec<usize> = real.iter().map(|l| *l as usize).collect();
         let mut keep = Vec::new();
-        for (lk, va, label) in core::mem::take(&mut shot.cpu_pending) {
+        for (lk, va, label, guest_len) in core::mem::take(&mut shot.cpu_pending) {
             if keys.iter().any(|&x| x == lk || key(x as *mut c_void) == lk) {
-                let text = match unsafe { crate::bindtrace::read_va(va, cb_bytes()) } {
+                // The captured guest CBV may reside in title-owned mapped memory,
+                // not a D3D upload heap tracked by bindtrace. Compare the same
+                // bounded 96-byte range as at draw-record time when submitting.
+                let n = guest_len.unwrap_or_else(cb_bytes);
+                let data = if n == 0 { None } else { unsafe { crate::bindtrace::read_va(va, n) } }.or_else(|| {
+                    if guest_len.is_some() && n != 0 && crate::title_shadow::is_writable_range(va as usize, n) {
+                        Some(unsafe { core::slice::from_raw_parts(va as *const u8, n).to_vec() })
+                    } else { None }
+                });
+                let text = match data {
                     Some(bytes) => bytes.chunks_exact(4).map(|x| format!("{:08x}", u32::from_le_bytes(x.try_into().unwrap()))).collect::<Vec<_>>().chunks(16).enumerate().map(|(r, c)| format!("  dw[{:3}..] {}", r * 16, c.join(" "))).collect::<Vec<_>>().join("\n"),
-                    None => "  not an upload-heap buffer bindtrace can map".to_string(),
+                    None => "  CPU memory unavailable at submission".to_string(),
                 };
                 shot.cpu_submit.push(format!("{label}: CPU view at ExecuteCommandLists (queue {queue:#x})\n{text}"));
             } else {
-                keep.push((lk, va, label));
+                keep.push((lk, va, label, guest_len));
             }
         }
         shot.cpu_pending = keep;
@@ -1675,8 +1844,8 @@ fn chain_line(g: &mut G, src: usize, planes: &str) -> String {
     let known = |r: usize| g.desc_cache.get(&r).map(|d| label_of(r, d)).unwrap_or_else(|| format!("{r:#x}"));
     let top: Vec<String> = per.iter().take(6).map(|(r, c)| format!("{}{} x{c}", if *r == src { "*SRC* " } else { "" }, known(*r))).collect();
     let src_label = label_of(src, &unsafe { desc_of(src) });
-    format!("src={} | {planes} | frame: draws={} dispatches={} indirect={} resolves={} copies={} binds={} unresolved_views={} draws_into_src={} | to/from src: [{}] | top rts: [{}]",
-        src_label, fc.draws, fc.dispatches, fc.indirect, fc.resolves, fc.copies, fc.binds, fc.unresolved, fc.into_src, fc.to_src.join("; "), top.join("; "))
+    format!("src={} | previous_present_src={:#x} (draws_into_src counts this previous source) | {planes} | frame: draws={} dispatches={} indirect={} resolves={} copies={} binds={} unresolved_views={} draws_into_src={} | to/from src: [{}] | top rts: [{}]",
+        src_label, g.last_src, fc.draws, fc.dispatches, fc.indirect, fc.resolves, fc.copies, fc.binds, fc.unresolved, fc.into_src, fc.to_src.join("; "), top.join("; "))
 }
 
 unsafe fn own_objects(g: &mut G, queue: *mut c_void) -> Option<(usize, usize, usize)> {

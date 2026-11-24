@@ -1026,6 +1026,28 @@ fn scalar_saveexec_lane_model() {
 }
 
 #[test]
+fn scalar_wrexec_writes_the_new_mask_and_scc() {
+    let mut cases = Cases::new();
+    for (op, mnemonic) in [(0x46, "s_andn1_wrexec_b32"), (0x47, "s_andn2_wrexec_b32")] {
+        for old in [0u32, 1] {
+            for src in [0u32, 1] {
+                for dest in [10, 12, 126] {
+                    let mut pre = pr();
+                    pre.sv(10, src).sv(126, old).sv(127, 0);
+                    let mut post = pr();
+                    // Save D0 and EXEC before enabling the lane for output.
+                    post.raw(&[sop1(3, 20, dest), sop1(3, 21, 126), sop1(3, 126, ic(1))])
+                        .s2v(0, 20).s2v(1, 21).scc_to_v(2);
+                    let new = if op == 0x46 { !src & old } else { src & !old } & 1;
+                    cases.add(mnemonic, &pre, &[sop1(op, dest, 10)], &post, &[new, new, new]);
+                }
+            }
+        }
+    }
+    cases.run_both("wrexec");
+}
+
+#[test]
 fn scalar_sopk_sopc() {
     let mut c = Cases::new();
     for &d0 in &[0u32, 5, 0xffff_fff0, 0x8000_0000, 0x7fff, 0xffff_8000, 0x0000_8000] {

@@ -312,11 +312,15 @@ static WBI_LOG: AtomicUsize = AtomicUsize::new(0);
 pub(crate) unsafe fn write_immediate(list: *mut c_void, va: u64, words: &[u32], mode: u32, what: &str) {
     let _ij = unsafe { crate::inject::scope(list, crate::inject::COPY) };
     let align = 4 * words.len() as u64;
-    if va == 0 || va % align != 0
-        || (va & GRAPHICS_VA_HIGH_MASK != 0 && !known_scarlett_buffer_address(va, align))
-    {
+    if va == 0 || va % align != 0 {
         if once(&WBI_LOG, 8) {
             record("d3d12_xs", "console_slots", &format!("{what}: destination {va:#x} must be {align}-byte aligned (console validation)"));
+        }
+        return;
+    }
+    if va & GRAPHICS_VA_HIGH_MASK != 0 && !known_scarlett_buffer_address(va, align) {
+        if once(&WBI_LOG, 8) {
+            record("d3d12_xs", "console_slots", &format!("{what}: destination {va:#x} exceeds the 40-bit graphics address range"));
         }
         return;
     }

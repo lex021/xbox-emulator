@@ -493,6 +493,9 @@ pub(crate) unsafe fn dispatch_with(list: *mut c_void, x: u32, y: u32, z: u32, pr
     if ![x, y, z].contains(&0) && !unsafe { crate::global_bind::before_dispatch(list) } {
         return;
     }
+    if unsafe { crate::fssm_compute::dispatch(list, || prev(list, x, y, z)) } {
+        return;
+    }
     if !ACTIVE.load(Acquire) && !resume::enabled() {
         unsafe { prev(list, x, y, z) };
         return;

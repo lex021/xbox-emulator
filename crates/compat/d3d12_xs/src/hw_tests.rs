@@ -98,6 +98,14 @@ fn gpu() -> &'static Gpu {
     static G: OnceLock<Gpu> = OnceLock::new();
     G.get_or_init(|| unsafe {
         crate::enable_experimental_shader_models();
+        if std::env::var_os("TOMBOX_FSSM_REPLAY_FIXTURES").is_some() {
+            let get: unsafe extern "system" fn(*const Guid, *mut *mut c_void) -> i32 =
+                core::mem::transmute(crate::host_proc(b"D3D12GetDebugInterface\0"));
+            let mut debug = core::ptr::null_mut();
+            assert_eq!(get(&crate::IID_ID3D12DEBUG, &mut debug), 0);
+            call!(debug, 3, () -> ());
+            call!(debug, 2, () -> u32);
+        }
         let warp = adapter_is_warp();
         let adapter = if warp { warp_adapter() } else { core::ptr::null_mut() };
         let p = crate::host_proc(b"D3D12CreateDevice\0");
@@ -107,6 +115,108 @@ fn gpu() -> &'static Gpu {
         assert!(hr >= 0 && !dev.is_null(), "D3D12CreateDevice ({}) hr={hr:#010x}", if warp { "WARP" } else { "hardware" });
         Gpu { dev: dev as usize, a: queue(dev), b: queue(dev), warp }
     })
+}
+
+#[test]
+#[ignore = "requires local compute PSO replay fixtures and the D3D12 debug layer"]
+fn hw_fssm_compute_root_replays_failed_pipelines() {
+    let fixtures = std::path::PathBuf::from(std::env::var_os("TOMBOX_FSSM_REPLAY_FIXTURES").unwrap());
+    let dev = gpu().dev as *mut c_void;
+    let mut tested = 0;
+    let mut failed = Vec::new();
+    for entry in std::fs::read_dir(fixtures).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|ext| ext != "xbox") {
+            continue;
+        }
+        let title = std::fs::read(path.with_extension("root")).unwrap();
+        let src = std::fs::read(&path).unwrap();
+        let code = match std::fs::read(path.with_extension("dxil")) {
+            Ok(bytes) => std::sync::Arc::new(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+                unsafe { crate::shader_xlat::translate(src.as_ptr(), src.len()) }.unwrap(),
+            Err(e) => panic!("reading replay code for {path:?}: {e}"),
+        };
+        let old = unsafe { crate::fssm_compute::create_root(dev, &title) }.unwrap();
+        let try_pso = |root: usize| unsafe {
+            let mut desc = [0u64; 7];
+            desc[0] = root as u64;
+            desc[1] = code.as_ptr() as u64;
+            desc[2] = code.len() as u64;
+            let mut pso = core::ptr::null_mut();
+            let hr = call!(dev, 11, (*const u8, *const Guid, *mut *mut c_void) -> i32,
+                desc.as_ptr().cast(), &IID_PSO, &mut pso);
+            if !pso.is_null() {
+                call!(pso, 2, () -> u32);
+            }
+            hr
+        };
+        let before = try_pso(old.0);
+        let tag = path.file_stem().unwrap().to_string_lossy();
+        tested += 1;
+        if before == 0 {
+            eprintln!("{tag} original={before:#010x}");
+            continue;
+        }
+        unsafe { crate::cmdlist_x::dump_device_messages(dev, &tag) };
+        assert!(crate::fssm_compute::cached_literal_sampler_retry(&src),
+            "FSSM eligibility must be recoverable without the translation marker for {tag}");
+        let after = crate::fssm_compute::variant(&title, &src)
+            .and_then(|body| unsafe { crate::fssm_compute::create_root(dev, &body) })
+            .map(|root| try_pso(root.0));
+        eprintln!("{tag} original={before:#010x}, FSSM={after:08x?}");
+        if after != Ok(0) {
+            unsafe { crate::cmdlist_x::dump_device_messages(dev, &format!("{tag}_after")) };
+            failed.push(tag.into_owned());
+        }
+    }
+    assert!(tested > 0, "no PSO fixtures found");
+    assert!(failed.is_empty(), "{}/{} PSOs failed: {failed:?}", failed.len(), tested);
+}
+
+#[test]
+#[ignore = "requires local compute shader and original root fixtures"]
+fn hw_compute_binding_recovery_replays_title_roots() {
+    let fixtures = std::path::PathBuf::from(std::env::var_os("TOMBOX_COMPUTE_BINDING_FIXTURES").unwrap());
+    let dev = gpu().dev;
+    let paths: Vec<_> = std::fs::read_dir(fixtures).unwrap().flatten().map(|entry| entry.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "xbox")).collect();
+    assert!(!paths.is_empty());
+    let index = std::sync::atomic::AtomicUsize::new(0);
+    let successes = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                while let Some(path) = paths.get(index.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                    let shader = std::fs::read(path).unwrap();
+                    let root = std::fs::read(path.with_extension("root")).unwrap();
+                    let result = crate::fssm_compute::translate_binding_retry(&shader, &root)
+                        .and_then(|(code, remap)| unsafe {
+                            let dev = dev as *mut c_void;
+                            let root = crate::fssm_compute::create_root(dev, remap.as_deref().unwrap_or(&root))?;
+                            let desc = [root.0 as u64, code.as_ptr() as u64, code.len() as u64, 0, 0, 0, 0];
+                            let mut pso = core::ptr::null_mut();
+                            let hr = call!(dev, 11, (*const u8, *const Guid, *mut *mut c_void) -> i32,
+                                desc.as_ptr().cast(), &IID_PSO, &mut pso);
+                            if !pso.is_null() {
+                                call!(pso, 2, () -> u32);
+                            }
+                            if hr == 0 {
+                                successes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                Ok(remap.is_some())
+                            } else {
+                                Err(format!("CreateComputePipelineState hr={hr:#010x}"))
+                            }
+                        });
+                    let name = path.file_stem().unwrap().to_string_lossy();
+                    eprintln!("binding-replay {name} {result:?}");
+                }
+            });
+        }
+    });
+    let count = successes.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("binding-replay {count}/{} PSOs created", paths.len());
+    assert!(count > 0);
 }
 
 struct Buf {
@@ -229,6 +339,51 @@ fn reached(f: *mut c_void, v: u64, within: Duration) -> bool {
             return false;
         }
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+#[ignore = "requires a D3D12 adapter"]
+fn hw_bop64_cpu_writeback_runs_after_the_gpu_fence() {
+    use crate::cl_ext::Bop64;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    let gpu = gpu();
+    let marker = AtomicU64::new(0);
+    let timestamp = AtomicU64::new(0);
+    let narrow = AtomicU64::new(0x0000_0000_1122_3344);
+    let expected = 0xabc1_2345_8765_4321;
+    unsafe {
+        let list = raw_list(gpu.dev);
+        assert!(crate::bop64::cpu::accepts(marker.as_ptr() as u64));
+        assert!(crate::bop64::cpu::record_write(list, marker.as_ptr() as u64, Bop64::Value, expected));
+        assert!(crate::bop64::cpu::record_write(list, timestamp.as_ptr() as u64, Bop64::GpuTimestamp, 0));
+        let high_word = narrow.as_ptr() as u64 + 4;
+        assert!(crate::bop64::cpu::accepts_width(high_word, 4));
+        assert!(!crate::bop64::cpu::accepts(high_word));
+        assert!(crate::bop64::cpu::record_write32(list, high_word, 0xaabb_ccdd));
+        assert_eq!(call!(list, X_CLOSE, () -> i32), 0);
+        let gate = fence(gpu.dev);
+        let done = fence(gpu.dev);
+        let queue = gpu.a as *mut c_void;
+        let original = crate::present::real_queue_slot;
+        let wait: extern "system" fn(*mut c_void, *mut c_void, u64) -> i32 = core::mem::transmute(original(15));
+        let signal: extern "system" fn(*mut c_void, *mut c_void, u64) -> i32 = core::mem::transmute(original(14));
+        let exec: crate::gpu_wait::ExecFn = core::mem::transmute(original(10));
+        assert_eq!(wait(queue, gate, 1), 0);
+        crate::gpu_wait::submit(queue, &[list], exec, original(14), original(15));
+        assert_eq!((marker.load(Ordering::Acquire), timestamp.load(Ordering::Acquire)), (0, 0));
+        assert_eq!(narrow.load(Ordering::Acquire), 0x1122_3344);
+        assert_eq!(signal(queue, done, 1), 0);
+        assert_eq!(call!(gate, 10, (u64) -> i32, 1), 0);
+        assert!(reached(done, 1, Duration::from_secs(5)));
+        assert_eq!(marker.load(Ordering::Acquire), expected);
+        assert_eq!(narrow.load(Ordering::Acquire), 0xaabb_ccdd_1122_3344);
+        let ticks = timestamp.load(Ordering::Acquire);
+        assert!(ticks > 0 && ticks < u64::MAX, "converted GPU ticks {ticks:#x}");
+        crate::bop64::cpu::reset(list);
+        call!(list, 2, () -> u32);
+        call!(gate, 2, () -> u32);
+        call!(done, 2, () -> u32);
     }
 }
 

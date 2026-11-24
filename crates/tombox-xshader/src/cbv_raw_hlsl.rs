@@ -152,7 +152,7 @@ pub fn table_cbv_ranges(rs: Option<&crate::meta::RootSig>) -> Vec<(u32, u32, u32
             v.extend(ranges.iter().filter(|r| r.range_type == 2).map(|r| (r.base_register, r.num.max(1), r.space)));
         }
     }
-    if let Some(slots) = rs.and_then(crate::meta::scarlett_graphics_table_slots) {
+    if let Some((_, slots)) = rs.and_then(crate::meta::scarlett_graphics_table) {
         v.push((crate::meta::SCARLETT_PACKED_CBV_REGISTER, slots, 1));
     }
     v

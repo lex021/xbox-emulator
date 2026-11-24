@@ -8,6 +8,9 @@ use crate::device_wrap::Guid;
 use crate::cl_ext::{bop64_route, bop_error, Bop64, BOP_FLAG_GPU_TIMESTAMP, BOP_FLAG_SYSTEM_TIMESTAMP, BOP_FLUSH_VALID};
 use crate::console_slots::WBI_MODE_MARKER_OUT;
 
+#[path = "bop64_cpu.rs"]
+pub(crate) mod cpu;
+
 pub const EOP_HEADER: u32 = 0xc004_4700;
 pub const EOP_EVENT_BOTTOM_OF_PIPE_TS: u32 = 0x528;
 pub const EOP_L2_POLICY_FLAG: u32 = 0x20;
@@ -140,10 +143,23 @@ unsafe fn flush_barrier(list: *mut c_void) {
 pub unsafe extern "system" fn write64(this: *mut c_void, va: u64, value: u64, flush: u32, flags: u32) {
     let ty = unsafe { crate::fill::list_type(this) };
     let closed = ty == LIST_TYPE_DIRECT && crate::cl2_state::title_closed(this);
+    if scarlett() && ty == LIST_TYPE_DIRECT && !closed && cpu::accepts(va) {
+        if let Some(eop) = decode_release_mem(&release_mem(va, value, flush, flags), flush) {
+            if eop.flush != 0 {
+                unsafe { flush_barrier(this) };
+            }
+            if unsafe { cpu::record_write(this, va, eop.kind, eop.value) } {
+                return;
+            }
+        }
+    }
     let eop = match plan(scarlett(), ty, closed, va, value, flush, flags) {
         Plan::Reject(why) => {
             if once(16) {
-                record("d3d12_xs", "bop64", &format!("{W}(va={va:#x}, flush={flush:#x}, flags={flags:#x}): {why} (console validation); not recorded"));
+                let cpu_writable = usize::try_from(va).ok().is_some_and(|p| {
+                    va % 8 == 0 && crate::title_shadow::is_writable_range(p, 8)
+                });
+                record("d3d12_xs", "bop64", &format!("{W}(va={va:#x}, flush={flush:#x}, flags={flags:#x}): {why} (console validation); not recorded; cpu_writable={cpu_writable}"));
             }
             return;
         }

@@ -16,6 +16,9 @@ extern "system" {
 extern "system" {
     fn GetAsyncKeyState(vk: i32) -> i16;
     fn GetForegroundWindow() -> *mut c_void;
+    fn GetWindowTextLengthW(hwnd: *mut c_void) -> i32;
+    fn GetWindowTextW(hwnd: *mut c_void, text: *mut u16, max: i32) -> i32;
+    fn SetWindowTextW(hwnd: *mut c_void, text: *const u16) -> i32;
 }
 
 #[repr(C)]
@@ -86,6 +89,53 @@ static USER: AtomicU8 = AtomicU8::new(0);
 static CFG_LAST: AtomicU8 = AtomicU8::new(0);
 static KEY_DOWN: AtomicBool = AtomicBool::new(false);
 static DISABLED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn start_shader_title() {
+    if std::env::var("TOMBOX_SHADER_TITLE").as_deref() != Ok("1") || compat_common::headless::enabled() {
+        return;
+    }
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| {
+        let _ = std::thread::Builder::new().name("tombox-shader-title".into()).spawn(|| {
+            let mut last_hwnd = 0;
+            let mut last_caption = String::new();
+            let mut base_title = String::new();
+            let mut last_log = None::<std::time::Instant>;
+            loop {
+                let hwnd = unsafe { crate::present::find_title_window() };
+                if hwnd != 0 {
+                    // The title owns the window. Keep synchronous Win32 caption messages
+                    // on this worker so a busy window thread cannot stall presentation.
+                    let hwnd_ptr = hwnd as *mut c_void;
+                    let capacity = unsafe { GetWindowTextLengthW(hwnd_ptr) }.saturating_add(1);
+                    let mut text = vec![0u16; capacity as usize];
+                    let n = unsafe { GetWindowTextW(hwnd_ptr, text.as_mut_ptr(), capacity) }.max(0) as usize;
+                    let caption = String::from_utf16_lossy(&text[..n]);
+                    if hwnd != last_hwnd || caption != last_caption {
+                        base_title = caption.clone();
+                        last_hwnd = hwnd;
+                    }
+                    let (ok, _) = crate::shader_xlat::counts();
+                    let cache = tombox_xshader::shader_cache::stats();
+                    let pending = crate::pso_async::pending_jobs();
+                    let status = format!("SHADERS: {ok} (hits {} / miss {}, new {}) | PSO_Q: {pending} | PACK: {}", cache.hits, cache.misses, cache.writes, cache.records);
+                    let next = if base_title.is_empty() { status.clone() } else { format!("{base_title} | {status}") };
+                    if next != caption {
+                        let wide = wide(&next);
+                        if unsafe { SetWindowTextW(hwnd_ptr, wide.as_ptr()) } != 0 {
+                            last_caption = next;
+                        }
+                    }
+                    if last_log.is_none_or(|t| t.elapsed().as_secs() >= 5) {
+                        record("d3d12_xs", "[overlay]", &format!("{status} | XREC left: {}", crate::pso_xrec::remaining()));
+                        last_log = Some(std::time::Instant::now());
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        });
+    });
+}
 
 pub fn active() -> bool {
     let cfg = SW.on();

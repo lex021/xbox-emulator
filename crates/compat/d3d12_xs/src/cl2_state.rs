@@ -383,6 +383,36 @@ pub(crate) fn note_initial_pso(list: *mut c_void, pso: *mut c_void) {
     }
 }
 
+pub(crate) fn vertex_buffer_zero(list: *mut c_void) -> Option<(u64, u32)> {
+    with(list, |s| {
+        let view = s.vbs.get(&0)?.as_ref()?;
+        Some((u64::from_le_bytes(view[..8].try_into().ok()?), u32::from_le_bytes(view[8..12].try_into().ok()?)))
+    })
+}
+
+pub(crate) fn raster_diagnostic(list: *mut c_void) -> String {
+    with(list, |state| {
+        let viewport = state.viewports.as_deref().unwrap_or_default().chunks_exact(4)
+            .take(24).map(|w| f32::from_le_bytes(w.try_into().unwrap())).collect::<Vec<_>>();
+        let scissor = state.scissors.as_deref().unwrap_or_default().chunks_exact(4)
+            .take(16).map(|w| i32::from_le_bytes(w.try_into().unwrap())).collect::<Vec<_>>();
+        let vertices = state.vbs.iter().take(8).map(|(slot, view)| {
+            let Some(view) = view else { return format!("{slot}: unbound") };
+            let va = u64::from_le_bytes(view[..8].try_into().unwrap());
+            let size = u32::from_le_bytes(view[8..12].try_into().unwrap());
+            let stride = u32::from_le_bytes(view[12..].try_into().unwrap());
+            let front = unsafe { crate::bindtrace::read_va(va, (size as usize).min(72)) }
+                .map(|bytes| bytes.chunks_exact(4).map(|word| {
+                    format!("{:08x}", u32::from_le_bytes(word.try_into().unwrap()))
+                }).collect::<Vec<_>>().join(" "))
+                .unwrap_or_else(|| "no mapped bytes".into());
+            format!("{slot}:{va:#x} size={size} stride={stride} data={front}")
+        }).collect::<Vec<_>>();
+        format!("Xbox topology={:?} variant={} viewport={viewport:?} scissor={scissor:?} vertex_buffers={vertices:?}",
+            state.topology, state.variant_bound)
+    })
+}
+
 pub(crate) fn bound_pso(list: *mut c_void) -> Option<usize> {
     with(list, |s| s.pso)
 }
@@ -1079,7 +1109,7 @@ unsafe fn apply_rect(list: *mut c_void) {
         return;
     }
     let Some(k) = (unsafe { wanted_key(list, pso) }) else {
-        match unsafe { crate::dbcount::rect_stream_pso(real_device(), pso) } {
+        match unsafe { crate::dbcount::rect_stream_pso(pso) } {
             Some(variant) if variant != 0 => {
                 unsafe { pc_set_pso(list, variant) };
                 with(list, |s| s.variant_bound = true);

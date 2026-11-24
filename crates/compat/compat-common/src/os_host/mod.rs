@@ -1,3 +1,4 @@
+mod bink_probe;
 pub mod affinity;
 pub mod coverage;
 pub mod dlldir;
@@ -85,6 +86,10 @@ pub fn hook_table() -> &'static [Hook] {
         v.extend(r);
         v
     })
+}
+
+pub fn install_bink_probe() {
+    bink_probe::install();
 }
 
 pub fn sweep_now() -> usize {

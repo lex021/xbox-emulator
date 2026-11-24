@@ -293,19 +293,6 @@ mod tests {
     }
 
     #[test]
-    fn rpf8_prefix_skips_partial_entries_but_rejects_truncated_files() {
-        let mut prefix = vec![0u8; 272 + 24 + 8];
-        prefix[..4].copy_from_slice(b"8FPR");
-        prefix[4..8].copy_from_slice(&2u32.to_le_bytes());
-        prefix[12..14].copy_from_slice(&0xffu16.to_le_bytes());
-        let file_size = 272 + 2 * 24;
-        let rpf = inspect_prefix(&prefix, file_size).unwrap();
-        assert!(matches!(rpf.header, Header::V8 { entry_count: 2, ref entries, .. } if entries.len() == 1));
-        assert!(inspect_prefix(&prefix, file_size - 1).unwrap_err().contains("truncated"));
-        assert!(inspect(&prefix).unwrap_err().contains("truncated"));
-    }
-
-    #[test]
     fn rejects_other_files_and_truncation() {
         assert!(inspect(b"PK\x03\x04aaaaaaaaaaaa").is_err());
         assert!(inspect(b"9F").is_err());

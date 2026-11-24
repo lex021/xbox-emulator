@@ -589,13 +589,13 @@ pub fn apply(real_list: *mut c_void) {
                 // Newer Scarlett command lists insert two entries before
                 // ExecuteIndirect. Alias the confirmed early blocks from the
                 // final legacy handlers so tracking stays in the call chain.
-                for (first, last) in [(61, 65), (70, 74), (85, 87)] {
+                for (first, last) in [(61, 65), (70, 79), (85, 87)] {
                     for slot in (first..=last).rev() {
                         vt_set(slot, vt_get(slot - 2));
                     }
                 }
                 record("d3d12_xs", "ScarlettCommandList",
-                    "newer Scarlett layout: ExecuteIndirect 61, Write64BitValueBottomOfPipeX 72, Wait64BitValueX 74, CopyTextureRegionX 85");
+                    "newer Scarlett layout: ExecuteIndirect 61, Write32BitValueBottomOfPipeX 71, Write64BitValueBottomOfPipeX 72, Wait64BitValueX 74, ForceZOrderX 75, SetupOrderedAppendCounterX 77, CopyTextureRegionX 85");
                 for slot in &XBOX_VT[128..131] {
                     slot.store(unsupported_scarlett_list6_slot as *const () as usize, Ordering::Relaxed);
                 }

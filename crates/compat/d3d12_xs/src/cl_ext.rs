@@ -141,6 +141,14 @@ unsafe extern "system" fn cl_write32_bottom_of_pipe(this: *mut c_void, va: u64, 
     if let Some(e) = bop_error(flush, flags, false, value as u64) {
         return reject(&BOP_LOG, W, e);
     }
+    if crate::bop64::scarlett() && !crate::cl2_state::title_closed(this) && crate::bop64::cpu::accepts_width(va, 4) {
+        if flush != 0 {
+            unsafe { stall_list(this) };
+        }
+        if unsafe { crate::bop64::cpu::record_write32(this, va, value) } {
+            return;
+        }
+    }
     unsafe { crate::console_slots::write_immediate(this, va, &[value], WBI_MODE_MARKER_OUT, W) };
 }
 
@@ -183,7 +191,13 @@ unsafe fn wait_value(list: *mut c_void, va: u64, func: u32, value: u64, mask: u6
         return reject(&WAIT_LOG, what, "pCommandList is not of type DIRECT");
     }
     if let Some(e) = gpu_wait::wait_args_error(va, func, flags, align) {
-        return reject(&WAIT_LOG, what, e);
+        if once(&WAIT_LOG, 8) {
+            let cpu_readable = usize::try_from(va).ok().is_some_and(|p| {
+                va % align == 0 && crate::title_shadow::is_readable_range(p, align as usize)
+            });
+            record("d3d12_xs", "cl_ext", &format!("{what}(va={va:#x}, func={func}, value={value:#x}, flags={flags:#x}): {e} (console validation); not recorded; cpu_readable={cpu_readable}"));
+        }
+        return;
     }
     let op = Op::Wait { addr: va, func, value, mask };
     if gpu_wait::wait_reg_mem_function(func) == 0 || gpu_wait::locally_satisfied(list, op) || !unsafe { crate::list_split::split_for_wait(list, op) } {

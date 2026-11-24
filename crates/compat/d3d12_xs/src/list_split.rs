@@ -174,6 +174,7 @@ pub(crate) unsafe fn new_part(like: *mut c_void, ty: u32) -> Option<(*mut c_void
 unsafe fn give_back(seg: usize) {
     crate::indirect_bundle::forget(seg);
     crate::gws_scratch::forget(seg as *mut c_void);
+    crate::bop64::cpu::reset(seg as *mut c_void);
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(p) = pool.iter_mut().find(|p| p.list == seg) {
         p.busy = false;
@@ -327,6 +328,7 @@ unsafe extern "system" fn h_release(this: *mut c_void) -> u32 {
     if n == 0 {
         for list in expand(&[o]) {
             crate::gws_scratch::forget(list);
+            crate::bop64::cpu::reset(list);
         }
     }
     if crate::indirect_bundle::title_released(o as usize, n) {
@@ -355,7 +357,11 @@ unsafe extern "system" fn h_reset(this: *mut c_void, alloc: *mut c_void, pso: *m
         }
     }
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = unsafe { core::mem::transmute(prev(SLOT_RESET)) };
-    unsafe { f(o, alloc, pso) }
+    let hr = unsafe { f(o, alloc, pso) };
+    if hr >= 0 {
+        crate::bop64::cpu::reset(o);
+    }
+    hr
 }
 
 pub fn install(vt: &[AtomicUsize]) -> usize {

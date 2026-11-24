@@ -205,7 +205,8 @@ pub fn gs_hlsl(vs_out: &[El], ps_in: &[El]) -> Result<String, String> {
     let p = format!("f{pos}");
     h.push_str(&format!("    float q0 = 1.0 / v[0].{p}.w;\n    float q1 = 1.0 / v[1].{p}.w;\n    float q2 = 1.0 / v[2].{p}.w;\n"));
     h.push_str(&format!("    bool same = v[0].{p}.w == v[1].{p}.w && v[0].{p}.w == v[2].{p}.w;\n"));
-    h.push_str("    float q3 = q1 + q2 - q0;\n    float w3 = 1.0 / q3;\n    GO c[4];\n");
+    h.push_str(&format!("    float2 n0 = v[0].{p}.xy * q0, n1 = v[1].{p}.xy * q1, n2 = v[2].{p}.xy * q2;\n"));
+    h.push_str("    float d0 = dot(n1-n2,n1-n2), d1 = dot(n0-n2,n0-n2), d2 = dot(n0-n1,n0-n1);\n    uint pivot = (d1 > d0 && d1 >= d2) ? 1u : ((d2 > d0 && d2 > d1) ? 2u : 0u);\n    uint a = pivot == 0u ? 1u : 0u, b = pivot == 2u ? 1u : 2u;\n    float q[3] = {q0, q1, q2};\n    float q3 = q[a] + q[b] - q[pivot];\n    float w3 = 1.0 / q3;\n    GO c[4];\n");
     for k in 0..3 {
         for i in 0..vs_out.len() {
             h.push_str(&format!("    c[{k}].f{i} = v[{k}].f{i};\n"));
@@ -214,9 +215,9 @@ pub fn gs_hlsl(vs_out: &[El], ps_in: &[El]) -> Result<String, String> {
     for (i, e) in vs_out.iter().enumerate() {
         let f = format!("f{i}");
         let line = match mode(e, ps_in) {
-            Mode::Position => format!("    c[3].{f} = same ? v[1].{f} + v[2].{f} - v[0].{f} : float4((v[1].{f}.xyz * q1 + v[2].{f}.xyz * q2 - v[0].{f}.xyz * q0) * w3, w3);\n"),
-            Mode::Perspective => format!("    c[3].{f} = same ? v[1].{f} + v[2].{f} - v[0].{f} : (v[1].{f} * q1 + v[2].{f} * q2 - v[0].{f} * q0) * w3;\n"),
-            Mode::Affine => format!("    c[3].{f} = v[1].{f} + v[2].{f} - v[0].{f};\n"),
+            Mode::Position => format!("    c[3].{f} = same ? v[a].{f} + v[b].{f} - v[pivot].{f} : float4((v[a].{f}.xyz * q[a] + v[b].{f}.xyz * q[b] - v[pivot].{f}.xyz * q[pivot]) * w3, w3);\n"),
+            Mode::Perspective => format!("    c[3].{f} = same ? v[a].{f} + v[b].{f} - v[pivot].{f} : (v[a].{f} * q[a] + v[b].{f} * q[b] - v[pivot].{f} * q[pivot]) * w3;\n"),
+            Mode::Affine => format!("    c[3].{f} = v[a].{f} + v[b].{f} - v[pivot].{f};\n"),
             Mode::Flat => format!("    c[3].{f} = v[0].{f};\n"),
         };
         h.push_str(&line);
@@ -224,8 +225,69 @@ pub fn gs_hlsl(vs_out: &[El], ps_in: &[El]) -> Result<String, String> {
     if pid {
         h.push_str("    c[0].pid = pid;\n    c[1].pid = pid;\n    c[2].pid = pid;\n    c[3].pid = pid;\n");
     }
-    h.push_str("    s.Append(c[0]);\n    s.Append(c[1]);\n    s.Append(c[3]);\n    s.RestartStrip();\n    s.Append(c[0]);\n    s.Append(c[3]);\n    s.Append(c[2]);\n    s.RestartStrip();\n}\n");
+    h.push_str("    s.Append(c[0]);\n    s.Append(c[1]);\n    s.Append(c[pivot == 0u ? 3u : 2u]);\n    s.RestartStrip();\n    s.Append(c[0]);\n    s.Append(c[pivot == 1u ? 2u : 3u]);\n    s.Append(c[pivot == 2u ? 1u : (pivot == 1u ? 3u : 2u)]);\n    s.RestartStrip();\n}\n");
     Ok(h)
+}
+
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RectGeometryDiag {
+    pub pivot: usize,
+    pub fourth: [f32; 4],
+    pub area0: f32,
+    pub area1: f32,
+    pub is_degenerate: bool,
+    pub winding_matches: bool,
+}
+
+pub fn diagnose_rect_geometry(v: &[[f32; 4]; 3]) -> RectGeometryDiag {
+    let q = [1.0 / v[0][3], 1.0 / v[1][3], 1.0 / v[2][3]];
+    let n = [
+        [v[0][0] * q[0], v[0][1] * q[0]],
+        [v[1][0] * q[1], v[1][1] * q[1]],
+        [v[2][0] * q[2], v[2][1] * q[2]],
+    ];
+    let dist = |a: usize, b: usize| (n[a][0] - n[b][0]).powi(2) + (n[a][1] - n[b][1]).powi(2);
+    let (d0, d1, d2) = (dist(1, 2), dist(0, 2), dist(0, 1));
+    let pivot = if d1 > d0 && d1 >= d2 { 1 } else if d2 > d0 && d2 > d1 { 2 } else { 0 };
+    let (a, b) = match pivot { 0 => (1, 2), 1 => (0, 2), _ => (0, 1) };
+    let same = v[0][3] == v[1][3] && v[0][3] == v[2][3];
+    let fourth = if same {
+        [
+            v[a][0] + v[b][0] - v[pivot][0],
+            v[a][1] + v[b][1] - v[pivot][1],
+            v[a][2] + v[b][2] - v[pivot][2],
+            v[pivot][3],
+        ]
+    } else {
+        let q3 = q[a] + q[b] - q[pivot];
+        let w3 = 1.0 / q3;
+        [
+            (v[a][0] * q[a] + v[b][0] * q[b] - v[pivot][0] * q[pivot]) * w3,
+            (v[a][1] * q[a] + v[b][1] * q[b] - v[pivot][1] * q[pivot]) * w3,
+            (v[a][2] * q[a] + v[b][2] * q[b] - v[pivot][2] * q[pivot]) * w3,
+            w3,
+        ]
+    };
+    let p = [n[0], n[1], n[2], [fourth[0] / fourth[3], fourth[1] / fourth[3]]];
+    let cross2d = |i: usize, j: usize, k: usize| {
+        (p[j][0] - p[i][0]) * (p[k][1] - p[i][1]) - (p[j][1] - p[i][1]) * (p[k][0] - p[i][0])
+    };
+    let (area0, area1) = match pivot {
+        0 => (cross2d(0, 1, 3), cross2d(0, 3, 2)),
+        1 => (cross2d(0, 1, 2), cross2d(0, 2, 3)),
+        _ => (cross2d(0, 1, 2), cross2d(0, 3, 1)),
+    };
+    let is_degenerate = area0.abs() < 1e-7 || area1.abs() < 1e-7;
+    let winding_matches = !is_degenerate && (area0 * area1 > 0.0);
+    RectGeometryDiag {
+        pivot,
+        fourth,
+        area0,
+        area1,
+        is_degenerate,
+        winding_matches,
+    }
 }
 
 pub fn check_gs(gs: &[u8], vs_out: &[El], ps_in: &[El]) -> Result<(), String> {
@@ -442,17 +504,61 @@ mod tests {
         let ps = [el("COLOR", 0, 2, 0, 4, 0, COMP_FLOAT, 4), el("", 0, 0xff, 0, 1, KIND_PRIMITIVE_ID, COMP_UINT, 1)];
         let h = gs_hlsl(&vs, &ps).unwrap();
         assert!(h.contains("    noperspective float4 f0 : SV_Position;\n    float2 f1 : TEXCOORD0;\n    nointerpolation uint f2 : TEXCOORD1;\n    float4 f3 : COLOR0;\n"), "{h}");
-        assert!(h.contains("c[3].f0 = same ? v[1].f0 + v[2].f0 - v[0].f0 : float4((v[1].f0.xyz * q1"), "{h}");
-        assert!(h.contains("c[3].f1 = same ? v[1].f1 + v[2].f1 - v[0].f1 : (v[1].f1 * q1"), "{h}");
+        assert!(h.contains("c[3].f0 = same ? v[a].f0 + v[b].f0 - v[pivot].f0"), "{h}");
+        assert!(h.contains("c[3].f1 = same ? v[a].f1 + v[b].f1 - v[pivot].f1"), "{h}");
         assert!(h.contains("c[3].f2 = v[0].f2;"), "{h}");
-        assert!(h.contains("c[3].f3 = v[1].f3 + v[2].f3 - v[0].f3;"), "{h}");
+        assert!(h.contains("c[3].f3 = v[a].f3 + v[b].f3 - v[pivot].f3;"), "{h}");
         assert!(h.contains("uint pid : SV_PrimitiveID;\n};"), "{h}");
-        assert!(h.contains("s.Append(c[0]);\n    s.Append(c[1]);\n    s.Append(c[3]);\n    s.RestartStrip();\n    s.Append(c[0]);\n    s.Append(c[3]);\n    s.Append(c[2]);"), "{h}");
+        assert!(h.contains("s.Append(c[pivot == 0u ? 3u : 2u])"), "{h}");
         assert!(gs_hlsl(&vs[1..], &[]).is_err());
         assert!(gs_hlsl(&[el("", 0, 0, 0, 4, KIND_POSITION, COMP_FLOAT, 0), el("X", 0, 1, 0, 4, 0, 6, 0)], &[]).is_err());
         assert_eq!(forwarded(RECTLIST), TRIANGLELIST);
         for t in [0, 1, 2, 3, 4, 5, 19, 33] {
             assert_eq!(forwarded(t), t);
+        }
+    }
+
+    #[test]
+    fn frame240_pass1_geometry_is_non_degenerate_and_covers_viewport() {
+        let v = [
+            [-1.0f32,  1.0, 0.0, 1.0],
+            [-1.0,    -1.0, 0.0, 1.0],
+            [ 1.0,    -1.0, 0.0, 1.0],
+        ];
+        let diag = diagnose_rect_geometry(&v);
+        assert!(!diag.is_degenerate, "Pass 1 geometry must not be degenerate");
+        assert!(diag.winding_matches, "Pass 1 triangles must have consistent CCW winding");
+        assert_eq!(diag.fourth, [1.0, 1.0, 0.0, 1.0]);
+        assert!(diag.area0.abs() > 1.0);
+        assert!(diag.area1.abs() > 1.0);
+    }
+
+    #[test]
+    fn frame240_pass2_collapsed_geometry_from_null_slot0_is_degenerate() {
+        let s = [0.0f32, 0.0, 0.5, 1.0];
+        let v_collapsed = [s, s, s];
+        let diag = diagnose_rect_geometry(&v_collapsed);
+        assert!(diag.is_degenerate, "Collapsed vertex geometry MUST be degenerate");
+        assert_eq!(diag.area0, 0.0);
+        assert_eq!(diag.area1, 0.0);
+    }
+
+    #[test]
+    fn longest_edge_finds_all_three_rectangle_pivots() {
+        for pivot in 0..3 {
+            let mut v = [[0.0f32, 0.0], [2.0, 0.0], [0.0, 1.0]];
+            v.swap(0, pivot);
+            let dist = |a: usize, b: usize| (v[a][0]-v[b][0]).powi(2) + (v[a][1]-v[b][1]).powi(2);
+            let (d0, d1, d2) = (dist(1,2), dist(0,2), dist(0,1));
+            let actual = if d1 > d0 && d1 >= d2 { 1 } else if d2 > d0 && d2 > d1 { 2 } else { 0 };
+            assert_eq!(actual, pivot);
+            let (a,b) = match pivot { 0 => (1,2), 1 => (0,2), _ => (0,1) };
+            let fourth = [v[a][0] + v[b][0] - v[pivot][0], v[a][1] + v[b][1] - v[pivot][1]];
+            assert_eq!(fourth, [2.0, 1.0]);
+            let p = [v[0], v[1], v[2], fourth];
+            let area = |i: usize, j: usize, k: usize| (p[j][0]-p[i][0])*(p[k][1]-p[i][1])-(p[j][1]-p[i][1])*(p[k][0]-p[i][0]);
+            let (first, second) = match pivot { 0 => (area(0,1,3), area(0,3,2)), 1 => (area(0,1,2), area(0,2,3)), _ => (area(0,1,2), area(0,3,1)) };
+            assert!(first * second > 0.0, "pivot {pivot}: triangle winding differs");
         }
     }
 

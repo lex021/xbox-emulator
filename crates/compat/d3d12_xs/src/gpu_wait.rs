@@ -73,6 +73,7 @@ pub fn wait_args_error(va: u64, func: u32, flags: u32, align: u64) -> Option<&'s
     }
     if va & crate::console_slots::GRAPHICS_VA_HIGH_MASK != 0
         && !crate::console_slots::known_scarlett_buffer_address(va, align)
+        && !cpu_title_address(va, align)
     {
         return Some("address must be in graphics memory");
     }
@@ -80,6 +81,19 @@ pub fn wait_args_error(va: u64, func: u32, flags: u32, align: u64) -> Option<&'s
         return Some(if align == 8 { "address must be 8 byte aligned" } else { "address must be 4 byte aligned" });
     }
     None
+}
+
+fn cpu_title_address(va: u64, align: u64) -> bool {
+    cpu_title_address_for(crate::bop64::scarlett(), va, align)
+}
+
+fn cpu_title_address_for(scarlett: bool, va: u64, align: u64) -> bool {
+    scarlett
+        && va != 0
+        && va % align == 0
+        && usize::try_from(va).ok().is_some_and(|p| {
+            crate::title_shadow::is_readable_range(p, align as usize)
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -234,6 +248,7 @@ static BOOK: Mutex<Option<Book>> = Mutex::new(None);
 static FENCES: Mutex<Option<HashMap<(bool, u64), usize>>> = Mutex::new(None);
 static DEVICE: AtomicUsize = AtomicUsize::new(0);
 static LOG: AtomicUsize = AtomicUsize::new(0);
+static SUBMIT_ORDER: Mutex<()> = Mutex::new(());
 
 fn once(n: usize) -> bool {
     LOG.fetch_add(1, Ordering::Relaxed) < n
@@ -385,6 +400,9 @@ fn readable(p: usize, len: usize) -> bool {
 }
 
 fn cpu_address(addr: u64) -> Option<usize> {
+    if cpu_title_address(addr, 4) {
+        return usize::try_from(addr).ok();
+    }
     let (e, off) = crate::gpu_va::lookup(addr)?;
     if !e.buffer {
         return None;
@@ -404,6 +422,17 @@ fn read_title(ptr: usize, wide: bool) -> Option<u64> {
     }
     let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), ptr as *const c_void, &mut v as *mut u64 as *mut c_void, n, core::ptr::null_mut()) };
     (ok != 0).then_some(v)
+}
+
+#[cfg(test)]
+#[test]
+fn wide_wait_reads_and_compares_high_word() {
+    let value: u64 = 0x1234_5678_9abc_def0;
+    let ptr = &value as *const u64 as usize;
+    assert_eq!(read_title(ptr, true), Some(value));
+    assert_eq!(read_title(ptr, false), Some(0x9abc_def0));
+    assert!(compare(FUNC_EQUAL, read_title(ptr, true).unwrap(), u64::MAX, value));
+    assert!(!compare(FUNC_EQUAL, read_title(ptr, true).unwrap(), u64::MAX, 0x9999_9999_9abc_def0));
 }
 
 pub fn cond_live(id: u64) -> bool {
@@ -486,6 +515,8 @@ pub unsafe fn wait_now(queue: *mut c_void, op: Op, ty: u32) -> bool {
 }
 
 pub unsafe fn submit(queue: *mut c_void, lists: &[*mut c_void], exec: ExecFn, signal: usize, wait: usize) {
+    // Keep CPU writeback fence insertion adjacent to the submission it covers.
+    let _submission = SUBMIT_ORDER.lock().unwrap_or_else(|e| e.into_inner());
     SIGNAL_FN.store(signal, Ordering::Relaxed);
     WAIT_FN.store(wait, Ordering::Relaxed);
     crate::wait_probe::set_exec(exec as usize);
@@ -498,7 +529,10 @@ pub unsafe fn submit(queue: *mut c_void, lists: &[*mut c_void], exec: ExecFn, si
         }
     };
     if ops.iter().all(|o| o.is_empty()) || signal == 0 || wait == 0 {
-        unsafe { exec(queue, lists.len() as u32, lists.as_ptr()) };
+        unsafe {
+            exec(queue, lists.len() as u32, lists.as_ptr());
+            crate::bop64::cpu::after_submit(queue, lists, signal, wait);
+        }
     } else {
         let refs: Vec<&[Op]> = ops.iter().map(|v| v.as_slice()).collect();
         let mut book = BOOK.lock().unwrap_or_else(|e| e.into_inner());
@@ -524,7 +558,10 @@ unsafe fn run_steps(queue: *mut c_void, steps: &[Step], lists: &[*mut c_void], e
                     i += 1;
                 }
                 if let Some(exec) = exec {
-                    unsafe { exec(queue, (end - index) as u32, lists[index..end].as_ptr()) };
+                    unsafe {
+                        exec(queue, (end - index) as u32, lists[index..end].as_ptr());
+                        crate::bop64::cpu::after_submit(queue, &lists[index..end], signal as usize, wait as usize);
+                    }
                 }
             }
             Step::WaitAddr { addr, seq } => {
@@ -591,6 +628,16 @@ unsafe fn run_steps(queue: *mut c_void, steps: &[Step], lists: &[*mut c_void], e
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scarlett_wait_accepts_only_committed_readable_cpu_addresses() {
+        let value = Box::new(1u64);
+        let address = (&*value as *const u64) as u64;
+        assert!(cpu_title_address_for(true, address, 8));
+        assert!(!cpu_title_address_for(false, address, 8));
+        assert!(!cpu_title_address_for(true, address + 1, 8));
+        assert!(!cpu_title_address_for(true, 0, 8));
+    }
 
     #[test]
     fn comparison_functions_map_like_the_debug_umd() {

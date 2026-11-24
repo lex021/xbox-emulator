@@ -598,7 +598,7 @@ pub fn interfaces() -> Vec<Iface> {
     let u = user_layout();
     let d = device_layout();
     vec![
-        Iface { clsid: CLSID, iid: CLSID, name: "XUser(01acd177)", slots: pick(&u, &[3, 4, 5, 7, 8, 11, 29, 30, 34]) },
+        Iface { clsid: CLSID, iid: CLSID, name: "XUser(01acd177)", slots: pick(&u, &[3, 4, 5, 7, 8, 9, 11, 13, 19, 20, 29, 30, 33, 34]) },
         Iface {
             clsid: CLSID,
             iid: IID_V1,
