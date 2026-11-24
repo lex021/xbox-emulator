@@ -357,19 +357,36 @@ unsafe extern "system" fn create_cbv(this: *mut c_void, pdesc: *const u8, dest: 
         unsafe { (core::ptr::read_unaligned(pdesc as *const u64), core::ptr::read_unaligned(pdesc.add(8) as *const u32)) }
     };
     let real = unsafe { real_of(this) };
-    match raw_view(loc, size, &crate::gpu_va::lookup) {
-        Ok((res, d)) => {
-            let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(vslot(real, DEVICE_CREATE_SRV)) };
-            unsafe { f(real, res as *mut c_void, d.as_ptr(), dest) };
-            unsafe { crate::ecl_probe::after_device_call(real, "CreateConstantBufferView (raw SRV)", || format!("BufferLocation={loc:#x} size {size} res={res:#x} dest={dest:#x}")) };
-        }
-        Err(e) => {
-            static N: AtomicUsize = AtomicUsize::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 16 {
-                record("d3d12_xs", "cbv_raw", &format!("{e}; descriptor {dest:#x} left unwritten"));
+    let view = raw_view(loc, size, &|addr| {
+        crate::gpu_va::lookup_buffer(addr).or_else(|| crate::gpu_va::lookup(addr))
+    });
+    let (res, desc) = match view {
+        Ok(view) => view,
+        Err(error) => {
+            static LOGGED: AtomicUsize = AtomicUsize::new(0);
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
+                record("d3d12_xs", "cbv_raw", &format!("{error}; wrote a null raw descriptor at {dest:#x}"));
             }
+            raw_view(0, 0, &|_| None).expect("a null raw view needs no resource")
+        }
+    };
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u8, usize) =
+        unsafe { core::mem::transmute(vslot(real, DEVICE_CREATE_SRV)) };
+    let trace = size == 144 && crate::bop64::scarlett() && crate::ecl_probe::device_probe_enabled();
+    let reason: unsafe extern "system" fn(*mut c_void) -> i32 =
+        unsafe { core::mem::transmute(vslot(real, 37)) };
+    let before = trace.then(|| unsafe { reason(real) });
+    unsafe { f(real, res as *mut c_void, desc.as_ptr(), dest) };
+    if let Some(before) = before {
+        let after = unsafe { reason(real) };
+        if after < 0 {
+            record("d3d12_xs", "ScarlettRawCbv", &format!(
+                "title={loc:#x} resource={res:#x} first={} destination={dest:#x} removal before={before:#010x} after={after:#010x}",
+                u64::from_le_bytes(desc[16..24].try_into().unwrap()),
+            ));
         }
     }
+    unsafe { crate::ecl_probe::after_device_call(real, "CreateConstantBufferView (raw SRV)", || format!("BufferLocation={loc:#x} size {size} res={res:#x} dest={dest:#x}")) };
 }
 
 unsafe extern "system" fn set_compute_root_cbv_x(this: *mut c_void, i: u32, va: u64) {
