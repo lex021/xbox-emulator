@@ -31,7 +31,6 @@ pub unsafe fn wait_fence(fence: *mut c_void, value: u64, timeout_ms: u32) -> boo
             std::thread::yield_now();
         }
     }
-    // Removal wakes the event too. Confirm progress with the fence itself.
     WaitForSingleObject(ev, timeout_ms);
     let current = completed(fence);
     current != u64::MAX && current >= value
