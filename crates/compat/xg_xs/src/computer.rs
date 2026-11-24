@@ -12,7 +12,6 @@ pub struct Computer {
     pub layout: Layout2D,
 }
 
-// The XG slot uses the D3D12 tiling output records for the layout owned by this object.
 pub(crate) type GetResourceTiling<T> = unsafe extern "system" fn(
     *mut T, *mut u32, *mut [u32; 3], *mut [u32; 3], *mut u32, u32, *mut SubresourceTiling,
 ) -> i32;
@@ -199,7 +198,6 @@ unsafe extern "system" fn tiled(
     }
     let tail_mips = layout.mips - first_tail;
     if !packed.is_null() {
-        // The first two bytes are NumStandardMips and NumPackedMips.
         let tail_start = if tail_mips == 0 { 0 } else { (layout.mip_offset(first_tail) / TILE) as u32 };
         packed.write_unaligned([first_tail | tail_mips << 8, u32::from(tail_mips != 0), tail_start]);
     }
