@@ -53,7 +53,7 @@ Counted live by `tools/progress/gen.py`; full table with evidence in [docs/MILES
 | Terraria | 4.4.14.1081 | **Reaches its world** at a steady 60 fps (1% low ~59); keyboard and controller work. Runs fine when played by hand (user, 2026-11-22); automated test runs still crash some seconds after the world appears (under investigation). |
 | Minecraft (Beta) | 1.18.3064.0 | Boots past the welcome screen to the menu (~44 s), then crashes in automated runs. |
 | XDefiant | 1.0.0.186 | Boots to first frames (~26 s) at under 1 fps (shader and pipeline compiles block the frame), then crashes. Imports and console OS (10.0.22000) mapped in [docs/LIBRARY_MAP.md](docs/LIBRARY_MAP.md); new modules include XCurl, Bink2Scarlett, chad (XDsp*), xapu (XApu*). |
-| Grand Theft Auto VI | 1.0.2.1 | **Not run** (dump has no executable). Shader package examined: 26,503 shaders, plain compressed Xbox shader containers. Of a 4,000-shader sample all disassemble cleanly; ~⅓ of vertex shaders translate. Blockers: mesh shaders, shaders without root signatures. |
+| Grand Theft Auto VI | 1.0.2.1 | **Boots to continuous frame presentation on the experimental branch.** On a GTX 1070 Ti at 3840×2160 (2026-11-24), TomBox presented at least 900 frames over six minutes and exited normally when the window was closed. Presentation reached about 5 fps in some intervals. The game backbuffer stayed black in all six sampled frames. The intro, menu and gameplay are still unverified. |
 
 ## Our local state
 
