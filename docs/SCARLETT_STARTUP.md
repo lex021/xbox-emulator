@@ -7,3 +7,9 @@ The XG tiling query succeeded during real UI texture loading. Zero-address place
 The filtered compatibility suite passed 176 tests and three DLL-level checks of the XG slot 10 ABI. Two shared-heap migration tests also failed on the comparison build before the tile guards. The XG unit-test target requires a missing oracle module in this checkout.
 
 A startup integration test should bring its own authorized title files locally. It should check texture loading, driver errors, a nonblack frame, and an identifiable menu before marking a run successful. Public CI can exercise the same ABI and resource paths with synthetic fixtures.
+
+## After the upstream sync
+
+The post-sync GTX run reached UI texture streaming and reproduced the crash. The exception stack and recorded arguments identify CopyDescriptorsSimple on a Scarlett shader-visible source heap. The next startup wave routes that heap's internal copies through the descriptor decoder and retains the guest records. This path is still being verified.
+
+Treat these as separate startup criteria: process reaches UI resource loading, frames contain visible content, the rendered screen is identifiable as the main menu, and the audio output contains audible menu sound. A present count alone does not pass the visual check. Use locally supplied title files for end-to-end runs and synthetic fixtures in public CI.

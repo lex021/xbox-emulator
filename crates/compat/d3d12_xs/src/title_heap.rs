@@ -507,7 +507,15 @@ unsafe fn write_slot(h: &Heap, i: usize, words: &[u32], kind: u8) -> bool {
     }
     let mut d = [0u32; 8];
     d[..words.len()].copy_from_slice(words);
-    let slot = decode_slot(h.family, &d);
+    unsafe { write_resource_slot(dev, handle, h.family, &d, kind) }
+}
+
+pub(crate) unsafe fn write_scarlett_copied_srv(device: usize, destination: u64, words: &[u32; 8]) -> bool {
+    unsafe { write_resource_slot(device, destination, FAMILY_SCARLETT, words, KIND_SRV) }
+}
+
+unsafe fn write_resource_slot(dev: usize, handle: u64, family: u32, words: &[u32; 8], kind: u8) -> bool {
+    let slot = decode_slot(family, words);
     let mut ok = true;
     if kind == KIND_CBV {
         let f: unsafe extern "system" fn(usize, *const [u8; 16], u64) = core::mem::transmute(vfn(dev, 17));

@@ -61,6 +61,16 @@ struct CpuAlias {
 static SCARLETT_CPU: RwLock<Vec<CpuAlias>> = RwLock::new(Vec::new());
 static ALIAS_RELEASE: AtomicUsize = AtomicUsize::new(0);
 
+pub(crate) fn scarlett_shader_visible_cpu_range(handle: usize, count: u32) -> bool {
+    if count == 0 {
+        return false;
+    }
+    let size = count as usize * 32;
+    let aliases = SCARLETT_CPU.read().unwrap_or_else(|e| e.into_inner());
+    aliases.iter().any(|alias| !alias.owned && handle.checked_sub(alias.start)
+        .is_some_and(|offset| offset % 32 == 0 && offset <= alias.bytes && size <= alias.bytes - offset))
+}
+
 pub(crate) fn native_cpu_handle(handle: usize) -> usize {
     let aliases = SCARLETT_CPU.read().unwrap_or_else(|e| e.into_inner());
     aliases.iter().find_map(|alias| {

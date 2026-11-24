@@ -2,10 +2,28 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use compat_common::record;
 
+static TRACE_NATIVE_AV: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static DESCRIPTOR_COPY: core::cell::Cell<Option<[usize; 6]>> = const { core::cell::Cell::new(None) };
+}
+
+pub(crate) fn trace_descriptor_copy(n: u32, dst: usize, src: usize, host_dst: usize, host_src: usize, ty: u32) {
+    if TRACE_NATIVE_AV.load(Ordering::Relaxed) {
+        DESCRIPTOR_COPY.set(Some([n as usize, dst, src, host_dst, host_src, ty as usize]));
+    }
+}
+
+pub(crate) fn clear_descriptor_copy() {
+    if TRACE_NATIVE_AV.load(Ordering::Relaxed) {
+        DESCRIPTOR_COPY.set(None);
+    }
+}
+
 pub fn install_native_exception_log() {
     if std::env::var_os("TOMBOX_SCARLETT_NATIVE_AV").is_none() {
         return;
     }
+    TRACE_NATIVE_AV.store(true, Ordering::Relaxed);
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, log_native_access_violation);
@@ -105,6 +123,10 @@ unsafe extern "system" fn log_native_access_violation(info: *const [usize; 2]) -
     );
     let mut written = 0;
     unsafe { WriteFile(GetStdHandle((-12i32) as u32), message.as_ptr(), message.len() as u32, &mut written, core::ptr::null_mut()) };
+    if let Ok(Some(args)) = DESCRIPTOR_COPY.try_with(|copy| copy.get()) {
+        let message = format!("ScarlettDescriptorCopy [count, title dst, title src, host dst, host src, type] = {args:x?}\n");
+        unsafe { WriteFile(GetStdHandle((-12i32) as u32), message.as_ptr(), message.len() as u32, &mut written, core::ptr::null_mut()) };
+    }
     let stack = unsafe { exception_stack(context, address) };
     unsafe { WriteFile(GetStdHandle((-12i32) as u32), stack.as_ptr(), stack.len() as u32, &mut written, core::ptr::null_mut()) };
     0

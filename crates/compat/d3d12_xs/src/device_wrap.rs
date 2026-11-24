@@ -1599,7 +1599,27 @@ unsafe extern "system" fn real_copy_descriptors_simple(real: *mut c_void, n: u32
     if heap_type == 0 {
         let dp = crate::heap_wrap::native_cpu_handle(dest);
         let sp = crate::heap_wrap::native_cpu_handle(src);
-        unsafe { f(real, n, dp, sp, heap_type) }
+        if crate::heap_wrap::scarlett_shader_visible_cpu_range(src, n) {
+            let bytes = n as usize * 32;
+            if crate::heap_wrap::scarlett_shader_visible_cpu_range(dest, n) {
+                // The Windows copy API forbids shader-visible heaps as sources.
+                // Copy the Xbox records and materialize a host view at each destination.
+                unsafe { core::ptr::copy(src as *const u8, dest as *mut u8, bytes) };
+                for index in 0..n as usize {
+                    let offset = index * 32;
+                    let words = unsafe { ((dest + offset) as *const [u32; 8]).read_unaligned() };
+                    unsafe { crate::title_heap::write_scarlett_copied_srv(real as usize, (dp + offset) as u64, &words) };
+                }
+                static LOGGED: AtomicU32 = AtomicU32::new(0);
+                if LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+                    record("d3d12_xs", "ScarlettDescriptorCopy", &format!("materialized {n} guest SRV(s) at {dest:#x}"));
+                }
+            }
+            return;
+        }
+        crate::process_debug::trace_descriptor_copy(n, dest, src, dp, sp, heap_type);
+        unsafe { f(real, n, dp, sp, heap_type) };
+        crate::process_debug::clear_descriptor_copy();
     } else {
         unsafe { f(real, n, dest, src, heap_type) }
     }
