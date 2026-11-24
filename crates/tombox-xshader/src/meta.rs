@@ -293,7 +293,9 @@ pub fn scarlett_graphics_table_slots(root: &RootSig) -> Option<u32> {
     }
 }
 
-pub const SCARLETT_MEDIA_SAMPLERS: [(u32, [u32; 4]); 3] = [
+pub const SCARLETT_MEDIA_SAMPLERS: [(u32, [u32; 4]); 5] = [
+    (27, [0x000, 0x00c00000, 0x14500000, 0]),
+    (28, [0x092, 0x00c00000, 0x18500000, 0]),
     (29, [0x092, 0x00c00000, 0x14000000, 0]),
     (30, [0x400, 0x00c00000, 0x18f00000, 0]),
     (31, [0x092, 0x00c00000, 0x14500000, 0]),

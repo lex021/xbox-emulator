@@ -23,3 +23,7 @@ The next GTX run explicitly completed the rematerialized Scarlett descriptor cop
 After isolating two predication tests from the shared command-list COM hooks, both pass in the serial suite. The full D3D12 suite now stops later with a Windows access violation in the placed-offset MSAA test. The separate pipeline and shader checks remain green.
 
 Disabling submit-time texture upload reproduced the same device removal. The raw-CBV wave now resolves placed-buffer offsets using resource-relative coordinates and writes typed null descriptors when there is no backing buffer. The disambiguation trace records the removal reason before and after the recurring 144-byte descriptor call. Its focused D3D12 suite passed 45 tests. The full shader library suite passed 118 tests, with three GPU/corpus tests ignored by default.
+
+Tracing the 144-byte raw descriptor showed S_OK immediately before CreateShaderResourceView and DXGI_ERROR_INVALID_CALL immediately after. The Windows view wrappers now expose the full backing resource extent while retaining the logical placed-buffer width for the title. The subsequent GTX run passed that descriptor creation and continued to present responsive frames for more than two minutes. The sampled frames were still black.
+
+Two captured Scarlett sampler encodings from later startup shaders are now represented in the expanded media root signature. The focused suite passed 25 tests and DXC accepted all three previously refused shader fixtures. The new native run is configured to save diagnostic captures on a separate drive.
