@@ -1531,7 +1531,7 @@ unsafe extern "system" fn real_create_srv(real: *mut c_void, res: *mut c_void, p
     crate::bindtrace::note_desc(dest, crate::bindtrace::Desc::Srv { res: res as usize, desc });
     crate::res3d::note_view(res, "SRV", desc.as_ref(), dest);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(real_orig(18)) };
-    unsafe { f(real, res, pdesc, crate::heap_wrap::native_cpu_handle(dest)) };
+    crate::placed_offset::with_true_desc(|| unsafe { f(real, res, pdesc, crate::heap_wrap::native_cpu_handle(dest)) });
     crate::bindtrace::note_desc_after(dest, 0, crate::bindtrace::Desc::Srv { res: res as usize, desc });
 }
 unsafe extern "system" fn real_create_uav(real: *mut c_void, res: *mut c_void, counter: *mut c_void, pdesc: *const u8, dest: usize) {
@@ -1539,7 +1539,7 @@ unsafe extern "system" fn real_create_uav(real: *mut c_void, res: *mut c_void, c
     crate::bindtrace::note_desc(dest, crate::bindtrace::Desc::Uav { res: res as usize, desc });
     crate::res3d::note_view(res, "UAV", desc.as_ref(), dest);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(real_orig(19)) };
-    unsafe { f(real, res, counter, pdesc, crate::heap_wrap::native_cpu_handle(dest)) };
+    crate::placed_offset::with_true_desc(|| unsafe { f(real, res, counter, pdesc, crate::heap_wrap::native_cpu_handle(dest)) });
     crate::bindtrace::note_desc_after(dest, 0, crate::bindtrace::Desc::Uav { res: res as usize, desc });
 }
 unsafe extern "system" fn real_create_sampler(real: *mut c_void, pdesc: *const u8, dest: usize) {
