@@ -637,6 +637,14 @@ pub(crate) fn plain_null_is_noop(plain_active: bool, res: usize) -> bool {
     res == 0 && !plain_active
 }
 
+#[cfg(test)]
+pub(crate) fn seed_plain_predication(list: *mut c_void, resource: usize) {
+    rec(list, |state| {
+        state.plain_predicate = true;
+        state.predication = Some((resource, 0, 0));
+    });
+}
+
 pub(crate) unsafe extern "system" fn w_predication(this: *mut c_void, res: *mut c_void, off: u64, op: u32) {
     if plain_null_is_noop(with(this, |s| s.plain_predicate), res as usize) {
         if once(8) {
@@ -2088,12 +2096,16 @@ unsafe extern "system" fn w_reset(this: *mut c_void, alloc: *mut c_void, pso: *m
     hr
 }
 
-pub(crate) unsafe extern "system" fn w_clear_state(this: *mut c_void, pso: *mut c_void) {
+pub(crate) fn clear_recorded_state(this: *mut c_void, pso: *mut c_void) {
     crate::cl_fw::forget(crate::list_split::origin_of(this));
     with(this, |s| {
         s.clear_bindings();
         s.pso = (!pso.is_null()).then_some(pso as usize);
     });
+}
+
+pub(crate) unsafe extern "system" fn w_clear_state(this: *mut c_void, pso: *mut c_void) {
+    clear_recorded_state(this, pso);
     fwd!(X_CLEAR_STATE, fn(*mut c_void), this, pso);
     unsafe { apply_pso_bias(this, pso as usize) };
 }

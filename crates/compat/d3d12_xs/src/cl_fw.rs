@@ -343,7 +343,7 @@ mod tests {
         unsafe { set_predication_buffer(p, &PredicationBufferDesc { va: 0x7f_0000_0000, offset: 0 }) };
         assert!(cursor(p as usize).is_some());
         assert_eq!(crate::cl2_state::predication_of(p), Some((0x3344, 0, 0)));
-        unsafe { crate::cl2_state::w_clear_state(p, core::ptr::null_mut()) };
+        crate::cl2_state::clear_recorded_state(p, core::ptr::null_mut());
         assert_eq!(cursor(p as usize), None, "ClearState must drop the predication cursor");
         assert_eq!(crate::cl2_state::predication_of(p), None, "ClearState must clear predication in list state");
         unsafe { advance_predication(p) };
@@ -356,7 +356,7 @@ mod tests {
         let vt: &Vec<usize> = Box::leak(Box::new(fake_vt()));
         let l: &FakeList = Box::leak(Box::new(FakeList { vt: vt.as_ptr(), ty: LIST_TYPE_DIRECT }));
         let p = l as *const FakeList as *mut c_void;
-        unsafe { crate::cl2_state::w_predication(p, 0x1234 as *mut c_void, 0, 0) };
+        crate::cl2_state::seed_plain_predication(p, 0x1234);
         assert_eq!(crate::cl2_state::predication_of(p), Some((0x1234, 0, 0)));
         unsafe { set_predication_buffer(p, &PredicationBufferDesc { va: 0x8a_0000_0000, offset: 0 }) };
         assert_eq!(crate::cl2_state::predication_of(p), Some((0x5566, 0, 0)));

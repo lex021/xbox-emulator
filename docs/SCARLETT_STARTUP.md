@@ -19,3 +19,5 @@ The first descriptor-copy wave stayed alive past the previous NVIDIA exception a
 The full D3D12 unit process still exits with an access violation in the predication test group. The targeted root, descriptor-heap and pipeline suite passed 41 tests. Menu audio has not been verified.
 
 The next GTX run explicitly completed the rematerialized Scarlett descriptor copies. It no longer reproduced the NVIDIA access violation at that point. It later reported D3D12 device removal with DXGI_ERROR_INVALID_CALL and exited with a breakpoint status (0x80000003). All 18 captured frames were black. The device-removal journal does not identify the command that first created the invalid state. The loading and presentation milestone remains partial. Main-menu rendering and audible menu sound are still open.
+
+After isolating two predication tests from the shared command-list COM hooks, both pass in the serial suite. The full D3D12 suite now stops later with a Windows access violation in the placed-offset MSAA test. The separate pipeline and shader checks remain green.
