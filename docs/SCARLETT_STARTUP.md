@@ -13,3 +13,7 @@ A startup integration test should bring its own authorized title files locally. 
 The post-sync GTX run reached UI texture streaming and reproduced the crash. The exception stack and recorded arguments identify CopyDescriptorsSimple on a Scarlett shader-visible source heap. The next startup wave routes that heap's internal copies through the descriptor decoder and retains the guest records. This path is still being verified.
 
 Treat these as separate startup criteria: process reaches UI resource loading, frames contain visible content, the rendered screen is identifiable as the main menu, and the audio output contains audible menu sound. A present count alone does not pass the visual check. Use locally supplied title files for end-to-end runs and synthetic fixtures in public CI.
+
+The first descriptor-copy wave stayed alive past the previous NVIDIA exception and reached later pixel and mesh pipeline compilation. The captured frames were still black. The next wave validates root table sizes against the serialized RTS0 data, which allows the 183–261-range tables observed at startup. A synthetic test covers valid and truncated tables in both supported record sizes.
+
+The full D3D12 unit process still exits with an access violation in the predication test group. The targeted root, descriptor-heap and pipeline suite passed 41 tests. Menu audio has not been verified.

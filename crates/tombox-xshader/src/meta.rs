@@ -349,10 +349,11 @@ pub fn parse_rts0(body: &[u8]) -> Result<RootSig, String> {
             0 => {
                 let nranges = u32_at(body, off)? as usize;
                 let roff = u32_at(body, off + 4)? as usize;
-                if nranges > 64 {
-                    return Err(format!("implausible range count {nranges}"));
-                }
                 let stride = if v11 { 24 } else { 20 };
+                let available = body.get(roff..).map_or(0, |remaining| remaining.len() / stride);
+                if nranges > available {
+                    return Err(format!("root table has {nranges} ranges but only {available} fit in RTS0"));
+                }
                 let mut ranges = Vec::with_capacity(nranges);
                 for r in 0..nranges {
                     let q = roff + r * stride;
@@ -509,5 +510,31 @@ mod tests {
         let mut union_only = cs_blob(48, [4, 2, 1]);
         union_only[4..16].copy_from_slice(&[8, 0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0]);
         assert_eq!(parse_psv0_cs_threads(&union_only), Some([4, 2, 1]));
+    }
+}
+
+#[cfg(test)]
+mod wide_table_tests {
+    use super::*;
+
+    #[test]
+    fn reads_large_root_tables_and_rejects_truncated_ranges() {
+        for (version, stride) in [(1, 20), (2, 24)] {
+            let count = 261usize;
+            let mut body = vec![0; 44 + count * stride];
+            for (off, value) in [(0, version), (4, 1), (8, 24), (32, 36), (36, count as u32), (40, 44)] {
+                body[off..off + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            for register in 0..count {
+                let off = 44 + register * stride + 8;
+                body[off..off + 4].copy_from_slice(&(register as u32).to_le_bytes());
+            }
+            let root = parse_rts0(&body).unwrap();
+            let RootParamKind::Table(ranges) = &root.params[0].kind else { panic!("expected table") };
+            assert_eq!(ranges.len(), count);
+            assert_eq!(ranges[count - 1].base_register, 260);
+            body.pop();
+            assert!(parse_rts0(&body).is_err());
+        }
     }
 }
