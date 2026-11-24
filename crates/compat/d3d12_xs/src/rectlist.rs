@@ -293,6 +293,42 @@ pub fn refuse_desc(d: &[u8], why: &str) {
     refuse(vs.as_ptr() as usize, crate::shader_xlat::fnv1a(vs), why);
 }
 
+pub(crate) fn expand_stream(source: &crate::dbcount::StreamRec) -> Result<Vec<u8>, String> {
+    use crate::dbcount::{append_sub, SUB_CACHED_PSO, SUB_DS, SUB_GS, SUB_HS, SUB_MS, SUB_PS, SUB_SO, SUB_VS};
+    use crate::mesh_pso::SUB_PRIMITIVE_TOPOLOGY;
+    let find = |kind| source.subs.iter().find(|&&(ty, _)| ty == kind).map(|&(_, at)| at);
+    let shader = |kind| find(kind).map_or(&[][..], |at| unsafe { blob(&source.stream, at) });
+    let word = |at| u32::from_le_bytes(source.stream[at..at + 4].try_into().unwrap());
+    let vs = shader(SUB_VS);
+    if vs.is_empty() || [SUB_DS, SUB_GS, SUB_HS, SUB_MS].iter().any(|&kind| !shader(kind).is_empty())
+        || find(SUB_SO).is_some_and(|at| word(at + 8) != 0)
+        || find(SUB_PRIMITIVE_TOPOLOGY).is_some_and(|at| !matches!(word(at), 0 | TOPOLOGY_TYPE_TRIANGLE))
+    {
+        return Err("the stream is not a vertex pipeline with triangle topology".into());
+    }
+    let gs = gs_for(vs, shader(SUB_PS))?;
+    let mut stream = source.stream.clone();
+    let mut subs = source.subs.clone();
+    let mut bytecode = [0u8; 16];
+    bytecode[..8].copy_from_slice(&(gs.as_ptr() as u64).to_le_bytes());
+    bytecode[8..].copy_from_slice(&(gs.len() as u64).to_le_bytes());
+    if let Some(at) = find(SUB_GS) {
+        stream[at..at + 16].copy_from_slice(&bytecode);
+    } else {
+        append_sub(&mut stream, &mut subs, SUB_GS, &bytecode);
+    }
+    let topology = TOPOLOGY_TYPE_TRIANGLE.to_le_bytes();
+    if let Some(at) = find(SUB_PRIMITIVE_TOPOLOGY) {
+        stream[at..at + 4].copy_from_slice(&topology);
+    } else {
+        append_sub(&mut stream, &mut subs, SUB_PRIMITIVE_TOPOLOGY, &topology);
+    }
+    if let Some(at) = find(SUB_CACHED_PSO) {
+        stream[at..at + 16].fill(0);
+    }
+    Ok(stream)
+}
+
 pub fn expand(d: &mut [u8]) -> bool {
     if d.len() < D_TOPOLOGY_TYPE + 4 {
         return false;

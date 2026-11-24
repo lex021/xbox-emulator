@@ -131,7 +131,7 @@ pub struct FactoryVtbl {
     pub set_debug_flags: unsafe extern "system" fn(*mut c_void, u32),
     pub set_staging_buffer_size: unsafe extern "system" fn(*mut c_void, u32) -> i32,
     pub slot9: unsafe extern "system" fn(*mut c_void) -> i32,
-    pub slot10: unsafe extern "system" fn(*mut c_void) -> i32,
+    pub create_queue_scarlett: unsafe extern "system" fn(*mut c_void, *const u8, *const c_void, *mut *mut c_void) -> i32,
     pub slot11: unsafe extern "system" fn(*mut c_void) -> i32,
     pub slot12: unsafe extern "system" fn(*mut c_void) -> i32,
     pub slot13: unsafe extern "system" fn(*mut c_void) -> i32,
@@ -145,7 +145,6 @@ pub struct FactoryObj {
 }
 
 trap!(factory_slot9, "IDStorageFactoryX", 9);
-trap!(factory_slot10, "IDStorageFactoryX", 10);
 trap!(factory_slot11, "IDStorageFactoryX", 11);
 trap!(factory_slot12, "IDStorageFactoryX", 12);
 trap!(factory_slot13, "IDStorageFactoryX", 13);
@@ -163,7 +162,7 @@ pub static FACTORY_VTBL: FactoryVtbl = FactoryVtbl {
     set_debug_flags: factory_set_debug_flags,
     set_staging_buffer_size: factory_set_staging_buffer_size,
     slot9: factory_slot9,
-    slot10: factory_slot10,
+    create_queue_scarlett: factory_create_queue_scarlett,
     slot11: factory_slot11,
     slot12: factory_slot12,
     slot13: factory_slot13,
@@ -185,7 +184,7 @@ unsafe extern "system" fn factory_qi(this: *mut c_void, riid: *const c_void, ppv
     }
     unsafe { *ppv = core::ptr::null_mut() };
     match unsafe { read_iid(riid) } {
-        Some(i) if i == IID_FACTORY_X || i == IID_IUNKNOWN => {
+        Some(i) if i == IID_FACTORY_X || i == IID_SCARLETT_FACTORY_X || i == IID_IUNKNOWN => {
             unsafe { qi_out(ppv, this) };
             S_OK
         }
@@ -212,18 +211,47 @@ unsafe extern "system" fn factory_create_queue(_this: *mut c_void, desc: *const 
     }
     let mut raw = [0u8; XQUEUE_DESC_SIZE];
     unsafe { core::ptr::copy_nonoverlapping(desc, raw.as_mut_ptr(), XQUEUE_DESC_SIZE) };
+    unsafe { create_queue(raw, riid, ppv, IID_QUEUE_X, "IDStorageFactoryX::CreateQueue") }
+}
+
+unsafe extern "system" fn factory_create_queue_scarlett(_this: *mut c_void, desc: *const u8, riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
+    const OP: &str = "IDStorageFactoryX::CreateQueueScarlett";
+    if ppv.is_null() {
+        return E_POINTER;
+    }
+    unsafe { *ppv = core::ptr::null_mut() };
+    if unsafe { read_iid(riid) } != Some(IID_SCARLETT_QUEUE_X) {
+        return E_NOINTERFACE;
+    }
+    // This slot takes the existing 24-byte queue descriptor plus one QWORD.
+    // Route the observed extension value through the checked CPU I/O path.
+    let mut desc_x = [0u8; XQUEUE_DESC_SIZE + 8];
+    if !range_accessible(desc as u64, desc_x.len(), false) {
+        return E_INVALIDARG;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(desc, desc_x.as_mut_ptr(), desc_x.len()) };
+    let (raw, extension) = desc_x.split_at(XQUEUE_DESC_SIZE);
+    let extension = u64::from_le_bytes(extension.try_into().unwrap());
+    if extension != 1 {
+        report(OP, E_NOTIMPL, &format!("queue extension {extension:#x}"));
+        return E_NOTIMPL;
+    }
+    unsafe { create_queue(raw.try_into().unwrap(), riid, ppv, IID_SCARLETT_QUEUE_X, OP) }
+}
+
+unsafe fn create_queue(raw: [u8; XQUEUE_DESC_SIZE], riid: *const c_void, ppv: *mut *mut c_void, iid: Iid, op: &str) -> i32 {
     let q = match QueueInner::create(raw) {
         Ok(q) => q,
         Err((hr, why)) => {
-            report("IDStorageFactoryX::CreateQueue", hr, &why);
+            report(op, hr, &why);
             return hr;
         }
     };
-    let obj = Box::into_raw(Box::new(QueueObj { vtbl: &QUEUE_VTBL, refs: AtomicU32::new(1), inner: q.clone() }));
+    let obj = Box::into_raw(Box::new(QueueObj { vtbl: &QUEUE_VTBL, refs: AtomicU32::new(1), iid, inner: q.clone() }));
     let hr = unsafe { queue_qi(obj as *mut c_void, riid, ppv) };
     unsafe { queue_release(obj as *mut c_void) };
     log(
-        "IDStorageFactoryX::CreateQueue",
+        op,
         &format!("type={} capacity={} priority={} name='{}' -> hr={hr:#010x} queue={:p}", q.source_type, q.capacity, q.priority, q.name, unsafe { *ppv }),
     );
     hr
@@ -975,6 +1003,7 @@ pub struct QueueVtbl {
 pub struct QueueObj {
     pub vtbl: &'static QueueVtbl,
     pub refs: AtomicU32,
+    pub iid: Iid,
     pub inner: Arc<QueueInner>,
 }
 
@@ -1016,7 +1045,7 @@ unsafe extern "system" fn queue_qi(this: *mut c_void, riid: *const c_void, ppv: 
     }
     unsafe { *ppv = core::ptr::null_mut() };
     match unsafe { read_iid(riid) } {
-        Some(i) if i == IID_QUEUE_X || i == IID_IUNKNOWN => {
+        Some(i) if i == unsafe { queue(this) }.iid || i == IID_IUNKNOWN => {
             unsafe { queue_add_ref(this) };
             unsafe { qi_out(ppv, this) };
             S_OK

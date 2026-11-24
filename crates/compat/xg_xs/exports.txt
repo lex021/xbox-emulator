@@ -21,3 +21,4 @@
 21 XGTerminateLibrary implemented
 22 XGValidateDepthStencilSwizzleMode implemented
 23 XGValidateDescriptor implemented
+24 XGSuggestSwizzleMode pending | Scarlett call-site ABI and host layout tests, console comparison pending

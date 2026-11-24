@@ -65,6 +65,27 @@ unsafe extern "system" fn on_destroyed(data: *mut c_void) {
     }
 }
 
+pub(crate) unsafe fn register_destruction(
+    obj: *mut c_void,
+    callback: DestroyedFn,
+    data: *mut c_void,
+) -> bool {
+    let qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(slot(obj, 0)) };
+    let mut notifier = core::ptr::null_mut();
+    if unsafe { qi(obj, &IID_DESTRUCTION_NOTIFIER, &mut notifier) } < 0 || notifier.is_null() {
+        return false;
+    }
+    let register: unsafe extern "system" fn(*mut c_void, DestroyedFn, *mut c_void, *mut u32) -> i32 =
+        unsafe { core::mem::transmute(slot(notifier, 3)) };
+    let release: unsafe extern "system" fn(*mut c_void) -> u32 =
+        unsafe { core::mem::transmute(slot(notifier, 2)) };
+    let mut id = 0;
+    let hr = unsafe { register(notifier, callback, data, &mut id) };
+    unsafe { release(notifier) };
+    hr >= 0
+}
+
 pub unsafe fn track(obj: *mut c_void, bytes: u64, what: &str) -> bool {
     unsafe { track_kind(obj, bytes, what, false) }
 }
@@ -77,22 +98,10 @@ unsafe fn track_kind(obj: *mut c_void, bytes: u64, what: &str, is_heap: bool) ->
         return false;
     }
     let Some(charge) = charge_fn() else { return false };
-    let qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(slot(obj, 0)) };
-    let mut n: *mut c_void = core::ptr::null_mut();
-    if unsafe { qi(obj, &IID_DESTRUCTION_NOTIFIER, &mut n) } < 0 || n.is_null() {
+    let data = (bytes | if is_heap { HEAP_BIT } else { 0 }) as usize as *mut c_void;
+    if !unsafe { register_destruction(obj, on_destroyed, data) } {
         if UNTRACKED.fetch_add(1, Ordering::Relaxed) < 4 {
-            record("d3d12_xs", "title_gpu", &format!("{what} {obj:p} has no ID3DDestructionNotifier: {bytes:#x} bytes not counted"));
-        }
-        return false;
-    }
-    let register: unsafe extern "system" fn(*mut c_void, DestroyedFn, *mut c_void, *mut u32) -> i32 = unsafe { core::mem::transmute(slot(n, 3)) };
-    let release: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(slot(n, 2)) };
-    let mut id = 0u32;
-    let hr = unsafe { register(n, on_destroyed, (bytes | if is_heap { HEAP_BIT } else { 0 }) as usize as *mut c_void, &mut id) };
-    unsafe { release(n) };
-    if hr < 0 {
-        if UNTRACKED.fetch_add(1, Ordering::Relaxed) < 4 {
-            record("d3d12_xs", "title_gpu", &format!("{what} {obj:p}: RegisterDestructionCallback hr={hr:#010x}, {bytes:#x} bytes not counted"));
+            record("d3d12_xs", "title_gpu", &format!("{what} {obj:p}: could not register destruction callback, {bytes:#x} bytes not counted"));
         }
         return false;
     }

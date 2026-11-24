@@ -71,7 +71,9 @@ pub fn wait_args_error(va: u64, func: u32, flags: u32, align: u64) -> Option<&'s
     if flags & WAIT_FLAG_PFP != 0 && func != FUNC_GREATER_EQUAL {
         return Some("waits using the PFP engine support only D3D12_COMPARISON_FUNC_GREATER_EQUAL");
     }
-    if va & crate::console_slots::GRAPHICS_VA_HIGH_MASK != 0 {
+    if va & crate::console_slots::GRAPHICS_VA_HIGH_MASK != 0
+        && !crate::console_slots::known_scarlett_buffer_address(va, align)
+    {
         return Some("address must be in graphics memory");
     }
     if va % align != 0 {

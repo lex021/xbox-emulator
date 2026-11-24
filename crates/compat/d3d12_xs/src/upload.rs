@@ -1157,6 +1157,9 @@ unsafe fn init(queue: *mut c_void) -> Result<Uploader, String> {
 
 /// Why a placed resource is not mirrored (None = it is).
 fn unsupported_reason(p: &Placed) -> Option<String> {
+    if p.va == 0 {
+        return Some("no title CPU backing for the committed resource".into());
+    }
     if p.dim() != 3 {
         return Some(format!("dimension {} (only Texture2D/array/cube are mirrored)", p.dim()));
     }

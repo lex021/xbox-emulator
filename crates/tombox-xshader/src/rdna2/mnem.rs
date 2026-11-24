@@ -379,6 +379,10 @@ pub fn lookup(enc: Enc, op: u32) -> Option<&'static str> {
             0x1d => Some("flat_store_dwordx2"),
             0x1e => Some("flat_store_dwordx4"),
             0x1f => Some("flat_store_dwordx3"),
+            0x32 => Some("flat_atomic_add"),
+            0x33 => Some("flat_atomic_sub"),
+            0x3f => Some("flat_atomic_fmin"),
+            0x40 => Some("flat_atomic_fmax"),
             _ => None,
         },
         Enc::Ds => match op {

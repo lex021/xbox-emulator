@@ -173,6 +173,46 @@ pub fn patch_rts0_with(b: &mut [u8], roots: bool) -> Result<RsPatch, String> {
     Ok(p)
 }
 
+fn expand_scarlett_graphics_table(blob: &[u8]) -> Option<Vec<u8>> {
+    use tombox_xshader::meta::{
+        scarlett_graphics_table_slots, scarlett_media_table, SCARLETT_MEDIA_SAMPLERS,
+        SCARLETT_PACKED_CBV_REGISTER, SCARLETT_PACKED_SRV_REGISTER,
+    };
+    let (offset, length) = crate::console_slots_mesh::rts0_range(blob)?;
+    let rts = blob.get(offset..offset.checked_add(length)?)?;
+    let root = tombox_xshader::meta::parse_rts0(rts).ok()?;
+    let slots = scarlett_graphics_table_slots(&root)?;
+    let media = scarlett_media_table(&root);
+    let params = rd(rts, 8).ok()? as usize;
+    let table = rd(rts, params + 8).ok()? as usize;
+    let ranges = rd(rts, table + 4).ok()? as usize;
+    let mut expanded = rts.to_vec();
+    let num_ranges = rd(rts, table).ok()?;
+    wr(&mut expanded, table, num_ranges + 2);
+    wr(&mut expanded, table + 4, length as u32);
+    expanded.extend_from_slice(rts.get(ranges..ranges + num_ranges as usize * 24)?);
+    // Different pipeline stages use the same slots with their declared type.
+    // Keep the two original bindings and add address-preserving register aliases.
+    for (kind, base) in [(0, SCARLETT_PACKED_SRV_REGISTER), (2, SCARLETT_PACKED_CBV_REGISTER)] {
+        for word in [kind, slots, base, 1, 1, 0] {
+            expanded.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+    if media {
+        let sampler_offset = expanded.len() as u32;
+        wr(&mut expanded, 12, SCARLETT_MEDIA_SAMPLERS.len() as u32);
+        wr(&mut expanded, 16, sampler_offset);
+        for (register, words) in SCARLETT_MEDIA_SAMPLERS {
+            let desc = crate::title_heap::sampler_desc(&words, [0.0; 4]);
+            expanded.extend_from_slice(&desc[..28]);
+            for word in [0u32, rd(&desc, 44).ok()?, rd(&desc, 48).ok()?, register, 1, 5] {
+                expanded.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+    }
+    crate::bl_alias::replace_rts0(blob, &expanded).ok()
+}
+
 pub fn alias_blob(blob: &[u8]) -> Result<Option<Vec<u8>>, String> {
     let (o, n) = crate::console_slots_mesh::rts0_range(blob).ok_or("root signature blob has no RTS0 part")?;
     let body = blob.get(o..o + n).ok_or("RTS0 chunk out of bounds")?;
@@ -255,6 +295,9 @@ unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, bl
     if blob.is_null() || len == 0 {
         return unsafe { f(this, mask, blob, len, riid, ppv) };
     }
+    let given = unsafe { core::slice::from_raw_parts(blob, len) };
+    let expanded = expand_scarlett_graphics_table(given);
+    let (blob, len) = expanded.as_ref().map_or((blob, len), |b| (b.as_ptr(), b.len()));
     if !enabled() {
         let given = unsafe { core::slice::from_raw_parts(blob, len) };
         return match copy_mode_blob(given) {
@@ -299,6 +342,11 @@ unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, bl
 }
 
 unsafe extern "system" fn create_cbv(this: *mut c_void, pdesc: *const u8, dest: usize) {
+    if !pdesc.is_null() {
+        let va = unsafe { core::ptr::read_unaligned(pdesc.cast::<u64>()) };
+        let bytes = unsafe { core::ptr::read_unaligned(pdesc.add(8).cast::<u32>()) };
+        unsafe { crate::heap_wrap::mirror_scarlett_cbv(dest, va, bytes) };
+    }
     if !enabled() && !copy_on() {
         let f: unsafe extern "system" fn(*mut c_void, *const u8, usize) = unsafe { core::mem::transmute(PREV_CBV.load(Ordering::Relaxed)) };
         return unsafe { f(this, pdesc, dest) };

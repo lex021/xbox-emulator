@@ -159,7 +159,7 @@ const NULL_UAV: [u8; 0x28] = {
 
 static VIEW_LOG: AtomicUsize = AtomicUsize::new(0);
 
-unsafe fn resource_desc(res: *mut c_void) -> [u8; 0x38] {
+pub(crate) unsafe fn resource_desc(res: *mut c_void) -> [u8; 0x38] {
     let mut d = [0u8; 0x38];
     let f: unsafe extern "system" fn(*mut c_void, *mut u8) -> *mut u8 = unsafe { core::mem::transmute(vfn(res, RES_GET_DESC)) };
     unsafe { f(res, d.as_mut_ptr()) };

@@ -8,7 +8,8 @@ pub fn dir() -> Option<String> {
 }
 
 pub fn wanted(frame: u64) -> bool {
-    dir().is_some() && SNAP_FRAMES.contains(&frame)
+    dir().is_some() && (SNAP_FRAMES.contains(&frame)
+        || (frame == 1 && std::env::var_os("TOMBOX_PRESENT_SNAP_FIRST").is_some()))
 }
 
 pub fn row_pitch(width: u32) -> u32 {

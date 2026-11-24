@@ -4,6 +4,7 @@ pub const TB_GLOBAL_CBV: u32 = 0;
 pub const TB_GLOBAL_FAULT_UAV: u32 = TB_GLOBAL_WINDOWS as u32;
 pub const TB_GLOBAL_CB_DWORDS: usize = 4 * TB_GLOBAL_WINDOWS + 4;
 pub const TB_GLOBAL_FAULT_BYTES: usize = 16;
+pub const TB_GLOBAL_ROOT_VAS: usize = 32;
 pub const TB_GLOBAL_ROOT_DWORDS: u32 = 2 * (TB_GLOBAL_WINDOWS as u32 + 2);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

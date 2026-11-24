@@ -466,6 +466,9 @@ unsafe extern "system" fn h_draw(this: *mut c_void, a: u32, b: u32, c: u32, d: u
 
 unsafe extern "system" fn h_draw_indexed(this: *mut c_void, a: u32, b: u32, c: u32, d: i32, e: u32) {
     unsafe { pre_draw(this) };
+    if crate::cmdlist_wrap::scarlett_list6_probe() {
+        crate::cl2_state::log_scarlett_indexed_draw(this, [a, b, c, d as u32, e]);
+    }
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32) = unsafe { core::mem::transmute(next(13)) };
     unsafe { f(this, a, b, c, d, e) };
     on_draw(this as usize);

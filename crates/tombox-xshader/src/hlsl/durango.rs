@@ -148,11 +148,12 @@ impl Emitter<'_> {
         None
     }
 
-    pub(super) fn dg_static_sampler(&self, idx: usize, ss: u16) -> Result<Option<u32>, String> {
-        if self.dg().is_none() {
+    pub(super) fn literal_static_sampler(&self, idx: usize, ss: u16) -> Result<Option<u32>, String> {
+        let durango = self.dg().is_some();
+        let Some(rs) = self.ex.root_sig.as_ref() else { return Ok(None) };
+        if !durango && (self.ex.fssm.get(..4) != Some(b"FSSM") || ss > 252) {
             return Ok(None);
         }
-        let Some(rs) = self.ex.root_sig.as_ref() else { return Ok(None) };
         let vis = match self.ex.stage {
             crate::Stage::Vertex => 1,
             crate::Stage::Hull => 2,
@@ -164,11 +165,25 @@ impl Emitter<'_> {
         let cands: Vec<_> = rs.static_samplers.iter().filter(|s| s.visibility == 0 || s.visibility == vis).collect();
         let pick = match cands.len() {
             0 => return Ok(None),
-            1 => *cands[0],
+            1 if durango => *cands[0],
             _ => {
-                let w0 = self.dg_sgpr_literal(idx, ss as u8).ok_or_else(|| format!("literal sampler s{ss}: {} static samplers and the S# word 0 is not a constant", cands.len()))?;
-                let w1 = self.dg_sgpr_literal(idx, (ss + 1) as u8);
-                let w2 = self.dg_sgpr_literal(idx, (ss + 2) as u8);
+                let raw_words = if durango {
+                    [self.dg_sgpr_literal(idx, ss as u8), self.dg_sgpr_literal(idx, (ss + 1) as u8),
+                        self.dg_sgpr_literal(idx, (ss + 2) as u8)]
+                } else {
+                    let start = self.insns[..idx].iter().rposition(|ins| ins.mnemonic.contains("branch"))
+                        .map_or(0, |i| i + 1);
+                    let literal = |r| Self::sgpr_const_in(&self.insns, start, idx, r);
+                    if literal((ss + 3) as u8) != Some(0) {
+                        return Ok(None);
+                    }
+                    [literal(ss as u8), literal((ss + 1) as u8), literal((ss + 2) as u8)]
+                };
+                let [w0, w1, w2] = raw_words;
+                if !durango && raw_words.iter().any(Option::is_none) {
+                    return Ok(None);
+                }
+                let w0 = w0.ok_or_else(|| format!("literal sampler s{ss}: {} static samplers and the S# word 0 is not a constant", cands.len()))?;
                 let compare = self.insns.get(idx).is_some_and(|i| is_compare_sample(&i.mnemonic));
                 let d = decode_ssharp(w0, w1, w2, compare);
                 let owned: Vec<StaticSampler> = cands.iter().map(|s| **s).collect();
@@ -380,9 +395,11 @@ mod ssharp_tests {
             has_root_sig: true,
             input_sig: vec![],
             output_sig: vec![sig],
+            prim_sig: Vec::new(),
             resources: vec![],
             gs_info: None,
             root_sig: root,
+            psv_numthreads: None,
         };
         let t = translate(&ex).expect("Durango PS level-2 descriptor indirection translation should succeed");
         assert!(t.hlsl.contains("tex0 : register(t0);"), "{}", t.hlsl);

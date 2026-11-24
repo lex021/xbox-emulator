@@ -230,6 +230,7 @@ unsafe extern "system" fn watch_release(this: *mut c_void) -> u32 {
     let n = unsafe { (*w).refs.fetch_sub(1, Ordering::AcqRel) } - 1;
     if n == 0 {
         let res = unsafe { (*w).res };
+        crate::gpu_va::forget_placed_buffer(res);
         crate::placed_offset::forget(res);
         crate::title_shadow::resource_gone(res);
         GONE.lock().unwrap_or_else(|e| e.into_inner()).push(res);

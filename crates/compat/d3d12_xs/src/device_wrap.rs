@@ -170,7 +170,23 @@ unsafe extern "system" fn create_descriptor_heap(
         // Keep the heap REAL (so it works when passed to SetDescriptorHeaps etc.);
         // patch the shared heap vtable once to fix the handle-getter ABI.
         crate::heap_wrap::ensure_patched(unsafe { *ppv });
-        if (crate::rtcap::enabled() || crate::passcap::tables_on()) && !pdesc.is_null() {
+        if scarlett_budget_enabled() && !pdesc.is_null() && xone_desc.is_none()
+            && real_orig(18) != 0
+        {
+            let fields = unsafe { &*pdesc.cast::<[u32; 4]>() };
+            if fields == &[0, 802_816, 1, 1] && scarlett_descriptor_create_caller() {
+                // The allocator passes its original CPU VA and byte count
+                // immediately after the ordinary four-field heap descriptor.
+                let backing = unsafe { pdesc.cast::<usize>().add(2).read_unaligned() };
+                let bytes = unsafe { pdesc.cast::<usize>().add(3).read_unaligned() };
+                if bytes == 802_816 * 32 {
+                    unsafe { crate::heap_wrap::register_scarlett_cpu(*ppv, Some(backing), bytes) }
+                }
+            } else if fields[0] == 0 && fields[2] == 0 {
+                unsafe { crate::heap_wrap::register_scarlett_cpu(*ppv, None, fields[1] as usize * 32) };
+            }
+        }
+        if (crate::rtcap::enabled() || crate::passcap::tables_on() || crate::gws_dispatch::resume_enabled()) && !pdesc.is_null() {
             // Binding trace: remember shader-visible heaps (GPU handle -> CPU handle).
             let d = pdesc as *const u32;
             let (htype, numd, flags) = unsafe { (*d.add(0), *d.add(1), *d.add(2)) };
@@ -180,10 +196,9 @@ unsafe extern "system" fn create_descriptor_heap(
             }
             if flags & 1 != 0 {
                 let heap = unsafe { *ppv };
-                let hv = unsafe { *(heap as *const *const usize) };
-                let c: unsafe extern "system" fn(*mut c_void) -> u64 = unsafe { core::mem::transmute(*hv.add(9)) };
-                let g: unsafe extern "system" fn(*mut c_void) -> u64 = unsafe { core::mem::transmute(*hv.add(10)) };
-                crate::bindtrace::note_heap(unsafe { c(heap) } as usize, unsafe { g(heap) }, numd, htype);
+                let cpu = unsafe { crate::heap_wrap::bridge_cpu(heap) } as usize;
+                let gpu = unsafe { crate::heap_wrap::bridge_gpu(heap) };
+                crate::bindtrace::note_heap(cpu, gpu, numd, htype);
             }
         }
         // Log DESC { Type@0, NumDescriptors@4, Flags@8, NodeMask@0xC } + GPU base so
@@ -196,11 +211,8 @@ unsafe extern "system" fn create_descriptor_heap(
             let shader_visible = flags & 1 != 0;
             if shader_visible || N.fetch_add(1, Ordering::Relaxed) < 10 {
                 let heap = unsafe { *ppv };
-                // GetGPUDescriptorHandleForHeapStart (slot 10, now our bridge -> u64)
-                let gpu_base: u64 = if shader_visible {
-                    let g: unsafe extern "system" fn(*mut c_void) -> u64 =
-                        unsafe { core::mem::transmute(*(*(heap as *const *const usize)).add(10)) };
-                    unsafe { g(heap) }
+                let gpu_base = if shader_visible {
+                    unsafe { crate::heap_wrap::bridge_gpu(heap) }
                 } else { 0 };
                 record("d3d12_xs", "CreateDescriptorHeap",
                     &format!("type={htype} num={numd} flags={flags:#x} shaderVis={shader_visible} heap={heap:p} gpuBase={gpu_base:#x}"));
@@ -223,11 +235,18 @@ unsafe extern "system" fn create_command_queue_x(
         unsafe { core::ptr::copy_nonoverlapping(pdescx as *const u8, pc_desc.as_mut_ptr(), 16) };
     }
     crate::xone_queue::translate(&mut pc_desc);
+    let qtype = u32::from_le_bytes(pc_desc[0..4].try_into().unwrap());
+    let qflags = u32::from_le_bytes(pc_desc[8..12].try_into().unwrap());
+    // The Scarlett startup compute queues use flag 0x2 alone and combined
+    // with 0x1. Desktop D3D12 accepts only the 0x1 timeout flag.
+    let pc_flags = match (crate::cmdlist_wrap::scarlett_list6_probe(), qtype, qflags) {
+        (true, 2, 2 | 3) => qflags & 1,
+        _ => qflags,
+    };
+    pc_desc[8..12].copy_from_slice(&pc_flags.to_le_bytes());
     let f: unsafe extern "system" fn(*mut c_void, *const c_void, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(8)) }; // PC CreateCommandQueue
     let hr = unsafe { f(real, pc_desc.as_ptr() as *const c_void, riid, ppv) };
-    let qtype = u32::from_le_bytes([pc_desc[0], pc_desc[1], pc_desc[2], pc_desc[3]]);
-    let qflags = u32::from_le_bytes([pc_desc[8], pc_desc[9], pc_desc[10], pc_desc[11]]);
     if hr == 0 && !ppv.is_null() {
         // Give the queue an Xbox-sized vtable (PresentX at slot 30, other extensions no-op).
         crate::present::apply_queue_vtable(unsafe { *ppv });
@@ -236,7 +255,22 @@ unsafe extern "system" fn create_command_queue_x(
             crate::upload::register_direct_queue(unsafe { *ppv });
         }
     }
-    record("d3d12_xs", "CreateCommandQueueX", &format!("type={qtype} flags={qflags} -> hr={hr:#010x}"));
+    record("d3d12_xs", "CreateCommandQueueX", &format!("type={qtype} flags={qflags:#x} pc_flags={pc_flags:#x} -> hr={hr:#010x}"));
+    hr
+}
+
+unsafe extern "system" fn create_scarlett_fence(
+    this: *mut DeviceWrapper, initial: u64, flags: u32, iid: *const Guid, out: *mut *mut c_void,
+) -> i32 {
+    let real = unsafe { (*this).real };
+    let create: unsafe extern "system" fn(*mut c_void, u64, u32, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(*real_vtbl(real).add(36)) };
+    let hr = unsafe { create(real, initial, flags, iid, out) };
+    if hr >= 0 && !out.is_null() && !iid.is_null()
+        && unsafe { *iid == crate::scarlett_fence::IID_FENCE && !(*out).is_null() }
+    {
+        unsafe { *out = crate::scarlett_fence::wrap(*out, initial) };
+    }
     hr
 }
 
@@ -266,7 +300,17 @@ unsafe extern "system" fn create_command_list_x(
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(12)) };
     let dma = !riid.is_null() && unsafe { *riid == crate::dma_list::IID_XBOX_DMA_COMMAND_LIST };
-    let pc_riid = if dma { &crate::dma_list::IID_GRAPHICS_COMMAND_LIST as *const Guid } else { riid };
+    let scarlett_list6 = !riid.is_null()
+        && crate::cmdlist_wrap::scarlett_list6_probe()
+        && unsafe { *riid == crate::cmdlist_wrap::IID_SCARLETT_GRAPHICS_COMMAND_LIST6 };
+    let pc_riid = if dma {
+        &crate::dma_list::IID_GRAPHICS_COMMAND_LIST
+    } else if scarlett_list6 {
+        let pc = &crate::mesh_pso::IID_LIST6 as *const crate::mesh_pso::Guid;
+        pc.cast::<Guid>()
+    } else {
+        riid
+    };
     let init_state = if dma { init_state } else { crate::pso_async::swap(init_state) };
     let hr = unsafe { f(real, node_mask, list_type, alloc, init_state, pc_riid, ppv) };
     if hr == S_OK && !ppv.is_null() {
@@ -283,17 +327,30 @@ unsafe extern "system" fn create_command_list_x(
             };
         }
     }
-    record("d3d12_xs", "CreateCommandList", &format!("nodeMask={node_mask} type={list_type} dma={dma} -> hr={hr:#010x}"));
+    record("d3d12_xs", "CreateCommandList", &format!("nodeMask={node_mask} type={list_type} dma={dma} scarlett_list6_probe={scarlett_list6} -> hr={hr:#010x}"));
     hr
 }
 
-/// Slot 15: GetDescriptorHandleIncrementSize(type) -> UINT. Log what the game
-/// queries and what the real (NVIDIA) device reports, then forward.
-unsafe extern "system" fn get_descriptor_increment(this: *mut DeviceWrapper, heap_type: u32) -> u32 {
+/// Slot 15: GetDescriptorHandleIncrementSize(type) -> UINT.
+#[unsafe(naked)]
+unsafe extern "system" fn get_descriptor_increment(_this: *mut DeviceWrapper, _heap_type: u32) -> u32 {
+    core::arch::naked_asm!(
+        "mov r8, [rsp]",
+        "jmp {implementation}",
+        implementation = sym get_descriptor_increment_impl,
+    );
+}
+
+unsafe extern "system" fn get_descriptor_increment_impl(
+    this: *mut DeviceWrapper, heap_type: u32, caller: usize,
+) -> u32 {
     let real = unsafe { (*this).real };
     let f: unsafe extern "system" fn(*mut c_void, u32) -> u32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(15)) };
     let sz = unsafe { f(real, crate::xone_heap::heap_type(heap_type)) };
+    if heap_type == 0 && sz == 32 && scarlett_budget_enabled() {
+        cap_scarlett_online_pool(caller);
+    }
     static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 8 {
         record("d3d12_xs", "GetDescriptorHandleIncrementSize", &format!("type={heap_type} -> {sz}"));
@@ -301,11 +358,110 @@ unsafe extern "system" fn get_descriptor_increment(this: *mut DeviceWrapper, hea
     sz
 }
 
+fn scarlett_budget_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TOMBOX_SCARLETT_DESCRIPTOR_BUDGET").as_deref() == Ok("1"))
+}
+
+fn scarlett_descriptor_create_caller() -> bool {
+    unsafe extern "system" {
+        fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut usize, hash: *mut u32) -> u16;
+    }
+    let Some(return_pc) = title_exe_base().checked_add(0x01cf_32fd) else { return false };
+    let mut frames = [0usize; 8];
+    let count = unsafe { RtlCaptureStackBackTrace(0, frames.len() as u32, frames.as_mut_ptr(), core::ptr::null_mut()) };
+    frames[..count as usize].contains(&return_pc)
+        && unsafe { ((return_pc - 3) as *const [u8; 6]).read_unaligned() } == [0xff, 0x50, 0x70, 0x89, 0xc5, 0x48]
+}
+
+fn title_exe_base() -> usize {
+    unsafe extern "system" { fn GetModuleHandleW(name: *const u16) -> *mut c_void; }
+    unsafe { GetModuleHandleW(core::ptr::null()) as usize }
+}
+
+fn cap_scarlett_online_pool(caller: usize) {
+    // The title adds this separately configured pool to the static arena when
+    // it creates the heap, then subtracts the very same bytes from its end
+    // to initialize the static suballocator. Adjust the input before either
+    // calculation so the static slots and the native handle stride match.
+    const RETURN_RVA: usize = 0x05c5_ff32;
+    const CONFIG_RVA: usize = 0x0a94_3910;
+    const CALL: [u8; 11] = [0xff, 0x50, 0x78, 0x89, 0xc0, 0x8b, 0x15, 0xd6, 0x39, 0xce, 0x04];
+    let base = title_exe_base();
+    if base == 0 || caller != base + RETURN_RVA
+        || unsafe { ((caller - 3) as *const [u8; CALL.len()]).read_unaligned() } != CALL
+    {
+        return;
+    }
+    let config = base + CONFIG_RVA;
+    if !crate::title_shadow::is_writable_range(config, core::mem::size_of::<u32>()) {
+        return;
+    }
+    let count = config as *mut u32;
+    if unsafe { count.read() } == 0x2_0000 {
+        unsafe { count.write(0x1_0000) };
+        record("d3d12_xs", "descriptor_budget",
+            "Scarlett online pool reduced from 131072 to 65536 records before arena allocation");
+    }
+}
+
 /// ID3D12Device::GetResourceAllocationInfo (slot 25) returns D3D12_RESOURCE_ALLOCATION_INFO
 /// {UINT64 SizeInBytes; UINT64 Alignment;} by value -> sret ABI.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct AllocInfo { size: u64, align: u64 }
+
+#[repr(C)]
+struct AllocInfo1 {
+    offset: u64,
+    align: u64,
+    size: u64,
+}
+
+/// Scarlett slot 108. The title uses the Windows large-struct return ABI:
+/// RCX is the hidden output, RDX the device, R8/R9 the mask and count.
+/// Descriptor and optional per-resource output pointers follow on the stack.
+unsafe extern "system" fn get_scarlett_resource_alloc_info1(
+    out: *mut AllocInfo, this: *mut DeviceWrapper, visible_mask: u32, count: u32,
+    descs: *const u8, details: *mut AllocInfo1,
+) -> *mut AllocInfo {
+    if out.is_null() {
+        return out;
+    }
+    let failure = AllocInfo { size: 0, align: 0 };
+    unsafe { out.write(failure) };
+    if count != 0 && descs.is_null() {
+        return out;
+    }
+    let mut total = AllocInfo { size: 0, align: 1 };
+    for index in 0..count as usize {
+        let desc = unsafe { descs.add(index * crate::device_console_fix::RES_DESC_SIZE) };
+        let part = unsafe { get_resource_alloc_info(this, visible_mask, 1, desc.cast()) };
+        if !part.align.is_power_of_two() || part.size == 0 {
+            return out;
+        }
+        let Some(aligned) = total.size.checked_add(part.align - 1) else { return out };
+        let offset = aligned & !(part.align - 1);
+        let Some(end) = offset.checked_add(part.size) else { return out };
+        total = AllocInfo { size: end, align: total.align.max(part.align) };
+        if !details.is_null() {
+            unsafe { details.add(index).write(AllocInfo1 { offset, align: part.align, size: part.size }) };
+        }
+    }
+    if count <= 2 {
+        let mut calls = SCARLETT_ALLOC_INFO1_LOG.load(Ordering::Relaxed);
+        if calls < 18 {
+            calls = SCARLETT_ALLOC_INFO1_LOG.fetch_add(1, Ordering::Relaxed);
+            if calls < 18 {
+                record("d3d12_xs", "Scarlett slot 108", &format!("count={count} allocation size={:#x} align={:#x}", total.size, total.align));
+            }
+        }
+    }
+    unsafe { out.write(total) };
+    out
+}
+
+static SCARLETT_ALLOC_INFO1_LOG: AtomicU32 = AtomicU32::new(0);
 
 /// Intercept GetResourceAllocationInfo to see pResourceDescs (the crash is a null
 /// deref inside the real method), dump the desc, and avoid crashing on a null/bad
@@ -1340,13 +1496,24 @@ unsafe extern "system" fn real_create_root_signature(real: *mut c_void, mask: u3
         if let Some((_, idx)) = gds {
             crate::gds::note_root_signature(unsafe { *ppv }, idx);
             if phased_root {
-                unsafe { crate::gws_dispatch::note_phased_root(*ppv, idx) };
+                let original = if blob.is_null() { &[][..] } else { unsafe { core::slice::from_raw_parts(blob, len) } };
+                unsafe { crate::gws_dispatch::note_phased_root(*ppv, idx, original) };
             }
         }
         if cen.is_none() { crate::centroid_bind::forget(unsafe { *ppv }) }
     }
     if hr >= 0 && !ppv.is_null() && !blob.is_null() && len != 0 {
         crate::replay::note_root_signature(unsafe { *ppv } as usize, unsafe { core::slice::from_raw_parts(blob, len) });
+    }
+    if hr < 0 && crate::cmdlist_wrap::scarlett_list6_probe() {
+        static FAILURES: AtomicU32 = AtomicU32::new(0);
+        if FAILURES.fetch_add(1, Ordering::Relaxed) < 16 {
+            let bytes = sent.borrow();
+            let header = &bytes[..bytes.len().min(48)];
+            record("d3d12_xs", "ScarlettRootSignature", &format!(
+                "CreateRootSignature hr={hr:#010x} len={} mask={mask:#x} head={header:02x?}", bytes.len()
+            ));
+        }
     }
     hr
 }
@@ -1357,14 +1524,14 @@ unsafe extern "system" fn real_create_cbv(real: *mut c_void, pdesc: *const u8, d
         crate::bindtrace::note_desc(dest, crate::bindtrace::Desc::Cbv { va, size });
     }
     let f: unsafe extern "system" fn(*mut c_void, *const u8, usize) = unsafe { core::mem::transmute(real_orig(17)) };
-    unsafe { f(real, pdesc, dest) }
+    unsafe { f(real, pdesc, crate::heap_wrap::native_cpu_handle(dest)) }
 }
 unsafe extern "system" fn real_create_srv(real: *mut c_void, res: *mut c_void, pdesc: *const u8, dest: usize) {
     let desc = if pdesc.is_null() { None } else { Some(unsafe { core::ptr::read_unaligned(pdesc as *const [u8; 40]) }) };
     crate::bindtrace::note_desc(dest, crate::bindtrace::Desc::Srv { res: res as usize, desc });
     crate::res3d::note_view(res, "SRV", desc.as_ref(), dest);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(real_orig(18)) };
-    unsafe { f(real, res, pdesc, dest) };
+    unsafe { f(real, res, pdesc, crate::heap_wrap::native_cpu_handle(dest)) };
     crate::bindtrace::note_desc_after(dest, 0, crate::bindtrace::Desc::Srv { res: res as usize, desc });
 }
 unsafe extern "system" fn real_create_uav(real: *mut c_void, res: *mut c_void, counter: *mut c_void, pdesc: *const u8, dest: usize) {
@@ -1372,7 +1539,7 @@ unsafe extern "system" fn real_create_uav(real: *mut c_void, res: *mut c_void, c
     crate::bindtrace::note_desc(dest, crate::bindtrace::Desc::Uav { res: res as usize, desc });
     crate::res3d::note_view(res, "UAV", desc.as_ref(), dest);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(real_orig(19)) };
-    unsafe { f(real, res, counter, pdesc, dest) };
+    unsafe { f(real, res, counter, pdesc, crate::heap_wrap::native_cpu_handle(dest)) };
     crate::bindtrace::note_desc_after(dest, 0, crate::bindtrace::Desc::Uav { res: res as usize, desc });
 }
 unsafe extern "system" fn real_create_sampler(real: *mut c_void, pdesc: *const u8, dest: usize) {
@@ -1410,12 +1577,32 @@ unsafe extern "system" fn real_copy_descriptors(
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, *const usize, *const u32, u32, *const usize, *const u32, u32) =
         unsafe { core::mem::transmute(real_orig(23)) };
-    unsafe { f(real, nd, dstarts, dsizes, ns, sstarts, ssizes, heap_type) }
+    let translate = |starts: *const usize, len: u32| {
+        if heap_type != 0 || len == 0 || starts.is_null() || !scarlett_budget_enabled() {
+            return None;
+        }
+        let handles = unsafe { core::slice::from_raw_parts(starts, len as usize) };
+        if !handles.iter().any(|&handle| crate::heap_wrap::native_cpu_handle(handle) != handle) {
+            return None;
+        }
+        Some(handles.iter().map(|&handle| crate::heap_wrap::native_cpu_handle(handle)).collect::<Vec<_>>())
+    };
+    let dest = translate(dstarts, nd);
+    let src = translate(sstarts, ns);
+    let dp = dest.as_ref().map_or(dstarts, |handles| handles.as_ptr());
+    let sp = src.as_ref().map_or(sstarts, |handles| handles.as_ptr());
+    unsafe { f(real, nd, dp, dsizes, ns, sp, ssizes, heap_type) }
 }
 unsafe extern "system" fn real_copy_descriptors_simple(real: *mut c_void, n: u32, dest: usize, src: usize, heap_type: u32) {
     crate::bindtrace::copy_desc(dest, src, n, heap_type);
     let f: unsafe extern "system" fn(*mut c_void, u32, usize, usize, u32) = unsafe { core::mem::transmute(real_orig(24)) };
-    unsafe { f(real, n, dest, src, heap_type) }
+    if heap_type == 0 {
+        let dp = crate::heap_wrap::native_cpu_handle(dest);
+        let sp = crate::heap_wrap::native_cpu_handle(src);
+        unsafe { f(real, n, dp, sp, heap_type) }
+    } else {
+        unsafe { f(real, n, dest, src, heap_type) }
+    }
 }
 unsafe extern "system" fn real_make_resident(real: *mut c_void, n: u32, objs: *const *mut c_void) -> i32 {
     unsafe { crate::hang_cap::note_residency(false, n, objs) };
@@ -1784,6 +1971,9 @@ unsafe extern "system" fn create_compute_pso_sync(
     let code = match crate::frame_ev::time(crate::frame_ev::XLAT, || unsafe { crate::shader_xlat::translate(p, n) }) {
         Ok(c) => c,
         Err(e) => {
+            if let Some(hr) = unsafe { crate::global_bind::try_create_compute(f, real, &desc, p, n, riid, ppv) } {
+                return hr;
+            }
             if let Some(hr) = unsafe { crate::gws_dispatch::try_create(f, real, &desc, p, n, riid, ppv) } {
                 return hr;
             }
@@ -1803,6 +1993,7 @@ unsafe extern "system" fn create_compute_pso_sync(
     if hr == 0 && !ppv.is_null() {
         crate::dred_marks::note(unsafe { *ppv }, unsafe { crate::dred_marks::compute_hashes(pdesc) }, false);
         crate::device_x::register_compute(unsafe { *ppv }, &desc, code.clone());
+        unsafe { crate::gws_dispatch::note_compute(*ppv, p, n) };
     }
     if hr == 0 {
         let k = OK.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1995,6 +2186,14 @@ unsafe extern "system" fn create_placed_resource_x(
     this: *mut DeviceWrapper, va: u64, pdesc: *const u8, init_state: u32,
     pclear: *const c_void, riid: *const Guid, ppv: *mut *mut c_void,
 ) -> i32 {
+    unsafe { create_placed_resource_at(this, va, pdesc, init_state, pclear, riid, ppv, None) }
+}
+
+unsafe fn create_placed_resource_at(
+    this: *mut DeviceWrapper, va: u64, pdesc: *const u8, init_state: u32,
+    pclear: *const c_void, riid: *const Guid, ppv: *mut *mut c_void,
+    initial_layout: Option<u32>,
+) -> i32 {
     let _ev = crate::frame_ev::begin(crate::frame_ev::PLACED);
     let real = unsafe { (*this).real };
     if !resource_riid(riid) {
@@ -2020,11 +2219,22 @@ unsafe extern "system" fn create_placed_resource_x(
     let f: unsafe extern "system" fn(*mut c_void, *const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(27)) };
     let xbox_size = if dim >= 2 { title_layout_size(&orig) } else { crate::gpu_va::xbox_texture_size(&orig) };
-    let made = unsafe { crate::placed_offset::create(real, va, &d, xbox_size, init_state, pclear, ppv) }
-        .or_else(|| unsafe { crate::alias::create_placed_x(real, va, &d, xbox_size, init_state, pclear, ppv) });
-    let hr = match &made {
-        Some(m) => m.hr,
-        None => unsafe { f(real, heap.as_ptr(), 0, d.as_ptr(), init_state, pclear, &IID_ID3D12RESOURCE, ppv) },
+    let made = if va != 0 && initial_layout.is_none() {
+        unsafe { crate::placed_offset::create(real, va, &d, xbox_size, init_state, pclear, ppv) }
+            .or_else(|| unsafe { crate::alias::create_placed_x(real, va, &d, xbox_size, init_state, pclear, ppv) })
+    } else {
+        None
+    };
+    let hr = match (initial_layout, &made) {
+        (_, Some(m)) => m.hr,
+        (Some(layout), None) => {
+            // These initial render/depth targets need initialized compression
+            // metadata and start in the layout expected by their first Barrier.
+            let mut desc1 = [0u64; 8];
+            unsafe { core::ptr::copy_nonoverlapping(d.as_ptr(), desc1.as_mut_ptr().cast::<u8>(), 0x38) };
+            unsafe { create_scarlett_committed_layout(real, &heap, desc1.as_ptr().cast(), layout, pclear, ppv) }
+        }
+        (None, None) => unsafe { f(real, heap.as_ptr(), 0, d.as_ptr(), init_state, pclear, &IID_ID3D12RESOURCE, ppv) },
     };
     static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
@@ -2061,6 +2271,227 @@ unsafe extern "system" fn create_placed_resource_x(
             }
         }
     }
+    hr
+}
+
+/// Scarlett slot 127 extends CreateCommittedResource with three additional
+/// arguments before the resource IID. The startup path passes zero for them.
+unsafe extern "system" fn create_scarlett_display_resource(
+    this: *mut DeviceWrapper, heap: *const u32, heap_flags: u32, desc: *const u8,
+    state: u32, clear: *const c_void, extension0: usize, extension1: u32,
+    extension2: usize, iid: *const Guid, output: *mut *mut c_void,
+) -> i32 {
+    if !output.is_null() {
+        unsafe { *output = core::ptr::null_mut() };
+    }
+    const E_NOTIMPL: i32 = 0x8000_4001u32 as i32;
+    const ALLOW_DISPLAY: u32 = 0x8;
+    if extension0 != 0 || extension1 != 0 || extension2 != 0 || heap_flags != ALLOW_DISPLAY {
+        return E_NOTIMPL;
+    }
+    if desc.is_null() || heap.is_null() {
+        return crate::E_INVALIDARG;
+    }
+    if !resource_riid(iid) {
+        return E_NOINTERFACE;
+    }
+    // This startup path creates a 2D display texture. TomBox displays it by
+    // copying into the desktop swapchain, so the intermediate need not scan out.
+    let mut pc_desc = [0u32; 16];
+    let bytes = unsafe { core::slice::from_raw_parts_mut(pc_desc.as_mut_ptr().cast::<u8>(), 64) };
+    bytes[..0x38].copy_from_slice(unsafe { core::slice::from_raw_parts(desc, 0x38) });
+    let dimension = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+    if dimension != 3 {
+        return E_NOTIMPL;
+    }
+    bytes[8..16].fill(0);
+    bytes[0x2c..0x30].fill(0);
+    let flags = u32::from_le_bytes(bytes[0x30..0x34].try_into().unwrap());
+    let hr = if matches!(state, 0 | 3 | u32::MAX) && flags & 0x0030_0004 == 0x0030_0004 {
+        // This texture's first Xbox barrier is UAV -> render target. A legacy
+        // UAV resource state cannot be the input to an enhanced Barrier.
+        let orig = unsafe { desc.cast::<[u8; 0x38]>().read_unaligned() };
+        bytes[0x30..0x34].copy_from_slice(&(flags & 0xff).to_le_bytes());
+        bytes[0x34..].fill(0); // D3D12_RESOURCE_DESC1::SamplerFeedbackMipRegion
+        unsafe { create_scarlett_display_uav((*this).real, heap, bytes, &orig, clear, output) }
+    } else {
+        let pc_state = if state == u32::MAX { 0 } else { state };
+        unsafe { create_committed_resource(this, heap, 0, pc_desc.as_ptr(), pc_state, clear, iid, output) }
+    };
+    record("d3d12_xs", "Scarlett slot 127", &format!(
+        "display texture state={state:#x} {} -> {hr:#010x}", desc_str(unsafe { core::slice::from_raw_parts(desc, 0x38) })
+    ));
+    hr
+}
+
+unsafe fn create_scarlett_committed_layout(
+    real: *mut c_void, heap: &[u32; 5], desc: *const u8, layout: u32,
+    clear: *const c_void, output: *mut *mut c_void,
+) -> i32 {
+    const IID_DEVICE10: Guid = Guid {
+        d1: 0x517f_8718, d2: 0xaa66, d3: 0x49f9,
+        d4: [0xb0, 0x2b, 0xa7, 0xab, 0x89, 0xc0, 0x60, 0x31],
+    };
+    const CREATE_COMMITTED_RESOURCE3: usize = 76;
+    let qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(*real_vtbl(real)) };
+    let mut device10 = core::ptr::null_mut();
+    let hr = unsafe { qi(real, &IID_DEVICE10, &mut device10) };
+    if hr < 0 {
+        return hr;
+    }
+    let vtable = unsafe { real_vtbl(device10) };
+    let create: unsafe extern "system" fn(
+        *mut c_void, *const u32, u32, *const u8, u32, *const c_void,
+        *mut c_void, u32, *const u32, *const Guid, *mut *mut c_void,
+    ) -> i32 = unsafe { core::mem::transmute(*vtable.add(CREATE_COMMITTED_RESOURCE3)) };
+    let release: unsafe extern "system" fn(*mut c_void) -> u32 =
+        unsafe { core::mem::transmute(*vtable.add(2)) };
+    let heap = crate::device_console_fix::pc_heap_words(*heap);
+    let hr = unsafe {
+        create(device10, heap.as_ptr(), 0, desc, layout, clear,
+            core::ptr::null_mut(), 0, core::ptr::null(), &IID_ID3D12RESOURCE, output)
+    };
+    unsafe { release(device10) };
+    hr
+}
+
+unsafe fn create_scarlett_display_uav(
+    real: *mut c_void, heap: *const u32, desc: &[u8], original: &[u8; 0x38],
+    clear: *const c_void, output: *mut *mut c_void,
+) -> i32 {
+    const BARRIER_LAYOUT_UAV: u32 = 3;
+    let heap = unsafe { heap.cast::<[u32; 5]>().read_unaligned() };
+    let hr = unsafe { create_scarlett_committed_layout(real, &heap, desc.as_ptr(), BARRIER_LAYOUT_UAV, clear, output) };
+    if hr >= 0 && !output.is_null() && !unsafe { *output }.is_null() {
+        let res = unsafe { *output };
+        crate::map_x::ensure_patched(res);
+        let allocation = unsafe { scarlett_display_memory(original) };
+        unsafe { crate::gpu_va::note_resource(real, res, &desc[..0x38], 0x8, allocation) };
+        crate::gpu_va::note_committed_texture(res, *original);
+        unsafe { crate::rtcap::register(res, &desc[..0x38], 0x8) };
+        if let Some(va) = allocation {
+            crate::gpu_va::note_scarlett_display_va(res, va);
+        } else {
+            unsafe { crate::title_gpu::committed(res, original) };
+        }
+    }
+    hr
+}
+
+unsafe fn scarlett_display_memory(desc: &[u8; 0x38]) -> Option<u64> {
+    unsafe extern "system" {
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+        fn GetModuleHandleExW(flags: u32, address: *const u16, module: *mut usize) -> i32;
+    }
+
+    // The export is data. Its first pointer is the allocator that also runs
+    // the game's display-arena callback while display targets are created.
+    let title = title_exe_base();
+    let hooks = unsafe { GetProcAddress(title as *mut c_void, c"__XMemAllocationHooks__".as_ptr().cast()) } as usize;
+    if hooks == 0 || !crate::title_shadow::is_readable_range(hooks, size_of::<usize>()) {
+        return None;
+    }
+    let alloc = unsafe { (hooks as *const usize).read_unaligned() };
+    let mut owner = 0;
+    if alloc == 0 || unsafe { GetModuleHandleExW(6, alloc as *const u16, &mut owner) } == 0 || owner != title {
+        return None;
+    }
+    let bytes = usize::try_from(title_layout_size(desc)).ok()?;
+    if bytes == 0 {
+        return None;
+    }
+    // Graphics memory, runtime allocator 0x80, 4 MiB page class and 64 KiB alignment.
+    const XALLOC_DISPLAY: u64 = (1 << 29) | (16 << 24) | (0x80 << 16) | (2 << 14);
+    let callback: unsafe extern "system" fn(usize, u64) -> *mut c_void =
+        unsafe { core::mem::transmute(alloc) };
+    let address = unsafe { callback(bytes, XALLOC_DISPLAY) };
+    record("d3d12_xs", "ScarlettDisplayArena",
+        &format!("display allocation {bytes:#x} through title XMem hook -> {address:p}"));
+    (!address.is_null()).then_some(address as u64)
+}
+
+/// Scarlett slot 133 creates a resource over a title virtual address.
+/// The startup paths use it for descriptor storage and the tiny default
+/// multisampled render/depth targets.
+unsafe extern "system" fn create_scarlett_placed_resource(
+    this: *mut DeviceWrapper, va: u64, desc: *const u8, state: u32,
+    clear: *const c_void, iid: *const Guid, output: *mut *mut c_void,
+) -> i32 {
+    if !output.is_null() {
+        unsafe { *output = core::ptr::null_mut() };
+    }
+    const E_NOTIMPL: i32 = 0x8000_4001u32 as i32;
+    if desc.is_null() || va == 0 {
+        return E_NOTIMPL;
+    }
+    let d = unsafe { core::slice::from_raw_parts(desc, crate::device_console_fix::RES_DESC_SIZE) };
+    let u32_at = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
+    let dim = u32_at(0);
+    let flags = u32_at(0x30);
+    let depth = dim != 1 && flags & crate::depth_uav::FLAG_DSV != 0;
+    // The single-sample, full-size startup color and depth targets are first
+    // used through shader-resource -> render/depth enhanced barriers.
+    let full_size_target = dim == 3 && flags & 3 != 0
+        && u32_at(0x10) >= 1920 && u32_at(0x18) >= 1080
+        && u32_at(0x24) == 1 && u32_at(0x1c) == 0x0001_0001;
+    let initial_layout = (state == 6 && full_size_target).then_some(6);
+    let pc_initial = match state {
+        u32::MAX if (1..=4).contains(&dim) => 0,
+        3 if flags & crate::depth_uav::FLAG_UAV != 0 && !depth => 0x8,
+        6 if initial_layout.is_some() => 0xc0,
+        6 if depth => 0x10,
+        6 if flags & 1 != 0 && dim != 1 => 0x4,
+        6 if flags & 7 == 0 && (2..=4).contains(&dim) => 0xc0,
+        _ => {
+            record("d3d12_xs", "Scarlett slot 133", &format!("unsupported state={state:#x} {}", desc_str(d)));
+            return E_NOTIMPL;
+        },
+    };
+    let mut typed_clear = [0u32; 5];
+    let clear = if depth && !clear.is_null() {
+        typed_clear = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
+        // The clear value names the typed depth-stencil format.
+        typed_clear[0] = match typed_clear[0] {
+            19 => 20,
+            39 => 40,
+            value => value,
+        };
+        typed_clear.as_ptr().cast()
+    } else {
+        clear
+    };
+    let mut depth_desc = [0; 0x38];
+    let depth_pair = match crate::depth_uav::plan(d) {
+        crate::depth_uav::Plan::None => None,
+        crate::depth_uav::Plan::Pair(formats) if crate::depth_uav::enabled() => {
+            depth_desc = crate::depth_uav::depth_desc(d[..0x38].try_into().unwrap());
+            Some(formats)
+        },
+        plan => {
+            record("d3d12_xs", "Scarlett slot 133", &format!("depth/UAV placement requires a supported shadow plan: {plan:?}"));
+            return E_NOTIMPL;
+        },
+    };
+    let host_desc = if depth_pair.is_some() { depth_desc.as_ptr() } else { desc };
+    let mut hr = unsafe { create_placed_resource_at(this, va, host_desc, pc_initial, clear, iid, output, initial_layout) };
+    if hr >= 0 && !output.is_null() {
+        if let Some(formats) = depth_pair {
+            let resource = unsafe { *output };
+            let heap = [1, 0, 0, 1, 1];
+            let real = unsafe { (*this).real };
+            if let Err(error) = unsafe { crate::depth_uav::register(real, resource, &depth_desc, &heap, pc_initial, formats) } {
+                crate::depth_uav::refuse(resource as usize, &error);
+                unsafe {
+                    release_temporary_resource(resource);
+                    *output = core::ptr::null_mut();
+                }
+                hr = E_NOTIMPL;
+            }
+        }
+    }
+    record("d3d12_xs", "Scarlett slot 133",
+        &format!("{} at Xbox VA {va:#x} state={state:#x} -> {hr:#010x}", desc_str(d)));
     hr
 }
 
@@ -2161,6 +2592,12 @@ pub(crate) fn vtable() -> *const usize {
         v[80] = crate::frame::wait_frame_event_x as usize;
         v[81] = crate::frame::frame_statistics_x as usize;
         v[44] = create_placed_resource_x as usize; // CreatePlacedResourceX
+        if crate::cmdlist_wrap::scarlett_list6_probe() {
+            v[36] = create_scarlett_fence as *const () as usize;
+            v[108] = get_scarlett_resource_alloc_info1 as usize;
+            v[127] = create_scarlett_display_resource as usize;
+            v[133] = create_scarlett_placed_resource as usize;
+        }
         v[61] = create_sampler_x as usize; // Xbox extended (anisotropic) sampler create
         v[60] = create_gfx_pso_x as usize; // Xbox graphics PSO create -> PC CreateGraphicsPipelineState
         v[55] = create_derived_pso_x as usize; // Xbox derived-PSO create (base PSO + state patches)
@@ -2219,7 +2656,7 @@ pub fn wrap_device_for_driver(real: *mut c_void, driver: crate::process_debug::D
         unsafe { crate::shader_xlat::probe_typed_atomic64(real) };
         crate::blend_probe::note_device(real);
     }
-    if (crate::rtcap::enabled() || crate::passcap::tables_on() || crate::gws_dispatch::phased_enabled()) && !real.is_null() {
+    if !real.is_null() && (scarlett_budget_enabled() || crate::rtcap::enabled() || crate::passcap::tables_on() || crate::gws_dispatch::phased_enabled()) {
         unsafe { patch_real_device(real) };
     }
     let debug_umd = driver == crate::process_debug::Driver::Debug;

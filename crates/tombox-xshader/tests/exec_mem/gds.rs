@@ -99,12 +99,11 @@ unsafe fn run(c: &mut Ctx, hlsl: &str, code: &[u8], gds_init: &[u32], groups: u3
     vcall!(l, 31, fn(u32, u64) -> (), 0, vgpu);
     vcall!(l, 25, fn(*mut c_void) -> (), pso);
     if let Some((plan, rounds)) = phased {
-        let [x, y, z] = plan.groups;
         let uav_barrier = [2u64, 0, 0, 0];
         for _ in 0..rounds {
-            for group in 0..x {
-                vcall!(l, 33, fn(u32, u32, u32) -> (), 1, group, 0);
-                vcall!(l, 14, fn(u32, u32, u32) -> (), x, y, z);
+            for wave in 0..plan.waves {
+                vcall!(l, 33, fn(u32, u32, u32) -> (), 1, tombox_xshader::gds_abi::tb_gws_phase_word(plan.groups, plan.waves, wave), 0);
+                vcall!(l, 14, fn(u32, u32, u32) -> (), 1, 1, 1);
                 vcall!(l, 26, fn(u32, *const u64) -> (), 1, uav_barrier.as_ptr());
             }
         }
@@ -583,7 +582,7 @@ fn ds_gws_posts_wake_waiters_across_guest_workgroups() {
 
 #[test]
 fn ds_gws_phased_dispatch_wakes_across_physical_groups() {
-    use tombox_xshader::gds_abi::{TB_GWS_TABLE_DWORD, tb_gds_byte_offset};
+    use tombox_xshader::gds_abi::{TB_GWS_RELEASE_DWORD, TB_GWS_TABLE_DWORD, tb_gds_byte_offset};
     use tombox_xshader::hlsl::translate_gws_phased_dispatch;
 
     const RESOURCE: u32 = 7;
@@ -606,19 +605,19 @@ fn ds_gws_phased_dispatch_wakes_across_physical_groups() {
     words.push(S_ENDPGM);
 
     let ex = cs_extract(&words, 32);
-    assert!(translate_gws_phased_dispatch(&ex, [9, 1, 1]).is_err());
+    assert!(translate_gws_phased_dispatch(&ex, [17, 1, 1]).is_err());
     let mut gds = init();
     gds[(TB_GWS_TABLE_DWORD + RESOURCE) as usize] = 0;
 
     let two = translate_gws_phased_dispatch(&ex, [2, 1, 1]).unwrap();
     let (output, actual, scratch) = execute(&two.shader, &gds, 2, Some((&two, 8))).unwrap();
     assert!(output.iter().all(|&value| value == 0), "group zero wrote before the post");
-    assert_eq!(scratch[1 + 2], tb_gds_byte_offset(TB_GWS_TABLE_DWORD + RESOURCE));
+    assert_eq!(scratch[2 + 2], tb_gds_byte_offset(TB_GWS_TABLE_DWORD + RESOURCE));
     assert_eq!(actual, gds);
     let (output, actual, scratch) = execute(&two.shader, &gds, 2, Some((&two, two.max_rounds))).unwrap();
     assert_eq!(output[0], SENTINEL);
     assert!(output[1..].iter().all(|&value| value == 0));
-    assert_eq!(scratch[1 + 2], 0);
+    assert_eq!(scratch[2 + 2], 0);
     assert_eq!(actual, gds);
 
     // Beyond the fused path's limit. Only the oldest of the four waiters wakes.
@@ -627,7 +626,7 @@ fn ds_gws_phased_dispatch_wakes_across_physical_groups() {
     assert_eq!(output[0], SENTINEL);
     assert!(output[1..].iter().all(|&value| value == 0));
     let pending_addr = tb_gds_byte_offset(TB_GWS_TABLE_DWORD + RESOURCE);
-    assert_eq!(&scratch[1 + 5..1 + 2 * 5], &[0, 0, pending_addr, pending_addr, pending_addr]);
+    assert_eq!(&scratch[2 + 5..2 + 2 * 5], &[0, 0, pending_addr, pending_addr, pending_addr]);
     assert_eq!(actual, gds);
 
     words[post..post + 2].copy_from_slice(&gds_op(0x18, RESOURCE, 0, 0, 0, 0));
@@ -635,19 +634,20 @@ fn ds_gws_phased_dispatch_wakes_across_physical_groups() {
     let (output, actual, scratch) = execute(&release.shader, &gds, 5, Some((&release, release.max_rounds))).unwrap();
     assert_eq!(&output[..5], &[SENTINEL, 0, SENTINEL, SENTINEL, SENTINEL]);
     assert!(output[5..].iter().all(|&value| value == 0));
-    assert_eq!(&scratch[1 + 5..1 + 2 * 5], &[0; 5]);
-    assert_eq!(actual, gds, "release-all must not deposit credits");
+    assert_eq!(&scratch[2 + 5..2 + 2 * 5], &[0; 5]);
+    gds[(TB_GWS_RELEASE_DWORD + RESOURCE) as usize] += 1;
+    assert_eq!(actual, gds, "release-all advances the generation without depositing credits");
 }
 
 #[test]
 fn ds_gws_barrier_reloads_and_releases_only_after_last_arrival() {
-    use tombox_xshader::gds_abi::{TB_GWS_TABLE_DWORD, tb_gds_byte_offset};
+    use tombox_xshader::gds_abi::{TB_GWS_BARRIER_DWORD, TB_GWS_TABLE_DWORD, tb_gds_byte_offset};
     use tombox_xshader::hlsl::{translate_gws_fused_dispatch, translate_gws_phased_dispatch};
 
     const RESOURCE: u32 = 7;
     const SENTINEL: u32 = 0x51ab_1e7e;
     let counter = (TB_GWS_TABLE_DWORD + RESOURCE) as usize;
-    let pending = tb_gds_byte_offset(TB_GWS_TABLE_DWORD + RESOURCE);
+    let pending = tb_gds_byte_offset(TB_GWS_TABLE_DWORD + RESOURCE) | 1;
     for (groups, phased) in [(4, false), (5, true)] {
         for extra in [0, 1] {
             // Lane 0 is inactive. Lane 1 supplies the next generation's count.
@@ -688,12 +688,105 @@ fn ds_gws_barrier_reloads_and_releases_only_after_last_arrival() {
             if phased {
                 let queued = if extra == 0 { 0 } else { pending };
                 assert_eq!(
-                    &scratch[1 + groups as usize..1 + 2 * groups as usize],
+                    &scratch[2 + groups as usize..2 + 2 * groups as usize],
                     vec![queued; groups as usize],
                 );
             }
             gds[counter] = if extra == 0 { 8 } else { 0 };
+            if phased {
+                let generation = (TB_GWS_BARRIER_DWORD + RESOURCE) as usize;
+                gds[generation] = gds[generation].wrapping_add(if extra == 0 { 2 } else { 1 });
+            }
             assert_eq!(actual, gds);
         }
+    }
+}
+
+#[test]
+fn ds_gws_barrier_and_semaphore_keep_distinct_wait_states() {
+    use tombox_xshader::gds_abi::{TB_GWS_TABLE_DWORD, tb_gds_byte_offset};
+    use tombox_xshader::hlsl::{translate_gws_fused_dispatch, translate_gws_phased_dispatch};
+
+    const BARRIER: u32 = 7;
+    const SEMAPHORE: u32 = 8;
+    const MARKER: u32 = 0x51ab_1e7e;
+    for (groups, phased) in [(4, false), (5, true)] {
+        let mut words = vec![vop1(1, 20, ic(groups as i32 - 1))];
+        words.extend_from_slice(&gds_op(0x1d, BARRIER, 20, 0, 0, 0));
+        let wait = words.len();
+        words.extend_from_slice(&gds_op(0x1c, SEMAPHORE, 0, 0, 0, 0));
+        words.extend_from_slice(&smem(2, 8, 4, 0, SNULL));
+        words.extend_from_slice(&[
+            vop1(1, 21, 5), vop2(0x1a, 1, ic(2), 21), vop1(1, 10, LIT), MARKER,
+            vopc(0xd2, ic(0), 0), 0xe070_1000, 0x8002_0a01, S_ENDPGM,
+        ]);
+        let ex = cs_extract(&words, 32);
+        let mut gds = init();
+        // Two waves will reach the next barrier generation. The first
+        // generation releases one more wave than the semaphore has credits.
+        let credits = groups - 3;
+        gds[(TB_GWS_TABLE_DWORD + BARRIER) as usize] = credits;
+        gds[(TB_GWS_TABLE_DWORD + SEMAPHORE) as usize] = credits;
+        let (output, actual, scratch) = if phased {
+            let plan = translate_gws_phased_dispatch(&ex, [groups, 1, 1]).unwrap();
+            execute(&plan.shader, &gds, groups, Some((&plan, plan.max_rounds))).unwrap()
+        } else {
+            let shader = translate_gws_fused_dispatch(&ex, [groups, 1, 1]).unwrap();
+            execute(&shader, &gds, 1, None).unwrap()
+        };
+        assert_eq!(output[..groups as usize].iter().filter(|&&value| value == MARKER).count(), credits as usize);
+        assert!(output[groups as usize..].iter().all(|&value| value == 0));
+        assert_eq!(actual[(TB_GWS_TABLE_DWORD + BARRIER) as usize], credits);
+        assert_eq!(actual[(TB_GWS_TABLE_DWORD + SEMAPHORE) as usize], 0);
+        if phased {
+            let semaphore_key = tb_gds_byte_offset(TB_GWS_TABLE_DWORD + SEMAPHORE);
+            let barrier_key = tb_gds_byte_offset(TB_GWS_TABLE_DWORD + BARRIER) | 1;
+            let pending = &scratch[2 + groups as usize..2 + 2 * groups as usize];
+            assert_eq!(pending.iter().filter(|&&value| value == semaphore_key).count(), 1);
+            assert_eq!(pending.iter().filter(|&&value| value == barrier_key).count(), 2);
+            assert_eq!(pending.iter().filter(|&&value| value == 0).count(), credits as usize);
+        }
+        words[wait..wait + 2].copy_from_slice(&gds_op(0x1c, BARRIER, 0, 0, 0, 0));
+        assert!(translate_gws_phased_dispatch(&cs_extract(&words, 32), [groups, 1, 1]).is_err());
+    }
+}
+
+#[test]
+fn ds_gws_phased_dispatch_preserves_both_waves_in_a_workgroup() {
+    use tombox_xshader::gds_abi::{TB_GWS_BARRIER_DWORD, TB_GWS_TABLE_DWORD};
+    use tombox_xshader::hlsl::translate_gws_phased_dispatch;
+
+    const RESOURCE: u32 = 7;
+    // Each lane writes at its guest local ID plus a distinct offset for its guest group.
+    let mut words = vec![sop1(3, 124, LIT), 0x400, vop1(1, 20, ic(3))];
+    words.extend_from_slice(&gds_op(0x1d, RESOURCE, 20, 0, 0, 0));
+    words.extend_from_slice(&[
+        vop2(0x1a, 22, ic(3), 1), vop2(0x25, 21, v(0), 22),
+        vop2(0x1a, 22, ic(5), 2), vop2(0x25, 21, v(21), 22),
+        vop1(1, 22, 5), vop2(0x25, 22, 6, 22), vop2(0x25, 22, 7, 22),
+        vop2(0x1a, 22, ic(6), 22), vop2(0x25, 21, v(21), 22),
+        vop2(0x1a, 21, ic(2), 21), vop1(1, 20, ic(1)),
+    ]);
+    words.extend_from_slice(&gds_op(0x00, 0, 21, 20, 0, 0));
+    words.push(S_ENDPGM);
+
+    for (shape, grid) in [
+        ([64, 1, 1], [2, 1, 1]),
+        ([8, 4, 2], [1, 2, 1]),
+        ([8, 4, 2], [1, 1, 2]),
+    ] {
+        let mut ex = cs_extract(&words, 64);
+        ex.isa_preamble[1..4].copy_from_slice(&shape);
+        let plan = translate_gws_phased_dispatch(&ex, grid).unwrap();
+        assert_eq!(plan.waves, 4);
+        let mut gds = init();
+        gds[..128].fill(0);
+        gds[(TB_GWS_TABLE_DWORD + RESOURCE) as usize] = 3;
+        let (_, actual, scratch) = execute(&plan.shader, &gds, 2, Some((&plan, plan.max_rounds))).unwrap();
+        gds[..128].fill(1);
+        let generation = (TB_GWS_BARRIER_DWORD + RESOURCE) as usize;
+        gds[generation] = gds[generation].wrapping_add(1);
+        assert_eq!(actual, gds, "guest thread coordinates in {shape:?}");
+        assert_eq!(&scratch[6..10], &[0; 4]);
     }
 }

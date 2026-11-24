@@ -396,7 +396,7 @@ static MAP3_ORIG: AtomicUsize = AtomicUsize::new(0);
 unsafe extern "system" fn vfree_w(addr: usize, size: usize, kind: u32) -> i32 {
     let (lo, hi) = crate::epoch::bump_free(addr, size);
     let r = crate::title_acct::track_free(addr, size, kind, || vfree_inner(addr, size, kind));
-    if r != 0 && kind & MEM_RELEASE != 0 {
+    if r != 0 && kind == MEM_RELEASE {
         crate::write_watch::forget_range(addr, size);
     }
     crate::epoch::bump_range(lo, hi);
@@ -404,7 +404,7 @@ unsafe extern "system" fn vfree_w(addr: usize, size: usize, kind: u32) -> i32 {
 }
 
 unsafe fn vfree_inner(addr: usize, size: usize, kind: u32) -> i32 {
-    if kind & MEM_RELEASE != 0 {
+    if kind == MEM_RELEASE {
         if let Some(r) = crate::phys::release_region(addr, size) {
             return r;
         }

@@ -210,6 +210,7 @@ pub struct ListState {
     pub stencil: Option<u32>,
     pub pso: Option<usize>,
     pub variant_bound: bool,
+    pub(crate) global_error: bool,
     pub predication: Option<(usize, u64, u32)>,
     pub plain_predicate: bool,
     pub heaps: Option<Vec<usize>>,
@@ -268,7 +269,9 @@ impl ListState {
         let keep = (self.open, self.queue, self.kickoff_pending, self.list9);
         let q = core::mem::take(&mut self.queries);
         let sus = self.suspended;
+        let global_error = self.global_error;
         *self = ListState::default();
+        self.global_error = global_error;
         (self.open, self.queue, self.kickoff_pending, self.list9) = keep;
         self.queries = q;
         self.suspended = sus;
@@ -384,8 +387,121 @@ pub(crate) fn bound_pso(list: *mut c_void) -> Option<usize> {
     with(list, |s| s.pso)
 }
 
+pub(crate) fn note_global_error(list: *mut c_void) {
+    with(list, |s| s.global_error = true);
+}
+
 pub(crate) fn compute_root(list: *mut c_void) -> Option<usize> {
     with(list, |s| s.root[0])
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct ComputeBindings {
+    root: usize,
+    heaps: Option<Vec<usize>>,
+    args: BTreeMap<u32, RootArg>,
+}
+
+pub(crate) struct ComputeBuffer {
+    resource: usize,
+    address: u64,
+    required_state: u32,
+}
+
+impl ComputeBuffer {
+    pub(crate) fn lookup(address: u64, required_state: u32) -> Option<Self> {
+        let (entry, _) = crate::gpu_va::lookup_buffer(address)?;
+        let buffer = Self { resource: entry.res, address, required_state };
+        buffer.is_replayable().then_some(buffer)
+    }
+
+    pub(crate) fn is_replayable(&self) -> bool {
+        crate::gpu_va::lookup_buffer(self.address).is_some_and(|(entry, _)| {
+            entry.res == self.resource
+                && crate::placed::lookup(entry.res as *mut c_void).is_none()
+                && crate::gpu_va::state(entry.res) & self.required_state == self.required_state
+        })
+    }
+
+    pub(crate) fn resource(&self) -> *mut c_void {
+        self.resource as *mut c_void
+    }
+}
+
+impl ComputeBindings {
+    pub(crate) fn root(&self) -> *mut c_void {
+        self.root as *mut c_void
+    }
+
+    pub(crate) fn views(&self) -> impl Iterator<Item = (u32, usize, u64)> + '_ {
+        self.args.iter().filter_map(|(&index, arg)| match *arg {
+            RootArg::View(slot, address) => Some((index, slot, address)),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn replayable_root(&self) -> Option<*mut c_void> {
+        (self.heaps.as_ref().map_or(0, Vec::len) <= 1).then_some(self.root as *mut c_void)
+    }
+
+    pub(crate) fn descriptor_heap(&self) -> Option<usize> {
+        self.heaps.as_ref()?.first().copied()
+    }
+
+    pub(crate) fn table_handles(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
+        self.args.iter().filter_map(|(&index, arg)| match arg {
+            RootArg::Table(handle) => Some((index, *handle)),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn replayable_buffers(&self) -> Option<Vec<ComputeBuffer>> {
+        let mut buffers = Vec::new();
+        for arg in self.args.values() {
+            if let RootArg::View(slot, address) = *arg {
+                let required_state = match slot {
+                    41 => 0x1,  // VERTEX_AND_CONSTANT_BUFFER
+                    43 => 0x40, // NON_PIXEL_SHADER_RESOURCE
+                    45 => 0x8,  // UNORDERED_ACCESS
+                    _ => return None,
+                };
+                buffers.push(ComputeBuffer::lookup(address, required_state)?);
+            }
+        }
+        Some(buffers)
+    }
+
+    pub(crate) unsafe fn apply_compute_args(&self, list: *mut c_void) {
+        let set_constant: unsafe extern "system" fn(*mut c_void, u32, u32, u32) =
+            unsafe { core::mem::transmute(vslot(list, 33)) };
+        for (&index, arg) in &self.args {
+            match arg {
+                RootArg::Consts(values) => {
+                    for (&offset, &value) in values {
+                        unsafe { set_constant(list, index, value, offset) };
+                    }
+                }
+                RootArg::View(slot @ (41 | 43 | 45), address) => {
+                    let set: unsafe extern "system" fn(*mut c_void, u32, u64) =
+                        unsafe { core::mem::transmute(vslot(list, slot - 4)) };
+                    unsafe { set(list, index, *address) };
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+pub(crate) fn compute_bindings(list: *mut c_void) -> Option<ComputeBindings> {
+    with(list, |s| {
+        Some(ComputeBindings {
+            root: s.root[0]?,
+            heaps: s.heaps.clone(),
+            args: s.args.iter().filter_map(|(&(side, index), arg)| {
+                (side == 0).then(|| (index, arg.clone()))
+            }).collect(),
+        })
+    })
 }
 
 pub(crate) fn predication_of(list: *mut c_void) -> Option<(usize, u64, u32)> {
@@ -422,6 +538,33 @@ pub(crate) fn clone_state(from: *mut c_void, to: *mut c_void) {
     if from != to {
         crate::query_x::carry_nest(from as usize, to as usize);
     }
+}
+
+pub(crate) fn log_scarlett_indexed_draw(list: *mut c_void, args: [u32; 5]) {
+    static DRAWS: AtomicUsize = AtomicUsize::new(0);
+    if DRAWS.fetch_add(1, Ordering::Relaxed) >= 8 {
+        return;
+    }
+    unsafe extern "system" {
+        fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut usize, hash: *mut u32) -> u16;
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+    }
+    let base = unsafe { GetModuleHandleW(core::ptr::null()) } as usize;
+    let mut stack = [0usize; 28];
+    let frames = unsafe { RtlCaptureStackBackTrace(0, stack.len() as u32, stack.as_mut_ptr(), core::ptr::null_mut()) };
+    let title_stack: Vec<_> = stack[..frames as usize].iter()
+        .filter_map(|pc| pc.checked_sub(base).filter(|&rva| rva < 0x5f4_0000)).collect();
+    record("d3d12_xs", "scarlett_draw", &format!("caller stack RVAs: {title_stack:x?}"));
+    let key = list as usize;
+    let states = STATES[shard_of(key)].lock().unwrap_or_else(|e| e.into_inner());
+    let Some(s) = states.as_ref().and_then(|states| states.get(&key)) else {
+        record("d3d12_xs", "scarlett_draw", &format!("indexed {args:?} list={list:p}: no command-list state"));
+        return;
+    };
+    record("d3d12_xs", "scarlett_draw", &format!(
+        "indexed {args:?} list={list:p} pso={:x?} root={:x?} topology={:?} ib={:x?} vertex_buffers={} viewport_bytes={} scissor_bytes={} targets={:?}",
+        s.pso, s.root, s.topology, s.ib, s.vbs.len(),
+        s.viewports.as_ref().map_or(0, |b| b.len()), s.scissors.as_ref().map_or(0, |b| b.len()), s.targets));
 }
 
 pub fn raster_snapshot(list: usize) -> Option<(Vec<u8>, Vec<u8>, Option<u32>, Option<usize>)> {
@@ -928,7 +1071,14 @@ unsafe fn apply_rect(list: *mut c_void) {
         return;
     }
     let Some(k) = (unsafe { wanted_key(list, pso) }) else {
-        crate::rectlist::refuse(0, pso as u64, &format!("PSO {pso:#x} has no recorded PC description (stream-built or unknown pipeline)"));
+        match unsafe { crate::dbcount::rect_stream_pso(real_device(), pso) } {
+            Some(variant) if variant != 0 => {
+                unsafe { pc_set_pso(list, variant) };
+                with(list, |s| s.variant_bound = true);
+            }
+            Some(_) => {}
+            None => crate::rectlist::refuse(0, pso as u64, &format!("PSO {pso:#x} has no recorded PC description")),
+        }
         return;
     };
     let v = unsafe { pso_variant(pso, k) };
@@ -1900,10 +2050,14 @@ unsafe extern "system" fn w_kickoff(this: *mut c_void) {
 }
 
 unsafe extern "system" fn w_close(this: *mut c_void) -> i32 {
-    let queue = with(this, |s| s.queue);
+    let (queue, global_error) = with(this, |s| (s.queue, s.global_error));
     let p = prev(X_CLOSE);
     let f: unsafe extern "system" fn(*mut c_void) -> i32 = unsafe { core::mem::transmute(p) };
-    let hr = unsafe { f(this) };
+    let mut hr = unsafe { f(this) };
+    if global_error && hr >= 0 {
+        hr = 0x80004005u32 as i32;
+        crate::ecl_probe::on_close(this, hr);
+    }
     with(this, |s| {
         s.open = false;
         s.closed = hr >= 0;

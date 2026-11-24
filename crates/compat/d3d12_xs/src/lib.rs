@@ -37,6 +37,7 @@ mod xone_barrier;
 mod xone_tex;
 mod heap_wrap;
 mod cmdlist_wrap;
+mod scarlett_fence;
 mod blendclamp;
 mod blend_probe;
 mod gpuprof;
@@ -283,6 +284,7 @@ pub extern "system" fn D3D12XboxCreateDevice(
     if !pp_device.is_null() {
         unsafe { *pp_device = core::ptr::null_mut() };
     }
+    process_debug::install_native_exception_log();
     let _ = xgs_kmd_emu::api();
     present::start_window_clamp();
     agility::select();
@@ -297,11 +299,28 @@ pub extern "system" fn D3D12XboxCreateDevice(
     // D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL, REFIID, void**)
     let f: extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(p) };
-    let hr = agility::create_device(core::ptr::null_mut(), D3D_FEATURE_LEVEL_12_0, riid, pp_device).unwrap_or_else(|| f(core::ptr::null_mut(), D3D_FEATURE_LEVEL_12_0, riid, pp_device));
+    let adapter = if std::env::var("TOMBOX_D3D12_ADAPTER").as_deref() == Ok("warp") {
+        match xone_dxgi::warp_adapter() {
+            Ok(adapter) => {
+                record(M, "D3D12XboxCreateDevice", "using the WARP software adapter");
+                adapter
+            }
+            Err(hr) => {
+                record(M, "D3D12XboxCreateDevice", &format!("EnumWarpAdapter failed hr={hr:#010x}"));
+                return hr;
+            }
+        }
+    } else {
+        core::ptr::null_mut()
+    };
+    let hr = agility::create_device(adapter, D3D_FEATURE_LEVEL_12_0, riid, pp_device)
+        .unwrap_or_else(|| f(adapter, D3D_FEATURE_LEVEL_12_0, riid, pp_device));
+    unsafe { xone_dxgi::com_release(adapter as usize) };
     process_debug::mark_device_created();
     if hr == S_OK && !pp_device.is_null() {
         let real = unsafe { *pp_device };
         if !real.is_null() {
+            unsafe { process_debug::capture_messages(real) };
             dred::watch(real);
             let wrapped = device_wrap::wrap_device_for_driver(real, driver);
             unsafe { *pp_device = wrapped };

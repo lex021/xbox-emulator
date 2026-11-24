@@ -1,7 +1,7 @@
 use super::{mesh, r, Emitter};
 use crate::gds_abi::{
     tb_gds_byte_offset, TB_GDS_HLSL_DECL, TB_GDS_TITLE_DWORDS, TB_GWS_COUNTER_MASK,
-    TB_GWS_RESOURCES, TB_GWS_TABLE_DWORD,
+    TB_GWS_BARRIER_DWORD, TB_GWS_CHECKPOINT_DWORDS, TB_GWS_MAX_GROUPS, TB_GWS_RELEASE_DWORD, TB_GWS_RESOURCES, TB_GWS_TABLE_DWORD,
 };
 use crate::rdna2::{Enc, Insn};
 use crate::Stage;
@@ -38,7 +38,11 @@ impl Emitter<'_> {
         self.tmp += 1;
         let offset = ins.aux.imm;
         let resource_mask = TB_GWS_RESOURCES - 1;
-        let table = tb_gds_byte_offset(TB_GWS_TABLE_DWORD);
+        let table = tb_gds_byte_offset(if name == "ds_gws_sema_release_all" {
+            TB_GWS_RELEASE_DWORD
+        } else {
+            TB_GWS_TABLE_DWORD
+        });
         // Elect one active lane per guest wave independently of host wave size.
         self.line(&format!("uint t{t}id = gtid.x + {x}u * (gtid.y + {y}u * gtid.z); uint t{t}wave = t{t}id >> 5u;"));
         self.line(&format!("if ((t{t}id & 31u) == 0u) tb_gws_counter_first[t{t}wave] = 0xffffffffu;"));
@@ -46,7 +50,7 @@ impl Emitter<'_> {
         self.line(&format!("if ((exec_lo & 1u) != 0u) InterlockedMin(tb_gws_counter_first[t{t}wave], t{t}id);"));
         self.line("GroupMemoryBarrierWithGroupSync();");
         self.line(&format!("if (t{t}id == tb_gws_counter_first[t{t}wave]) {{ uint t{t}a = {table}u + 4u * (((m0 >> 16) + {offset}u) & {resource_mask}u);"));
-        let value = if name == "ds_gws_sema_v" {
+        let value = if matches!(name, "ds_gws_sema_v" | "ds_gws_sema_release_all") {
             "1u".to_string()
         } else {
             let data = &ins.src[1];
@@ -64,7 +68,7 @@ impl Emitter<'_> {
 
     pub(super) fn emit_gds(&mut self, ins: &Insn) -> Result<(), String> {
         let m = ins.mnemonic.clone();
-        if matches!(m.as_str(), "ds_gws_init" | "ds_gws_sema_v" | "ds_gws_sema_br") {
+        if matches!(m.as_str(), "ds_gws_init" | "ds_gws_sema_v" | "ds_gws_sema_br" | "ds_gws_sema_release_all") {
             return self.emit_gws_counter(ins);
         }
         if m.starts_with("ds_gws_") {
@@ -149,70 +153,96 @@ pub(super) const COOPERATIVE_STATE: &str = r#"
 groupshared uint tb_gws_pc[TB_GWS_WAVES];
 groupshared uint tb_gws_pending[TB_GWS_WAVES];
 groupshared uint tb_gws_ticket[TB_GWS_WAVES];
+groupshared uint tb_gws_release[TB_GWS_WAVES];
 groupshared uint tb_gws_next_ticket;
 groupshared uint tb_gws_progress;
 "#;
 
 impl Emitter<'_> {
     pub(super) fn emit_cooperative_gws(&mut self, mode: Mode) -> Result<(), String> {
-        let [_, x, y, z] = self.ex.isa_preamble;
-        let waves = x.saturating_mul(mode.groups()) / 32;
+        let [_, _, y, z] = self.ex.isa_preamble;
+        let threads = workgroup_threads(self.ex.isa_preamble);
+        let waves = threads.saturating_mul(mode.groups()) / 32;
         if self.ex.stage != Stage::Compute
-            || !matches!([x, y, z], [32 | 64, 1, 1])
-            || waves < 2
+            || !matches!(threads, 32 | 64)
+            || (!mode.phased() && (y != 1 || z != 1 || waves < 2))
             || mesh::wave_size(&self.insns) != 32
         {
-            return Err("cooperative GWS requires at least two wave32s in 32x1x1 or 64x1x1 compute groups".into());
-        }
-        if mode.phased() && x != 32 {
-            return Err("phased GWS requires exactly one wave32 per workgroup".into());
+            return Err("cooperative GWS requires wave32 compute groups of 32 or 64 threads, with linear groups and at least two waves in fused mode".into());
         }
         let instructions = self.insns.clone();
         let barrier = instructions.iter().any(|ins| ins.mnemonic == "ds_gws_barrier");
-        if !barrier && !instructions.iter().any(|ins| ins.mnemonic == "ds_gws_sema_p") {
+        let semaphore_wait = instructions.iter().any(|ins| ins.mnemonic == "ds_gws_sema_p");
+        if !barrier && !semaphore_wait {
             return Err("cooperative GWS requires a semaphore wait or a barrier".into());
         }
         if barrier && instructions.iter().any(|ins| ins.mnemonic.starts_with("ds_gws_sema_")) {
-            return Err("mixing GWS barriers and semaphore operations is unsupported".into());
+            let changes_base = instructions.iter().any(|ins| ins.dst.contains(&super::Opnd::M0));
+            let aliases_resource = instructions.iter().any(|op| {
+                op.mnemonic == "ds_gws_barrier" && instructions.iter().any(|other| {
+                    other.mnemonic.starts_with("ds_gws_sema_") && op.aux.imm == other.aux.imm
+                })
+            });
+            if changes_base || aliases_resource {
+                return Err("mixed GWS requires distinct barrier and semaphore resources and a fixed M0 base".into());
+            }
         }
         let end = instructions.len();
         let end_offset = instructions.last().map_or(0, |ins| ins.offset + ins.dwords * 4);
         let counter_mask = TB_GWS_COUNTER_MASK;
         let resource_mask = TB_GWS_RESOURCES - 1;
         let base = tb_gds_byte_offset(TB_GWS_TABLE_DWORD);
+        let release_offset = tb_gds_byte_offset(TB_GWS_RELEASE_DWORD - TB_GWS_TABLE_DWORD);
+        let barrier_offset = tb_gds_byte_offset(TB_GWS_BARRIER_DWORD - TB_GWS_TABLE_DWORD);
         if mode.phased() {
-            self.line("uint tb_gws_wave = gid.x;");
-            self.line("uint tb_gws_turn = gid.x;");
+            self.line(&format!("uint tb_gws_wave = tb_gws_group * {}u + (tb_gws_lane >> 5u);", threads / 32));
+            self.line("uint tb_gws_turn = tb_gws_selected;");
             self.line("GroupMemoryBarrierWithGroupSync();");
         } else {
-            self.line("uint tb_gws_wave = gtid.x >> 5u;");
-            self.line("if (gtid.x < TB_GWS_WAVES) { tb_gws_pc[gtid.x] = 0u; tb_gws_pending[gtid.x] = 0u; tb_gws_ticket[gtid.x] = 0u; }");
-            self.line("if (gtid.x == 0u) tb_gws_next_ticket = 0u;");
+            self.line("const uint tb_gws_waves = TB_GWS_WAVES;");
+            self.line("uint tb_gws_wave = tb_gws_lane >> 5u;");
+            self.line("if (tb_gws_lane < TB_GWS_WAVES) { tb_gws_pc[tb_gws_lane] = 0u; tb_gws_pending[tb_gws_lane] = 0u; tb_gws_ticket[tb_gws_lane] = 0u; }");
+            self.line("if (tb_gws_lane == 0u) tb_gws_next_ticket = 0u;");
             self.line("GroupMemoryBarrierWithGroupSync();");
             // Every productive round retires an instruction or wakes a wave.
             let rounds = 2 * end * waves as usize + 1;
             self.line(&format!("[loop] for (uint tb_gws_round = 0u; tb_gws_round < {rounds}u; ++tb_gws_round) {{"));
-            self.line("if (gtid.x == 0u) tb_gws_progress = 0u;");
+            self.line("if (tb_gws_lane == 0u) tb_gws_progress = 0u;");
             self.line("GroupMemoryBarrierWithGroupSync();");
             self.line("[loop] for (uint tb_gws_turn = 0u; tb_gws_turn < TB_GWS_WAVES; ++tb_gws_turn) {");
         }
-        self.line("if (gtid.x == 0u) {");
+        self.line("if (tb_gws_lane == 0u) {");
         self.line("tb_gws_first = 0xffffffffu;");
-        if !barrier {
-            self.line("uint wait_addr = tb_gws_pending[tb_gws_turn];");
-            self.line("if (wait_addr != 0u) {");
+        // GDS addresses are dword-aligned. The low bit distinguishes a barrier
+        // checkpoint from a semaphore checkpoint without growing the UAV layout.
+        if semaphore_wait || (barrier && mode.phased()) {
+            self.line("uint wait_key = tb_gws_pending[tb_gws_turn];");
+        }
+        if semaphore_wait {
+            self.line("if (wait_key != 0u && (wait_key & 1u) == 0u) {");
+            self.line("uint wait_addr = wait_key;");
             self.line("uint earlier = 0u;");
-            self.line("for (uint p = 0u; p < TB_GWS_WAVES; ++p) earlier |= (tb_gws_pending[p] == wait_addr && tb_gws_ticket[p] < tb_gws_ticket[tb_gws_turn]) ? 1u : 0u;");
+            self.line("for (uint p = 0u; p < tb_gws_waves; ++p) earlier |= (tb_gws_pending[p] == wait_addr && tb_gws_ticket[p] < tb_gws_ticket[tb_gws_turn]) ? 1u : 0u;");
             self.line("uint count;");
             self.line("tb_gds.InterlockedOr(wait_addr, 0u, count);");
+            if mode.phased() {
+                self.line(&format!("uint released; tb_gds.InterlockedOr(wait_addr + {release_offset}u, 0u, released);"));
+                self.line("if (released != tb_gws_release[tb_gws_turn]) { tb_gws_pending[tb_gws_turn] = 0u; tb_gws_progress = 1u; } else");
+            }
             self.line(&format!("if (earlier == 0u && (count & {counter_mask}u) != 0u) {{"));
             self.line("uint old; tb_gds.InterlockedAdd(wait_addr, 0xffffffffu, old);");
             self.line("tb_gws_pending[tb_gws_turn] = 0u; tb_gws_progress = 1u;");
             self.line("} }");
         }
+        if barrier && mode.phased() {
+            self.line("if ((wait_key & 1u) != 0u) {");
+            self.line("uint wait_addr = wait_key & ~1u;");
+            self.line(&format!("uint released; tb_gds.InterlockedOr(wait_addr + {barrier_offset}u, 0u, released);"));
+            self.line("if (released != tb_gws_release[tb_gws_turn]) { tb_gws_pending[tb_gws_turn] = 0u; tb_gws_progress = 1u; } }");
+        }
         self.line("}");
         self.line("GroupMemoryBarrierWithGroupSync();");
-        self.line("if (tb_gws_wave == tb_gws_turn && (exec_lo & 1u) != 0u) InterlockedMin(tb_gws_first, gtid.x);");
+        self.line("if (tb_gws_wave == tb_gws_turn && (exec_lo & 1u) != 0u) InterlockedMin(tb_gws_first, tb_gws_lane);");
         self.line("GroupMemoryBarrierWithGroupSync();");
         self.line("uint tb_gws_step = tb_gws_pc[tb_gws_turn]; uint tb_gws_waiting = tb_gws_pending[tb_gws_turn];");
         // All lanes must finish reading the shared PC before its owner can change it.
@@ -247,7 +277,7 @@ impl Emitter<'_> {
                         return Err("invalid cooperative GWS resource encoding".into());
                     }
                     let offset = ins.aux.imm;
-                    self.line(&format!("if (gtid.x == tb_gws_first) {{ uint addr = {base}u + 4u * (((m0 >> 16) + {offset}u) & {resource_mask}u);"));
+                    self.line(&format!("if (tb_gws_lane == tb_gws_first) {{ uint addr = {base}u + 4u * (((m0 >> 16) + {offset}u) & {resource_mask}u);"));
                     match ins.mnemonic.as_str() {
                         "ds_gws_barrier" => {
                             let data = &ins.src[0];
@@ -256,28 +286,41 @@ impl Emitter<'_> {
                             self.line("uint count; tb_gds.InterlockedOr(addr, 0u, count);");
                             self.line(&format!("if ((count & {counter_mask}u) == 0u) {{"));
                             self.line(&format!("uint old; tb_gds.InterlockedExchange(addr, ({}) & {counter_mask}u, old);", r(data)?));
-                            self.line("for (uint p = 0u; p < TB_GWS_WAVES; ++p) { if (tb_gws_pending[p] == addr) tb_gws_pending[p] = 0u; }");
+                            if mode.phased() {
+                                self.line(&format!("tb_gds.InterlockedAdd(addr + {barrier_offset}u, 1u, old);"));
+                            }
+                            self.line("for (uint p = 0u; p < tb_gws_waves; ++p) { if (tb_gws_pending[p] == (addr | 1u)) tb_gws_pending[p] = 0u; }");
                             self.line("} else {");
                             self.line("uint old; tb_gds.InterlockedAdd(addr, 0xffffffffu, old);");
-                            self.line("tb_gws_pending[tb_gws_turn] = addr;");
+                            self.line("tb_gws_pending[tb_gws_turn] = addr | 1u;");
+                            if mode.phased() {
+                                self.line(&format!("tb_gds.InterlockedOr(addr + {barrier_offset}u, 0u, old); tb_gws_release[tb_gws_turn] = old;"));
+                            }
                             self.line("}");
                         }
                         "ds_gws_sema_p" => {
                             self.line("uint count; tb_gds.InterlockedOr(addr, 0u, count);");
                             self.line("uint older = 0u;");
-                            self.line("for (uint p = 0u; p < TB_GWS_WAVES; ++p) older |= (tb_gws_pending[p] == addr) ? 1u : 0u;");
+                            self.line("for (uint p = 0u; p < tb_gws_waves; ++p) older |= (tb_gws_pending[p] == addr) ? 1u : 0u;");
                             self.line(&format!("if (older == 0u && (count & {counter_mask}u) != 0u) {{"));
                             self.line("uint old; tb_gds.InterlockedAdd(addr, 0xffffffffu, old);");
-                            self.line("} else { tb_gws_pending[tb_gws_turn] = addr; tb_gws_ticket[tb_gws_turn] = tb_gws_next_ticket++; }");
+                            self.line("} else { tb_gws_pending[tb_gws_turn] = addr; tb_gws_ticket[tb_gws_turn] = tb_gws_next_ticket++;");
+                            if mode.phased() {
+                                self.line(&format!("uint released; tb_gds.InterlockedOr(addr + {release_offset}u, 0u, released); tb_gws_release[tb_gws_turn] = released;"));
+                            }
+                            self.line("}");
                         }
                         "ds_gws_sema_release_all" => {
                             // A previous post may not have been consumed yet. Apply its
                             // credits to the existing queue before releasing the rest.
                             self.line("uint waiting = 0u;");
-                            self.line("for (uint p = 0u; p < TB_GWS_WAVES; ++p) { if (tb_gws_pending[p] == addr) { tb_gws_pending[p] = 0u; ++waiting; } }");
+                            self.line("for (uint p = 0u; p < tb_gws_waves; ++p) { if (tb_gws_pending[p] == addr) { tb_gws_pending[p] = 0u; ++waiting; } }");
                             self.line("uint count; tb_gds.InterlockedOr(addr, 0u, count);");
                             self.line(&format!("uint used = min(waiting, count & {counter_mask}u);"));
                             self.line("if (used != 0u) { uint old; tb_gds.InterlockedAdd(addr, 0u - used, old); }");
+                            if mode.phased() {
+                                self.line(&format!("uint old; tb_gds.InterlockedAdd(addr + {release_offset}u, 1u, old);"));
+                            }
                         }
                         "ds_gws_sema_v" => self.line("uint old; tb_gds.InterlockedAdd(addr, 1u, old);"),
                         name => {
@@ -296,6 +339,7 @@ impl Emitter<'_> {
                     }
                     self.emit_insn(i, ins, false, None)?;
                 }
+                "ds_add_u32" if is_gds(ins) => self.emit_gds(ins)?,
                 op if op.starts_with("v_cmpx_") => {
                     for operand in ins.src.iter().chain(&ins.dst) {
                         self.touch(operand);
@@ -304,7 +348,7 @@ impl Emitter<'_> {
                 }
                 op => return Err(format!("{op} is outside the cooperative GWS instruction subset")),
             }
-            self.line(&format!("if ((gtid.x & 31u) == 0u) {{ tb_gws_pc[tb_gws_turn] = {target}; tb_gws_progress = 1u; }} }}"));
+            self.line(&format!("if ((tb_gws_lane & 31u) == 0u) {{ tb_gws_pc[tb_gws_turn] = {target}; tb_gws_progress = 1u; }} }}"));
         }
         self.line("}");
         self.line("AllMemoryBarrierWithGroupSync();");
@@ -321,66 +365,97 @@ impl Emitter<'_> {
 #[derive(Clone, Copy)]
 pub(super) enum Mode {
     Fused(u32),
-    Phased(u32),
+    Phased,
 }
 
 impl Mode {
     pub(super) fn groups(self) -> u32 {
         match self {
-            Self::Fused(x) | Self::Phased(x) => x,
+            Self::Fused(x) => x,
+            Self::Phased => TB_GWS_MAX_GROUPS,
         }
     }
 
     pub(super) fn phased(self) -> bool {
-        matches!(self, Self::Phased(_))
+        matches!(self, Self::Phased)
     }
 }
 
-// The fixed per-lane stride covers 256 VGPRs, 128 SGPRs and scalar control registers.
-const CHECKPOINT_DWORDS: u32 = 400;
-
-pub(super) fn scratch_bytes(groups: u32) -> u32 {
-    4 * (1 + 3 * groups + groups * 32 * CHECKPOINT_DWORDS)
+pub(super) fn workgroup_threads([_, x, y, z]: [u32; 4]) -> u32 {
+    x.saturating_mul(y).saturating_mul(z)
 }
 
 impl Emitter<'_> {
-    /// One physical workgroup advances by one instruction per phase. Only the group
-    /// named in the immutable root constant may touch shared dispatch state.
-    pub(super) fn checkpoint_phased_gws(&self, groups: u32) -> Result<String, String> {
+    pub(super) fn phased_dispatch_prefix(&self) -> String {
+        let waves_per_group = workgroup_threads(self.ex.isa_preamble) / 32;
+        let end = self.insns.len();
+        let sema_epoch = tb_gds_byte_offset(TB_GWS_RELEASE_DWORD - TB_GWS_TABLE_DWORD);
+        let barrier_epoch = tb_gds_byte_offset(TB_GWS_BARRIER_DWORD - TB_GWS_TABLE_DWORD);
+        format!(r#"
+uint tb_gws_selected = tb_gws_control & 255u;
+bool tb_gws_routed = (tb_gws_control >> 8u) == 0u;
+uint tb_gws_shape = tb_gws_routed ? tb_gws_scratch.Load(0u) : tb_gws_control;
+uint tb_gws_waves = ((tb_gws_shape >> 8u) & 255u) * (tb_gws_routed ? {waves_per_group}u : 1u);
+if (tb_gws_selected >= tb_gws_waves || tb_gws_waves > TB_GWS_WAVES) return;
+uint tb_gws_pc_offset = 8u + 4u * tb_gws_selected;
+uint tb_gws_wait_key = tb_gws_scratch.Load(tb_gws_pc_offset + 4u * tb_gws_waves);
+if (tb_gws_wait_key == 0u && tb_gws_scratch.Load(tb_gws_pc_offset) >= {end}u) return;
+if (tb_gws_wait_key != 0u) {{
+    bool at_barrier = (tb_gws_wait_key & 1u) != 0u;
+    uint address = tb_gws_wait_key & ~1u;
+    uint saved_epoch = tb_gws_scratch.Load(tb_gws_pc_offset + 12u * tb_gws_waves);
+    uint epoch = tb_gds.Load(address + (at_barrier ? {barrier_epoch}u : {sema_epoch}u));
+    if (epoch == saved_epoch && (at_barrier || (tb_gds.Load(address) & {TB_GWS_COUNTER_MASK}u) == 0u)) return;
+}}
+uint tb_gws_group = tb_gws_selected / {waves_per_group}u;
+uint tb_gws_groups_x = (tb_gws_shape >> 16u) & 255u;
+uint tb_gws_groups_y = tb_gws_shape >> 24u;
+uint tb_gws_group_row = tb_gws_group / tb_gws_groups_x;
+gid = uint3(tb_gws_group % tb_gws_groups_x, tb_gws_group_row % tb_gws_groups_y, tb_gws_group_row / tb_gws_groups_y);
+"#)
+    }
+
+    /// One guest wave advances by one instruction per phase. The entire physical
+    /// workgroup participates in group barriers, including any inactive sibling wave.
+    pub(super) fn checkpoint_phased_gws(&self) -> Result<String, String> {
         use core::fmt::Write;
         let registers = ["exec_lo", "exec_hi", "vcc_lo", "vcc_hi", "scc", "m0"]
             .into_iter()
             .chain(self.regs.iter().map(String::as_str))
             .collect::<Vec<_>>();
-        if self.vreg_array || registers.len() > CHECKPOINT_DWORDS as usize {
+        if self.vreg_array || registers.len() > TB_GWS_CHECKPOINT_DWORDS as usize {
             return Err("phased GWS register checkpoint exceeds its supported layout".into());
         }
         let mut h = String::new();
-        let _ = writeln!(h, "if (gid.x != tb_gws_selected || gid.x >= {groups}u) return;");
-        let _ = writeln!(h, "uint tb_gws_slot = 4u * ({}u + (gid.x * 32u + gtid.x) * {CHECKPOINT_DWORDS}u);", 1 + 3 * groups);
-        h.push_str("if (gtid.x == 0u) tb_gws_next_ticket = tb_gws_scratch.Load(0u);\n");
-        let arrays = ["tb_gws_pc", "tb_gws_pending", "tb_gws_ticket"];
-        let _ = writeln!(h, "if (gtid.x < {groups}u) {{");
+        let threads = workgroup_threads(self.ex.isa_preamble);
+        let waves_per_group = threads / 32;
+        let _ = writeln!(h, "bool tb_gws_selected_lane = (tb_gws_lane >> 5u) == tb_gws_selected % {waves_per_group}u;");
+        let _ = writeln!(h, "uint tb_gws_slot = 4u * (2u + 4u * tb_gws_waves + (tb_gws_group * {threads}u + tb_gws_lane) * {TB_GWS_CHECKPOINT_DWORDS}u);");
+        h.push_str("if (tb_gws_lane == 0u) tb_gws_next_ticket = tb_gws_scratch.Load(4u);\n");
+        let arrays = ["tb_gws_pc", "tb_gws_pending", "tb_gws_ticket", "tb_gws_release"];
+        h.push_str("if (tb_gws_lane < tb_gws_waves) {\n");
         for (i, array) in arrays.iter().enumerate() {
-            let offset = 4 * (1 + i as u32 * groups);
-            let _ = writeln!(h, "{array}[gtid.x] = tb_gws_scratch.Load({offset}u + 4u * gtid.x);");
+            let offset = 4 * i;
+            let _ = writeln!(h, "{array}[tb_gws_lane] = tb_gws_scratch.Load(8u + {offset}u * tb_gws_waves + 4u * tb_gws_lane);");
         }
-        h.push_str("}\nif (tb_gws_scratch.Load(4u + 4u * gid.x) != 0u) {\n");
+        h.push_str("}\nif (tb_gws_selected_lane && tb_gws_scratch.Load(8u + 4u * tb_gws_selected) != 0u) {\n");
         for (i, register) in registers.iter().enumerate() {
             let _ = writeln!(h, "{register} = tb_gws_scratch.Load(tb_gws_slot + {}u);", 4 * i);
         }
         h.push_str("}\n");
         h.push_str(&self.body);
-        h.push_str("if (gtid.x == 0u) tb_gws_scratch.Store(0u, tb_gws_next_ticket);\n");
-        let _ = writeln!(h, "if (gtid.x < {groups}u) {{");
+        h.push_str("if (tb_gws_lane == 0u) tb_gws_scratch.Store(4u, tb_gws_next_ticket);\n");
+        h.push_str("if (tb_gws_lane < tb_gws_waves) {\n");
         for (i, array) in arrays.iter().enumerate() {
-            let offset = 4 * (1 + i as u32 * groups);
-            let _ = writeln!(h, "tb_gws_scratch.Store({offset}u + 4u * gtid.x, {array}[gtid.x]);");
+            let offset = 4 * i;
+            let _ = writeln!(h, "tb_gws_scratch.Store(8u + {offset}u * tb_gws_waves + 4u * tb_gws_lane, {array}[tb_gws_lane]);");
         }
         h.push_str("}\n");
+        h.push_str("if (tb_gws_selected_lane) {\n");
         for (i, register) in registers.iter().enumerate() {
             let _ = writeln!(h, "tb_gws_scratch.Store(tb_gws_slot + {}u, {register});", 4 * i);
         }
+        h.push_str("}\n");
         Ok(h)
     }
 }

@@ -394,14 +394,20 @@ fn hw_gds_round_trip_through_the_shader_binding() {
 }
 
 fn gws_shader_fixture(opcode: u32, resource: u32) -> Vec<u8> {
-    // Synthetic Xbox compute container with one global wave sync instruction.
-    let isa = [
-        0xd580_0000u32, 0x03fe_0000, 0, // VOP3 nop, including the literal operand
+    gws_shader_code(&[
         0x7e00_0289, // v_mov_b32 v0, 9 (next barrier count)
         0xd800_0000 | (opcode << 18) | (1 << 17) | resource, 0,
         0xbf81_0000,
-    ];
-    let section = [16, 32, 1, 1].into_iter().chain(isa).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+    ])
+}
+
+fn gws_shader_code(isa: &[u32]) -> Vec<u8> {
+    gws_shader_code_with_shape(isa, [32, 1, 1])
+}
+
+fn gws_shader_code_with_shape(isa: &[u32], [x, y, z]: [u32; 3]) -> Vec<u8> {
+    let preamble = [16, x, y, z, 0xd580_0000, 0x03fe_0000, 0];
+    let section = preamble.into_iter().chain(isa.iter().copied()).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
     let mut fssm = vec![0u8; 0x100];
     fssm[..4].copy_from_slice(b"FSSM");
     fssm[0xc0..0xc4].copy_from_slice(&0x100u32.to_le_bytes());
@@ -422,6 +428,446 @@ fn gws_shader_fixture(opcode: u32, resource: u32) -> Vec<u8> {
     dxbc[40..44].copy_from_slice(&(dxil.len() as u32).to_le_bytes());
     dxbc.extend_from_slice(&dxil);
     dxbc
+}
+
+unsafe fn gws_test_signature(dev: *mut c_void, opcode: u32, stride: u32) -> *mut c_void {
+    const IID_SIGNATURE: Guid = Guid {
+        d1: 0xc36a797c, d2: 0xec80, d3: 0x4f0a,
+        d4: [0x89, 0x85, 0xa7, 0xb2, 0x47, 0x50, 0x82, 0xd1],
+    };
+    let args = [opcode, 0, 0, 0];
+    let desc = [u64::from(stride) | (1 << 32), args.as_ptr() as u64, 0];
+    let mut signature = core::ptr::null_mut();
+    let hr = call!(dev, 41, (*const u64, *mut c_void, *const Guid, *mut *mut c_void) -> i32,
+        desc.as_ptr(), core::ptr::null_mut(), &IID_SIGNATURE, &mut signature);
+    assert!(hr >= 0 && !signature.is_null(), "command signature hr={hr:#010x}");
+    signature
+}
+
+#[test]
+#[ignore = "needs D3D12 and DXC; set TOMBOX_HW_ADAPTER=warp for WARP"]
+fn hw_gws_indirect_signature_preserves_gpu_execution_time_arguments() {
+    let g = gpu();
+    unsafe {
+        let dev = crate::device_wrap::wrap_device(g.dev as *mut c_void);
+        let mut signature = core::ptr::null_mut();
+        for (opcode, stride, expected) in [(0, 16, None), (2, 12, Some(12)), (105, 16, Some(16))] {
+            signature = gws_test_signature(dev, opcode, stride);
+            assert_eq!(crate::gws_dispatch::indirect_stride(signature), expected);
+            if opcode != 105 {
+                call!(signature, 2, () -> u32);
+            }
+        }
+
+        let hlsl = r#"
+            RWByteAddressBuffer output : register(u0);
+            [RootSignature("UAV(u0)")]
+            [numthreads(1,1,1)]
+            void main(uint3 gid : SV_GroupID) {
+                uint old;
+                output.InterlockedMax(0, gid.x + 1, old);
+                output.InterlockedMax(4, gid.y + 1, old);
+                output.InterlockedMax(8, gid.z + 1, old);
+            }
+        "#;
+        let (root, pso) = compute_pso(g.dev, hlsl, None);
+        let args = buffer(g.dev, HEAP_UPLOAD, 256, 0, ST_GENERIC_READ);
+        let indirect_args = buffer(g.dev, HEAP_DEFAULT, 256, 0, ST_COPY_DEST);
+        let output = buffer(g.dev, HEAP_DEFAULT, 256, FLAG_UAV, ST_COPY_DEST);
+        let readback = buffer(g.dev, HEAP_READBACK, 256, 0, ST_COPY_DEST);
+        args.cpu.add(64).write_bytes(0, 12);
+
+        let list = title_list(g.dev);
+        let raw = crate::cmdlist_wrap::unwrap(list);
+        call!(list, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (), indirect_args.res, 16, args.res, 16, 20);
+        const INDIRECT_ARGUMENT: u32 = 0x200;
+        crate::fill::barrier_pub(raw, indirect_args.res, ST_COPY_DEST, INDIRECT_ARGUMENT);
+        call!(list, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (), output.res, 0, args.res, 64, 12);
+        crate::fill::barrier_pub(raw, output.res, ST_COPY_DEST, 8);
+        call!(list, X_SET_COMPUTE_ROOT_SIGNATURE, (*mut c_void) -> (), root);
+        call!(list, X_SET_PSO, (*mut c_void) -> (), pso);
+        call!(list, X_SET_COMPUTE_ROOT_UAV, (u32, u64) -> (), 0, output.va);
+        call!(list, 59, (*mut c_void, u32, usize, u64, usize, u64) -> (), signature, 1, indirect_args.res, 16, indirect_args.res, 32);
+        crate::fill::barrier_pub(raw, indirect_args.res, INDIRECT_ARGUMENT, ST_COPY_DEST);
+        crate::fill::barrier_pub(raw, output.res, 8, ST_COPY_SOURCE);
+        call!(list, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (), readback.res, 0, output.res, 0, 12);
+        crate::fill::barrier_pub(raw, output.res, ST_COPY_SOURCE, ST_COPY_DEST);
+        assert!(call!(list, X_CLOSE, () -> i32) >= 0);
+
+        let f = fence(g.dev);
+        for (i, (groups, count, expected)) in [
+            ([3u32, 2, 1], 1u32, [3, 2, 1]),
+            ([4, 1, 1], 1, [4, 1, 1]),
+            ([2, 1, 1], 0, [0, 0, 0]),
+            ([0, 1, 1], 1, [0, 0, 0]),
+        ].into_iter().enumerate() {
+            args.cpu.add(16).cast::<[u32; 3]>().write(groups);
+            args.cpu.add(32).cast::<u32>().write(count);
+            let value = i as u64 + 1;
+            submit(g.a, list, f, value);
+            assert!(reached(f, value, Duration::from_secs(5)));
+            assert_eq!([rd(&readback, 0), rd(&readback, 4), rd(&readback, 8)], expected);
+        }
+        for obj in [signature, list, f, pso, root] {
+            call!(obj, 2, () -> u32);
+        }
+    }
+}
+
+
+#[test]
+#[ignore = "needs D3D12 and DXC with TOMBOX_GWS_PHASED=1 and TOMBOX_GWS_RESUME=1"]
+fn hw_gws_resume_between_closed_lists() {
+    if !crate::gws_dispatch::phased_enabled()
+        || std::env::var("TOMBOX_GWS_RESUME").as_deref() != Ok("1") {
+        return;
+    }
+    let g = gpu();
+    unsafe {
+        let dev = crate::device_wrap::wrap_device(g.dev as *mut c_void);
+        let code = tombox_xshader::dxc::compile(r#"[RootSignature("UAV(u0), RootConstants(num32BitConstants=2, b0)")] [numthreads(1,1,1)] void main() {}"#, "cs_6_0").unwrap();
+        let mut root = core::ptr::null_mut();
+        assert!(call!(dev, 16, (u32, *const u8, usize, *const Guid, *mut *mut c_void) -> i32,
+            0, code.as_ptr(), code.len(), &IID_ROOT_SIGNATURE, &mut root) >= 0);
+        let create_with_root = |root: *mut c_void, shader: Vec<u8>| {
+            let mut desc = [0u8; 56];
+            desc[..8].copy_from_slice(&(root as u64).to_le_bytes());
+            desc[8..16].copy_from_slice(&(shader.as_ptr() as u64).to_le_bytes());
+            desc[16..24].copy_from_slice(&(shader.len() as u64).to_le_bytes());
+            let mut pso = core::ptr::null_mut();
+            assert!(call!(dev, 11, (*const u8, *const Guid, *mut *mut c_void) -> i32,
+                desc.as_ptr(), &IID_PSO, &mut pso) >= 0);
+            pso
+        };
+        let create = |shader| create_with_root(root, shader);
+        use tombox_xshader::gds_abi::TB_GWS_TABLE_DWORD;
+        const GWS_INDEX: u32 = 31;
+        let ds = |op: u32| 0xd802_0000u32 | (op << 18) | GWS_INDEX;
+        let make_waiter = |marker: u32| create(gws_shader_code(&[
+            0xbefc_03ff, 0x400,
+            0x7e28_0281, 0x7e2a_0280,
+            ds(0x1c), 0,
+            0xd802_0000 | marker, 21 | (20 << 8),
+            0xbf81_0000,
+        ]));
+        let waiter = make_waiter(0x90);
+        let younger = make_waiter(0x94);
+        let unrelated = create(gws_shader_code(&[0xbf81_0000]));
+        let poster = create(gws_shader_fixture(0x1a, GWS_INDEX));
+        let releaser = create(gws_shader_fixture(0x18, GWS_INDEX));
+        let participant = create(gws_shader_code(&[
+            0xbefc_03ff, 0x400,
+            0x7e28_0281, 0x7e2a_0280,
+            ds(0x1d), 20,
+            0xd802_0090, 21 | (20 << 8),
+            0xbf81_0000,
+        ]));
+        let src = buffer(g.dev, HEAP_UPLOAD, 256, 0, ST_GENERIC_READ);
+        src.cpu.cast::<[u32; 2]>().write([0, 1]);
+        let output = buffer(g.dev, HEAP_DEFAULT, 256, 0, ST_COPY_DEST);
+        let readback = buffer(g.dev, HEAP_READBACK, 256, 0, ST_COPY_DEST);
+        let make_reader = |offset| {
+            let list = title_list(g.dev);
+            let raw = crate::cmdlist_wrap::unwrap(list);
+            crate::gds::copy(raw, false, 0x90 / 4, 2, output.va + offset, "read cross-list markers");
+            crate::fill::barrier_pub(raw, output.res, ST_COPY_DEST, ST_COPY_SOURCE);
+            call!(list, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (),
+                readback.res, offset, output.res, offset, 8);
+            crate::fill::barrier_pub(raw, output.res, ST_COPY_SOURCE, ST_COPY_DEST);
+            assert!(call!(list, X_CLOSE, () -> i32) >= 0);
+            raw
+        };
+        let record_with_target = |pso, groups, seed, target: Option<u64>| {
+            let list = title_list(g.dev);
+            let raw = crate::cmdlist_wrap::unwrap(list);
+            if seed {
+                let initial_count = if pso == participant { src.va + 4 } else { src.va };
+                crate::gds::copy(raw, true, TB_GWS_TABLE_DWORD + GWS_INDEX + 1, 1, src.va, "clear producer barrier");
+                crate::gds::copy(raw, true, TB_GWS_TABLE_DWORD + GWS_INDEX, 1, initial_count, "seed cross-list counter");
+                crate::gds::copy(raw, true, 0x90 / 4, 1, src.va, "clear older cross-list marker");
+                crate::gds::copy(raw, true, 0x94 / 4, 1, src.va, "clear younger cross-list marker");
+            }
+            call!(list, X_SET_COMPUTE_ROOT_SIGNATURE, (*mut c_void) -> (), root);
+            call!(list, X_SET_COMPUTE_ROOT_CONSTANT, (u32, u32, u32) -> (), 1, if seed { 19 } else { 43 }, 0);
+            if let Some(va) = target {
+                call!(list, 45, (u32, u64) -> (), 0, va);
+            }
+            call!(list, X_SET_PSO, (*mut c_void) -> (), pso);
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), groups, 1, 1);
+            assert!(call!(list, X_CLOSE, () -> i32) >= 0);
+            list
+        };
+        let record = |pso, groups, seed| record_with_target(pso, groups, seed, None);
+        let submit_batch = |queue: *mut c_void, lists: &[*mut c_void]| {
+            call!(queue, 10, (u32, *const *mut c_void) -> (), lists.len() as u32, lists.as_ptr());
+        };
+        let completed = fence(g.dev);
+        let mut value = 0;
+        for (first, second, groups, expected) in [
+            (waiter, unrelated, 2, 0),
+            (waiter, poster, 2, 32),
+            (waiter, releaser, 2, 64),
+            (participant, participant, 1, 64),
+        ] {
+            let queue = queue(g.dev as *mut c_void) as *mut c_void;
+            let lists = [
+                crate::cmdlist_wrap::unwrap(record(first, groups, true)),
+                crate::cmdlist_wrap::unwrap(record(unrelated, 1, false)),
+                crate::cmdlist_wrap::unwrap(record(second, 1, false)),
+                make_reader(0),
+            ];
+            for _ in 0..2 {
+                value += 1;
+                submit_batch(queue, &lists);
+                call!(queue, 14, (*mut c_void, u64) -> i32, completed, value);
+                assert!(reached(completed, value, Duration::from_secs(10)));
+                assert_eq!(rd(&readback, 0), expected,
+                    "the reader must see exactly the waves released by the preceding list");
+            }
+            call!(queue, 2, () -> u32);
+        }
+        let timeline_queue = queue(g.dev as *mut c_void) as *mut c_void;
+        let lists = [
+            crate::cmdlist_wrap::unwrap(record(waiter, 1, true)),
+            crate::cmdlist_wrap::unwrap(record(younger, 1, false)),
+            crate::cmdlist_wrap::unwrap(record(unrelated, 1, false)),
+            crate::cmdlist_wrap::unwrap(record(poster, 1, false)),
+            make_reader(0),
+            crate::cmdlist_wrap::unwrap(record(releaser, 1, false)),
+            make_reader(8),
+        ];
+        submit_batch(timeline_queue, &lists);
+        let queue = timeline_queue;
+        call!(queue, 14, (*mut c_void, u64) -> i32, completed, value + 1);
+        assert!(reached(completed, value + 1, Duration::from_secs(10)));
+        assert_eq!([rd(&readback, 0), rd(&readback, 4)], [32, 0],
+            "the first credit must resume only the older list");
+        assert_eq!([rd(&readback, 8), rd(&readback, 12)], [32, 32],
+            "release-all must resume the younger list without repeating the older wave");
+        call!(queue, 2, () -> u32);
+
+        let cooperative_release = create(gws_shader_code(&[
+            0x7e28_0280,                   // v20 = 0 for the one-wave barrier
+            ds(0x1d) + 1, 20,
+            ds(0x18), 0,
+            0xbf81_0000,
+        ]));
+        let separate = self::queue(g.dev as *mut c_void) as *mut c_void;
+        let waiting_list = record(waiter, 2, true);
+        submit_batch(separate, &[crate::cmdlist_wrap::unwrap(waiting_list)]);
+        value += 2;
+        call!(separate, 14, (*mut c_void, u64) -> i32, completed, value);
+        assert!(reached(completed, value, Duration::from_secs(10)));
+
+        let mut allocator = core::ptr::null_mut();
+        assert!(call!(g.dev, 9, (u32, *const Guid, *mut *mut c_void) -> i32,
+            0, &IID_ALLOCATOR, &mut allocator) >= 0);
+        assert!(call!(waiting_list, 10, (*mut c_void, *mut c_void) -> i32,
+            allocator, core::ptr::null_mut()) >= 0);
+        assert!(call!(waiting_list, X_CLOSE, () -> i32) >= 0);
+
+        let post = crate::cmdlist_wrap::unwrap(record(poster, 1, false));
+        let release = record(cooperative_release, 1, false);
+        for list in [post, make_reader(0), crate::cmdlist_wrap::unwrap(release), make_reader(8)] {
+            submit_batch(separate, &[list]);
+        }
+        value += 1;
+        call!(separate, 14, (*mut c_void, u64) -> i32, completed, value);
+        assert!(reached(completed, value, Duration::from_secs(10)));
+        assert_eq!(rd(&readback, 0), 32, "a separate post submission must wake one saved wave");
+        assert_eq!(rd(&readback, 8), 64, "cooperative release-all must wake the other wave after Reset");
+
+        let first = record(participant, 1, true);
+        let second = record(participant, 1, false);
+        for list in [crate::cmdlist_wrap::unwrap(first), make_reader(0),
+            crate::cmdlist_wrap::unwrap(second), make_reader(8)] {
+            submit_batch(separate, &[list]);
+        }
+        value += 1;
+        call!(separate, 14, (*mut c_void, u64) -> i32, completed, value);
+        assert!(reached(completed, value, Duration::from_secs(10)));
+        assert_eq!(rd(&readback, 0), 0, "the first barrier dispatch must remain blocked");
+        assert_eq!(rd(&readback, 8), 64, "the second submission must finish the earlier barrier");
+        call!(separate, 2, () -> u32);
+
+        let origin_queue = self::queue(g.dev as *mut c_void) as *mut c_void;
+        let signal_queue = self::queue(g.dev as *mut c_void) as *mut c_void;
+        let handoff = fence(g.dev);
+        let waiting = record(waiter, 2, true);
+        submit_batch(origin_queue, &[waiting]);
+        assert!(call!(origin_queue, 14, (*mut c_void, u64) -> i32, handoff, 2) >= 0);
+
+        // Waiting for an earlier value on the same title fence must not import
+        // the pending waves. CPU observation avoids racing the device GDS.
+        assert!(reached(handoff, 2, Duration::from_secs(10)));
+        assert!(call!(signal_queue, 15, (*mut c_void, u64) -> i32, handoff, 1) >= 0);
+        submit_batch(signal_queue, &[record(poster, 1, false), make_reader(0)]);
+        value += 1;
+        call!(signal_queue, 14, (*mut c_void, u64) -> i32, completed, value);
+        assert!(reached(completed, value, Duration::from_secs(10)));
+        assert_eq!(rd(&readback, 0), 0, "an earlier fence value must not transfer the waiter");
+        submit_batch(signal_queue, &[record(unrelated, 1, true)]);
+
+        assert!(call!(signal_queue, 15, (*mut c_void, u64) -> i32, handoff, 2) >= 0);
+        submit_batch(signal_queue, &[record(poster, 1, false), make_reader(0)]);
+        assert!(call!(signal_queue, 23, (*mut c_void, u64, u32) -> i32, handoff, 3, 0) >= 0);
+        assert!(call!(origin_queue, 15, (*mut c_void, u64) -> i32, handoff, 3) >= 0);
+        submit_batch(origin_queue, &[record(releaser, 1, false), make_reader(8)]);
+        value += 1;
+        call!(origin_queue, 14, (*mut c_void, u64) -> i32, completed, value);
+        assert!(reached(completed, value, Duration::from_secs(10)));
+        assert_eq!(rd(&readback, 0), 32, "the destination queue must resume exactly one wave");
+        assert_eq!(rd(&readback, 8), 64, "the return fence must transfer the remaining waiter back");
+        call!(handoff, 2, () -> u32);
+        call!(origin_queue, 2, () -> u32);
+        call!(signal_queue, 2, () -> u32);
+
+        const ROOT_MARKER: u32 = 0x51ab_1e7e;
+        let add_root = |mut shader: Vec<u8>, code: &[u8]| {
+            let container = tombox_xshader::Dxbc::parse(code).unwrap();
+            let rts = container.chunk(b"RTS0").unwrap();
+            shader.splice(36..36, [0; 4]);
+            let offset = shader.len() as u32;
+            shader.extend_from_slice(&code[rts.offset - 8..rts.offset + rts.size]);
+            let size = shader.len() as u32;
+            shader[24..28].copy_from_slice(&size.to_le_bytes());
+            shader[28..32].copy_from_slice(&2u32.to_le_bytes());
+            shader[32..36].copy_from_slice(&40u32.to_le_bytes());
+            shader[36..40].copy_from_slice(&offset.to_le_bytes());
+            shader
+        };
+        let shader = gws_shader_code(&[
+            ds(0x1c), 0,
+            0xf408_0200, 0xfa00_0000, // s_load_dwordx4 s[8:11], s[0:1], 0
+            0x3402_0082,              // v1 = v0 * 4
+            0x7e14_02ff, ROOT_MARKER,
+            0xe070_1000, 0x8002_0a01, // buffer_store_dword via the root UAV
+            0xbf81_0000,
+        ]);
+        let root_waiter = create(add_root(shader, &code));
+
+        let original = buffer(g.dev, HEAP_DEFAULT, 256, FLAG_UAV, 0x8);
+        let other = buffer(g.dev, HEAP_DEFAULT, 256, FLAG_UAV, 0x8);
+        let buffer_queue = self::queue(g.dev as *mut c_void) as *mut c_void;
+        let seed = buffer(g.dev, HEAP_UPLOAD, 256, 0, ST_GENERIC_READ);
+        seed.cpu.cast::<u32>().write(0x1234);
+        let init = title_list(g.dev);
+        let init_raw = crate::cmdlist_wrap::unwrap(init);
+        for target in [&original, &other] {
+            crate::fill::barrier_pub(init_raw, target.res, 0x8, ST_COPY_DEST);
+            call!(init, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (),
+                target.res, 0, seed.res, 0, 4);
+            crate::fill::barrier_pub(init_raw, target.res, ST_COPY_DEST, 0x8);
+        }
+        assert!(call!(init, X_CLOSE, () -> i32) >= 0);
+        let waiting = record_with_target(root_waiter, 1, true, Some(original.va));
+        submit_batch(buffer_queue, &[init, waiting]);
+        value += 1;
+        call!(buffer_queue, 14, (*mut c_void, u64) -> i32, completed, value);
+        assert!(reached(completed, value, Duration::from_secs(10)));
+        assert!(call!(waiting, 10, (*mut c_void, *mut c_void) -> i32, allocator, core::ptr::null_mut()) >= 0);
+        assert!(call!(waiting, X_CLOSE, () -> i32) >= 0);
+        submit_batch(buffer_queue, &[record_with_target(poster, 1, false, Some(other.va))]);
+
+        let read = title_list(g.dev);
+        let read_raw = crate::cmdlist_wrap::unwrap(read);
+        for (target, offset) in [(&original, 0), (&other, 4)] {
+            crate::fill::barrier_pub(read_raw, target.res, 0x8, ST_COPY_SOURCE);
+            call!(read, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (),
+                readback.res, offset, target.res, 0, 4);
+            crate::fill::barrier_pub(read_raw, target.res, ST_COPY_SOURCE, 0x8);
+        }
+        assert!(call!(read, X_CLOSE, () -> i32) >= 0);
+        submit_batch(buffer_queue, &[read]);
+        value += 1;
+        call!(buffer_queue, 14, (*mut c_void, u64) -> i32, completed, value);
+        assert!(reached(completed, value, Duration::from_secs(10)));
+        assert_eq!([rd(&readback, 0), rd(&readback, 4)], [ROOT_MARKER, 0x1234],
+            "the resumed wave must write through its own root UAV");
+
+        let waiting = record_with_target(root_waiter, 1, true, Some(original.va));
+        submit_batch(buffer_queue, &[init, waiting]);
+        let transition = |before: u32, after: u32| {
+            let list = title_list(g.dev);
+            let barrier = [0, original.res as u64, u64::from(u32::MAX) | (u64::from(before) << 32), u64::from(after)];
+            call!(list, X_BARRIER, (u32, *const u64) -> (), 1, barrier.as_ptr());
+            assert!(call!(list, X_CLOSE, () -> i32) >= 0);
+            submit_batch(buffer_queue, &[list]);
+        };
+        transition(0x8, ST_COPY_SOURCE);
+        submit_batch(buffer_queue, &[record_with_target(poster, 1, false, Some(other.va))]);
+        let blocked_read = title_list(g.dev);
+        call!(blocked_read, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (),
+            readback.res, 8, original.res, 0, 4);
+        assert!(call!(blocked_read, X_CLOSE, () -> i32) >= 0);
+        submit_batch(buffer_queue, &[blocked_read]);
+
+        transition(ST_COPY_SOURCE, 0x8);
+        submit_batch(buffer_queue, &[record_with_target(releaser, 1, false, Some(other.va)), read]);
+        value += 1;
+        call!(buffer_queue, 14, (*mut c_void, u64) -> i32, completed, value);
+        assert!(reached(completed, value, Duration::from_secs(10)));
+        assert_eq!(rd(&readback, 8), 0x1234, "the wave must remain blocked while the UAV is unavailable");
+        assert_eq!([rd(&readback, 0), rd(&readback, 4)], [ROOT_MARKER, 0x1234],
+            "restoring the UAV state must let the next signal resume the original wave");
+        let table_code = tombox_xshader::dxc::compile(
+            r#"[RootSignature("DescriptorTable(UAV(u0))")] [numthreads(1,1,1)] void main() {}"#,
+            "cs_6_0",
+        ).unwrap();
+        let mut table_root = core::ptr::null_mut();
+        assert!(call!(dev, 16, (u32, *const u8, usize, *const Guid, *mut *mut c_void) -> i32,
+            0, table_code.as_ptr(), table_code.len(), &IID_ROOT_SIGNATURE, &mut table_root) >= 0);
+        let table_shader = gws_shader_code(&[
+            ds(0x1c), 0,
+            0xf408_0202, 0xfa00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x3402_0082,
+            0x7e14_02ff, ROOT_MARKER,
+            0xe070_1000, 0x8002_0a01,
+            0xbf81_0000,
+        ]);
+        let table_waiter = create_with_root(table_root, add_root(table_shader, &table_code));
+        const IID_HEAP: Guid = Guid {
+            d1: 0x8efb471d, d2: 0x616c, d3: 0x4f49,
+            d4: [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        };
+        let mut heap = core::ptr::null_mut();
+        assert!(call!(dev, 14, (*const u32, *const Guid, *mut *mut c_void) -> i32,
+            [0, 128, 1, 0].as_ptr(), &IID_HEAP, &mut heap) >= 0);
+        let inc = u64::from(call!(dev, 15, (u32) -> u32, 0));
+        let cpu_handle = call!(heap, 9, () -> usize) + (96 * inc) as usize;
+        let gpu_handle = call!(heap, 10, () -> u64) + 96 * inc;
+        let uav = [39u32, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        let write_descriptor = |resource: usize| {
+            call!(dev, 19, (usize, usize, *const u32, usize) -> (),
+                resource, 0, uav.as_ptr(), cpu_handle);
+        };
+        write_descriptor(original.res);
+        let table_list = title_list(g.dev);
+        let raw = crate::cmdlist_wrap::unwrap(table_list);
+        crate::gds::copy(raw, true, TB_GWS_TABLE_DWORD + GWS_INDEX, 1, src.va,
+            "clear descriptor waiter semaphore");
+        call!(table_list, X_SET_COMPUTE_ROOT_SIGNATURE, (*mut c_void) -> (), table_root);
+        call!(table_list, 32, (u32, *const *mut c_void) -> (), 1, &heap);
+        call!(table_list, 35, (u32, u64) -> (), 0, gpu_handle);
+        call!(table_list, X_SET_PSO, (*mut c_void) -> (), table_waiter);
+        call!(table_list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+        assert!(call!(table_list, X_CLOSE, () -> i32) >= 0);
+        submit_batch(buffer_queue, &[init, table_list]);
+        value += 1;
+        call!(buffer_queue, 14, (*mut c_void, u64) -> i32, completed, value);
+        assert!(reached(completed, value, Duration::from_secs(10)));
+        write_descriptor(other.res);
+        assert!(call!(table_list, 10, (*mut c_void, *mut c_void) -> i32, allocator, core::ptr::null_mut()) >= 0);
+        assert!(call!(table_list, X_CLOSE, () -> i32) >= 0);
+        submit_batch(buffer_queue, &[record(poster, 1, false), read]);
+        value += 1;
+        call!(buffer_queue, 14, (*mut c_void, u64) -> i32, completed, value);
+        assert!(reached(completed, value, Duration::from_secs(10)));
+        assert_eq!([rd(&readback, 0), rd(&readback, 4)], [ROOT_MARKER, 0x1234],
+            "the resumed wave must use the descriptor saved before the heap was overwritten");
+        call!(heap, 2, () -> u32);
+        call!(buffer_queue, 2, () -> u32);
+    }
 }
 
 #[test]
@@ -453,6 +899,8 @@ fn hw_gws_compute_pso_selects_dispatch_variant() {
             crate::gds::note_root_signature(rs, 0);
             (rs, normal)
         };
+        let resume = phased && std::env::var("TOMBOX_GWS_RESUME").as_deref() == Ok("1");
+        let command_queue = if resume { queue(g.dev as *mut c_void) } else { g.a };
         let list = title_list(g.dev);
         let mut desc = [0u8; 56];
         desc[0..8].copy_from_slice(&(rs as u64).to_le_bytes());
@@ -487,7 +935,7 @@ fn hw_gws_compute_pso_selects_dispatch_variant() {
         call!(list, X_SET_COMPUTE_ROOT_SIGNATURE, (*mut c_void) -> (), rs);
         // Credits must survive a guest dispatch boundary and a compute PSO switch.
         call!(list, X_SET_PSO, (*mut c_void) -> (), producer);
-        call!(list, X_DISPATCH, (u32, u32, u32) -> (), 12, 1, 1);
+        call!(list, X_DISPATCH, (u32, u32, u32) -> (), 64, 1, 1);
         let uav_barrier = [2u64, 0, 0, 0];
         call!(list, X_BARRIER, (u32, *const u64) -> (), 1, uav_barrier.as_ptr());
         call!(list, X_SET_PSO, (*mut c_void) -> (), pso);
@@ -503,8 +951,328 @@ fn hw_gws_compute_pso_selects_dispatch_variant() {
             barrier[..4].copy_from_slice(&2u32.to_le_bytes());
             call!(list, X_BARRIER, (u32, *const u8) -> (), 1, barrier.as_ptr());
         }
+        let mut indirect_inputs = None;
+        if phased {
+            let upload = buffer(g.dev, HEAP_UPLOAD, 256, 0, ST_GENERIC_READ);
+            let commands = buffer(g.dev, HEAP_DEFAULT, 256, 0, ST_COPY_DEST);
+            let signature = gws_test_signature(dev, 105, 16);
+            let data = [
+                2u32, 1, 1, 0, // valid DispatchX
+                4, 1, 1, 0, // disabled by the count buffer
+                3, 2, 1, 0, // multidimensional phased dispatch
+                0, 1, 1, 0, // zero groups
+            ];
+            core::ptr::copy_nonoverlapping(data.as_ptr(), upload.cpu.cast(), data.len());
+            upload.cpu.add(64).cast::<[u32; 4]>().write([4, 3, 2, 0]);
+            core::ptr::write_volatile(upload.cpu.add(80).cast::<u32>(), 0);
+            let batch = [3u32, 1, 1, 0, 5, 1, 1, 0, 2, 1, 1, 0];
+            core::ptr::copy_nonoverlapping(batch.as_ptr(), upload.cpu.add(96).cast(), batch.len());
+            upload.cpu.add(144).cast::<[u32; 4]>().write([1, 1, 1, 0]);
+            core::ptr::write_volatile(upload.cpu.add(160).cast::<u32>(), 2);
+            upload.cpu.add(176).cast::<[u32; 4]>().write([2, 1, 1, 0]);
+            upload.cpu.add(192).cast::<[u32; 4]>().write([1, 1, 1, 0]);
+            upload.cpu.add(208).cast::<[u32; 2]>().write([0, 1]);
+            upload.cpu.add(224).cast::<[u32; 4]>().write([5, 1, 1, 0]);
+            upload.cpu.add(240).cast::<[u32; 4]>().write([4, 2, 2, 0]);
+            call!(list, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (), commands.res, 0, upload.res, 0, 256);
+            let mut transition = [0u64; 4];
+            transition[1] = commands.res as u64;
+            transition[2] = u64::from(u32::MAX) | (u64::from(ST_COPY_DEST) << 32);
+            transition[3] = 0x200;
+            call!(list, X_BARRIER, (u32, *const u64) -> (), 1, transition.as_ptr());
+            for (offset, counted) in [(0, false), (16, true), (32, false), (48, false), (64, false), (224, false)] {
+                let count = if counted { commands.res } else { 0 };
+                call!(list, 59, (*mut c_void, u32, usize, u64, usize, u64) -> (),
+                    signature, 1, commands.res, offset, count, 80);
+                call!(list, X_BARRIER, (u32, *const u64) -> (), 1, uav_barrier.as_ptr());
+            }
+            call!(list, 59, (*mut c_void, u32, usize, u64, usize, u64) -> (),
+                signature, 3, commands.res, 96, commands.res, 160);
+            call!(list, X_BARRIER, (u32, *const u64) -> (), 1, uav_barrier.as_ptr());
+            indirect_inputs = Some((upload, commands, signature));
+        }
         call!(list, X_SET_PSO, (*mut c_void) -> (), barrier_pso);
         call!(list, X_DISPATCH, (u32, u32, u32) -> (), barrier_groups, 1, 1);
+        if let Some((upload, commands, signature)) = &indirect_inputs {
+            crate::gds::copy(raw, true, counter + 1, 1, upload.va + 192, "seed indirect GWS barrier");
+            call!(list, 59, (*mut c_void, u32, usize, u64, usize, u64) -> (),
+                *signature, 1, commands.res, 176, 0, 0);
+        }
+        if resume {
+            const MARKER: u32 = 0x5ab;
+            let ds = |op: u32, res: u32| 0xd802_0000 | (op << 18) | res;
+            let waiter = gws_shader_code(&[
+                0x7e28_02ff, MARKER,                   // v_mov_b32 v20, literal
+                ds(0x1a, RESOURCE + 4), 0,            // side effect before the wait
+                ds(0x1c, RESOURCE + 2), 0,
+                ds(0x1b, RESOURCE + 3), 20 << 8,      // add the saved v20 after waking
+                0xbf81_0000,
+            ]);
+            let poster = gws_shader_fixture(0x1a, RESOURCE + 2);
+            let release = gws_shader_fixture(0x18, RESOURCE + 2);
+            let mut create = |shader: &[u8]| {
+                desc[8..16].copy_from_slice(&(shader.as_ptr() as u64).to_le_bytes());
+                desc[16..24].copy_from_slice(&(shader.len() as u64).to_le_bytes());
+                let mut pso = core::ptr::null_mut();
+                let hr = call!(dev, 11, (*const u8, *const Guid, *mut *mut c_void) -> i32,
+                    desc.as_ptr(), &IID_PSO, &mut pso);
+                assert!(hr >= 0 && !pso.is_null(), "cross-dispatch fixture PSO hr={hr:#010x}");
+                pso
+            };
+            let waiter_pso = create(&waiter);
+            let poster_pso = create(&poster);
+            let release_pso = create(&release);
+            src.cpu.add(32).write_bytes(0, 12);
+            crate::gds::copy(raw, true, counter + 2, 3, src.va + 32, "seed cross-dispatch test");
+            call!(list, X_SET_PSO, (*mut c_void) -> (), waiter_pso);
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), 2, 1, 1);
+            let (_, commands, signature) = indirect_inputs.as_ref().unwrap();
+            let unrelated = create(&gws_shader_code(&[0xbf81_0000]));
+            call!(list, X_SET_PSO, (*mut c_void) -> (), unrelated);
+            for _ in 0..3 {
+                call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+                call!(list, 59, (*mut c_void, u32, usize, u64, usize, u64) -> (),
+                    *signature, 1, commands.res, 192, 0, 0);
+            }
+            crate::gds::copy(raw, false, counter + 3, 1, dst.va + 132, "read marker before late post");
+            call!(list, X_SET_PSO, (*mut c_void) -> (), poster_pso);
+            for (count_offset, readback_offset) in [(208, 20), (212, 24)] {
+                call!(list, 59, (*mut c_void, u32, usize, u64, usize, u64) -> (),
+                    *signature, 1, commands.res, 192, commands.res, count_offset);
+                crate::gds::copy(raw, false, counter + 3, 1, dst.va + readback_offset, "read marker after indirect producer");
+            }
+            crate::gds::copy(raw, true, counter + 3, 1, src.va + 32, "clear indirect marker before direct producer");
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+            crate::gds::copy(raw, false, counter + 2, 3, dst.va + 8, "read post results");
+
+            crate::gds::copy(raw, true, counter + 2, 3, src.va + 32, "seed release-all test");
+            call!(list, X_SET_PSO, (*mut c_void) -> (), release_pso);
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+            call!(list, X_BARRIER, (u32, *const u64) -> (), 1, uav_barrier.as_ptr());
+            call!(list, X_SET_PSO, (*mut c_void) -> (), waiter_pso);
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), 2, 1, 1);
+            crate::gds::copy(raw, false, counter + 3, 1, dst.va + 28, "read marker after early release");
+            call!(list, X_SET_PSO, (*mut c_void) -> (), release_pso);
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+            crate::gds::copy(raw, false, counter + 2, 2, dst.va + 32, "read release-all results");
+
+            let barrier_shader = |marker, resource| gws_shader_code(&[
+                0x7e28_02ff, marker,
+                0x7e00_0283, // v_mov_b32 v0, 3 (four waves in the next generation)
+                ds(0x1d, RESOURCE + 5), 0,
+                ds(0x19, resource), 20 << 8,
+                0xbf81_0000,
+            ]);
+            let first = create(&barrier_shader(0x321, RESOURCE + 6));
+            let second = create(&barrier_shader(0x654, RESOURCE + 7));
+            src.cpu.add(48).cast::<[u32; 3]>().write([1, 0, 0]);
+            crate::gds::copy(raw, true, counter + 5, 3, src.va + 48, "seed two-wave cross-dispatch barrier");
+            call!(list, X_SET_PSO, (*mut c_void) -> (), first);
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+            crate::gds::copy(raw, false, counter + 6, 1, dst.va + 40, "read marker before last barrier arrival");
+            call!(list, X_SET_PSO, (*mut c_void) -> (), second);
+            call!(list, 59, (*mut c_void, u32, usize, u64, usize, u64) -> (),
+                *signature, 1, commands.res, 192, 0, 0);
+            crate::gds::copy(raw, false, counter + 6, 2, dst.va + 44, "read direct and indirect barrier participants");
+
+            let batch_barrier = create(&gws_shader_code(&[
+                0xbefc_03ff, 0x400,                 // s_mov_b32 m0, 0x400 (GDS size)
+                0x7e28_0281, 0x7e2a_0280,           // v20 = 1, v21 = 0
+                ds(0x1d, RESOURCE + 5), 0,
+                ds(0x00, 0x80), 21 | (20 << 8),     // ds_add_u32 v21, v20 offset:0x80 gds
+                0xbf81_0000,
+            ]));
+            src.cpu.add(64).cast::<u32>().write(7);
+            crate::gds::copy(raw, true, counter + 5, 1, src.va + 64, "seed eight-wave indirect barrier");
+            crate::gds::copy(raw, true, 0x80 / 4, 1, src.va + 32, "clear indirect barrier lane counter");
+            call!(list, X_SET_PSO, (*mut c_void) -> (), batch_barrier);
+            call!(list, 59, (*mut c_void, u32, usize, u64, usize, u64) -> (),
+                *signature, 2, commands.res, 96, 0, 0);
+            crate::gds::copy(raw, false, 0x80 / 4, 1, dst.va + 76, "read indirect barrier lane counter");
+
+            for (count_offset, readback_offset) in [(208, 52), (212, 64)] {
+                crate::gds::copy(raw, true, counter + 2, 3, src.va + 32, "seed indirect waiter");
+                call!(list, X_SET_PSO, (*mut c_void) -> (), waiter_pso);
+                call!(list, 59, (*mut c_void, u32, usize, u64, usize, u64) -> (),
+                    *signature, 1, commands.res, 224, commands.res, count_offset);
+                call!(list, X_SET_PSO, (*mut c_void) -> (), poster_pso);
+                call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+                crate::gds::copy(raw, false, counter + 2, 3, dst.va + readback_offset, "read indirect waiter");
+            }
+
+            let fifo_waiter = |output_byte| gws_shader_code(&[
+                0xbefc_03ff, 0x400,
+                0x7e28_0281, 0x7e2a_0280,
+                ds(0x1c, RESOURCE + 2), 0,
+                ds(0x00, output_byte), 21 | (20 << 8),
+                0xbf81_0000,
+            ]);
+            let older = create(&fifo_waiter(0x84));
+            let younger = create(&fifo_waiter(0x88));
+            let queue_both = |direct_groups, indirect_offset| {
+                crate::gds::copy(raw, true, counter + 2, 1, src.va + 32, "clear FIFO semaphore");
+                crate::gds::copy(raw, true, 0x84 / 4, 2, src.va + 32, "clear FIFO lane counters");
+                call!(list, X_SET_PSO, (*mut c_void) -> (), older);
+                call!(list, X_DISPATCH, (u32, u32, u32) -> (), direct_groups, 1, 1);
+                call!(list, X_SET_PSO, (*mut c_void) -> (), younger);
+                call!(list, 59, (*mut c_void, u32, usize, u64, usize, u64) -> (),
+                    *signature, 1, commands.res, indirect_offset, commands.res, 212);
+            };
+            queue_both(2, 224);
+            call!(list, X_SET_PSO, (*mut c_void) -> (), poster_pso);
+            for offset in [80, 88, 96] {
+                call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+                crate::gds::copy(raw, false, 0x84 / 4, 2, dst.va + offset, "read FIFO lane counters");
+            }
+            call!(list, X_SET_PSO, (*mut c_void) -> (), release_pso);
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+            queue_both(2, 224);
+            call!(list, X_SET_PSO, (*mut c_void) -> (), release_pso);
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+            crate::gds::copy(raw, false, 0x84 / 4, 2, dst.va + 104, "read release-all FIFO counters");
+            crate::gds::copy(raw, false, counter + 2, 1, dst.va + 112, "read credits after release-all");
+
+            queue_both(1, 192);
+            call!(list, X_SET_PSO, (*mut c_void) -> (), poster_pso);
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+            crate::gds::copy(raw, false, 0x84 / 4, 2, dst.va + 116, "read one-group waiters after post");
+            call!(list, X_SET_PSO, (*mut c_void) -> (), release_pso);
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+            crate::gds::copy(raw, false, 0x84 / 4, 2, dst.va + 124, "read one-group waiters after release-all");
+
+            let mixed = create(&gws_shader_code(&[
+                0x7e28_0281,                  // v20 = 1
+                ds(0x1d, RESOURCE + 5), 20,    // two-wave barrier
+                ds(0x1c, RESOURCE + 2), 0,     // one semaphore credit for two waves
+                ds(0x1b, RESOURCE + 6), 20 << 8,
+                0xbf81_0000,
+            ]));
+            src.cpu.add(72).cast::<u32>().write(1);
+            crate::gds::copy(raw, true, counter + 2, 1, src.va + 72, "seed mixed semaphore");
+            crate::gds::copy(raw, true, counter + 5, 1, src.va + 72, "seed mixed barrier");
+            crate::gds::copy(raw, true, counter + 6, 1, src.va + 32, "clear mixed marker");
+            call!(list, X_SET_PSO, (*mut c_void) -> (), mixed);
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), 2, 1, 1);
+            crate::gds::copy(raw, false, counter + 6, 1, dst.va + 136, "read marker after mixed dispatch");
+            call!(list, X_SET_PSO, (*mut c_void) -> (), release_pso);
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+            crate::gds::copy(raw, false, counter + 6, 1, dst.va + 140, "read marker after mixed release");
+
+            let cooperative_release = create(&gws_shader_code(&[
+                0x7e28_0280,                  // v20 = 0
+                ds(0x1d, RESOURCE + 5), 20,    // single-wave barrier
+                ds(0x18, RESOURCE + 2), 0,
+                0xbf81_0000,
+            ]));
+            for (indirect_release, snapshot) in [(false, 144), (true, 152)] {
+                crate::gds::copy(raw, true, counter + 5, 1, src.va + 32, "seed cooperative release barrier");
+                crate::gds::copy(raw, true, counter + 2, 1, src.va + 32, "clear cooperative release semaphore");
+                crate::gds::copy(raw, true, 0x84 / 4, 1, src.va + 32, "clear cooperative release marker");
+                call!(list, X_SET_PSO, (*mut c_void) -> (), older);
+                call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+                crate::gds::copy(raw, false, 0x84 / 4, 1, dst.va + snapshot, "read before cooperative release");
+                call!(list, X_SET_PSO, (*mut c_void) -> (), cooperative_release);
+                if indirect_release {
+                    call!(list, 59, (*mut c_void, u32, usize, u64, usize, u64) -> (),
+                        *signature, 1, commands.res, 192, 0, 0);
+                } else {
+                    call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+                }
+                crate::gds::copy(raw, false, 0x84 / 4, 1, dst.va + snapshot + 4, "read after cooperative release");
+            }
+
+            let between_rows_waiter = create(&gws_shader_code(&[
+                ds(0x1c, RESOURCE + 2), 0,
+                ds(0x1a, RESOURCE + 7), 0,
+                ds(0x1a, RESOURCE + 8), 0,
+                0xbf81_0000,
+            ]));
+            let resetting_release = create(&gws_shader_code(&[
+                0x7e28_0280,                  // v20 = 0
+                ds(0x1d, RESOURCE + 5), 20,
+                ds(0x19, RESOURCE + 7), 20 << 8,
+                ds(0x1a, RESOURCE + 9), 0,
+                ds(0x18, RESOURCE + 2), 0,
+                0xbf81_0000,
+            ]));
+            src.cpu.add(76).cast::<u32>().write(6);
+            for (records, args_offset, count_buffer, count_offset, snapshot) in [
+                (2, 176, commands.res, 208, 160),
+                (2, 176, commands.res, 212, 172),
+                (2, 176, 0, 0, 184),
+                (4, 96, 0, 0, 196),
+            ] {
+                crate::gds::copy(raw, true, counter + 2, 1, src.va + 32, "clear batch semaphore");
+                crate::gds::copy(raw, true, counter + 5, 1, src.va + 32, "seed batch barrier");
+                crate::gds::copy(raw, true, counter + 7, 1, src.va + 76, "seed batch observation");
+                crate::gds::copy(raw, true, counter + 8, 2, src.va + 32, "clear batch wake and producer counts");
+                call!(list, X_SET_PSO, (*mut c_void) -> (), between_rows_waiter);
+                if records == 4 {
+                    call!(list, 59, (*mut c_void, u32, usize, u64, usize, u64) -> (),
+                        *signature, 1, commands.res, 192, 0, 0);
+                } else {
+                    call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+                }
+                call!(list, X_SET_PSO, (*mut c_void) -> (), resetting_release);
+                call!(list, 59, (*mut c_void, u32, usize, u64, usize, u64) -> (),
+                    *signature, records, commands.res, args_offset, count_buffer, count_offset);
+                crate::gds::copy(raw, false, counter + 7, 3, dst.va + snapshot, "read batch observation and counts");
+            }
+
+            let two_wave_waiter = create(&gws_shader_code_with_shape(&[
+                0xbefc_03ff, 0x400,                 // s_mov_b32 m0, 0x400 (GDS size)
+                0x7e28_0281, 0x7e2a_0280,           // v20 = 1, v21 = 0
+                ds(0x1c, RESOURCE + 2), 0,
+                ds(0x00, 0x8c), 21 | (20 << 8),
+                0xbf81_0000,
+            ], [8, 4, 2]));
+            for (routed, snapshot) in [(false, 208), (true, 220)] {
+                crate::gds::copy(raw, true, counter + 2, 1, src.va + 32, "clear two-wave semaphore");
+                crate::gds::copy(raw, true, 0x8c / 4, 1, src.va + 32, "clear two-wave marker");
+                call!(list, X_SET_PSO, (*mut c_void) -> (), two_wave_waiter);
+                if routed {
+                    call!(list, 59, (*mut c_void, u32, usize, u64, usize, u64) -> (),
+                        *signature, 1, commands.res, 192, 0, 0);
+                } else {
+                    call!(list, crate::console_slots::CL_DISPATCH_X, (u32, u32, u32, u32) -> (), 1, 1, 1, 0);
+                }
+                crate::gds::copy(raw, false, 0x8c / 4, 1, dst.va + snapshot, "read before waking either wave");
+                call!(list, X_SET_PSO, (*mut c_void) -> (), poster_pso);
+                call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+                crate::gds::copy(raw, false, 0x8c / 4, 1, dst.va + snapshot + 4, "read after waking one wave");
+                call!(list, X_SET_PSO, (*mut c_void) -> (), release_pso);
+                call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+                crate::gds::copy(raw, false, 0x8c / 4, 1, dst.va + snapshot + 8, "read after waking both waves");
+            }
+
+            crate::gds::copy(raw, true, counter + 2, 1, src.va + 32, "clear 16-group semaphore");
+            crate::gds::copy(raw, true, 0x84 / 4, 1, src.va + 32, "clear 16-group marker");
+            call!(list, X_SET_PSO, (*mut c_void) -> (), older);
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), 4, 2, 2);
+            crate::gds::copy(raw, false, 0x84 / 4, 1, dst.va + 232, "read 16-group waiters before post");
+            call!(list, X_SET_PSO, (*mut c_void) -> (), poster_pso);
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+            crate::gds::copy(raw, false, 0x84 / 4, 1, dst.va + 236, "read 16-group waiters after post");
+            call!(list, X_SET_PSO, (*mut c_void) -> (), release_pso);
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+            crate::gds::copy(raw, false, 0x84 / 4, 1, dst.va + 240, "read 16-group waiters after release-all");
+
+            crate::gds::copy(raw, true, counter + 2, 1, src.va + 32, "clear routed large semaphore");
+            crate::gds::copy(raw, true, 0x84 / 4, 1, src.va + 32, "clear routed large marker");
+            call!(list, X_SET_PSO, (*mut c_void) -> (), older);
+            call!(list, 59, (*mut c_void, u32, usize, u64, usize, u64) -> (),
+                *signature, 1, commands.res, 240, 0, 0);
+            crate::gds::copy(raw, false, 0x84 / 4, 1, dst.va + 244, "read routed large waiters before post");
+            call!(list, X_SET_PSO, (*mut c_void) -> (), poster_pso);
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+            crate::gds::copy(raw, false, 0x84 / 4, 1, dst.va + 248, "read routed large waiters after post");
+            call!(list, X_SET_PSO, (*mut c_void) -> (), release_pso);
+            call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+            crate::gds::copy(raw, false, 0x84 / 4, 1, dst.va + 252, "read routed large waiters after release-all");
+        }
+        if let Some((_, commands, _)) = &indirect_inputs {
+            crate::fill::barrier_pub(raw, commands.res, 0x200, ST_COPY_DEST);
+        }
         call!(list, X_SET_PSO, (*mut c_void) -> (), normal);
         call!(list, X_DISPATCH, (u32, u32, u32) -> (), 2, 1, 1);
         crate::gds::copy(raw, false, counter, 2, dst.va, "read GWS test");
@@ -514,34 +1282,99 @@ fn hw_gws_compute_pso_selects_dispatch_variant() {
         barrier[20..24].copy_from_slice(&ST_COPY_DEST.to_le_bytes());
         barrier[24..28].copy_from_slice(&ST_COPY_SOURCE.to_le_bytes());
         call!(list, X_BARRIER, (u32, *const u8) -> (), 1, barrier.as_ptr());
-        call!(list, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (), out.res, 0, dst.res, 0, 8);
+        call!(list, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (), out.res, 0, dst.res, 0, if resume { 256 } else { 8 });
         crate::fill::barrier_pub(raw, dst.res, ST_COPY_SOURCE, ST_COPY_DEST);
         assert!(call!(list, X_CLOSE, () -> i32) >= 0);
         let f = fence(g.dev);
-        submit(g.a, list, f, 1);
+        submit(command_queue, list, f, 1);
         assert!(reached(f, 1, Duration::from_secs(5)));
-        let expected = 12 - 2 - 3 - if phased { 5 } else { 0 };
+        // The phased path also executes the direct 2x2x1 grid.
+        let expected = 64 - 2 - 3 - u32::from(resume) - if phased { 4 + 5 + 2 + 6 + 8 + 5 } else { 0 };
         assert_eq!(rd(&out, 0), expected);
         assert_eq!(rd(&out, 4), 9, "the last wave reloads the barrier counter");
+        let check_resume = |groups, routed_groups: u32| {
+            if resume {
+                assert_eq!(rd(&out, 132), 0, "unrelated dispatches must leave both waves waiting");
+                assert_eq!(rd(&out, 20), 0, "a zero indirect count must leave both waves waiting");
+                assert_eq!(rd(&out, 24), 0x5ab, "the indirect producer must resume a waiting wave");
+                assert_eq!(rd(&out, 12), 0x5ab, "the saved VGPR must survive the PSO switch");
+                assert_eq!(rd(&out, 8), 0, "exactly one credit wakes one wave");
+                assert_eq!(rd(&out, 16), 2, "the resumed wave must not repeat its pre-wait instruction");
+                assert_eq!(rd(&out, 28), 0, "release-all must not wake waves that arrived later");
+                assert_eq!(rd(&out, 32), 0, "release-all must not leave semaphore credit");
+                assert_eq!(rd(&out, 36), 2 * 0x5ab, "release-all must resume both queued waves");
+                assert_eq!(rd(&out, 40), 0, "the first barrier dispatch must wait for the second wave");
+                assert_eq!([rd(&out, 44), rd(&out, 48)], [0x321, 0x654],
+                    "the last arrival must resume both dispatches with their saved registers");
+                assert_eq!([rd(&out, 52), rd(&out, 56), rd(&out, 60)], [1, 0, 0],
+                    "a zero-count indirect waiter must neither execute initially nor resume");
+                assert_eq!([rd(&out, 64), rd(&out, 68), rd(&out, 72)], [0, 0x5ab, groups],
+                    "only the selected indirect variant may execute and consume a credit");
+                assert_eq!(rd(&out, 76), 8 * 32,
+                    "both indirect barrier records must resume, with every lane executing once");
+                assert_eq!([rd(&out, 80), rd(&out, 84)], [32, 0], "the first credit wakes the oldest wave");
+                assert_eq!([rd(&out, 88), rd(&out, 92)], [64, 0], "the older launch drains first");
+                assert_eq!([rd(&out, 96), rd(&out, 100)], [64, 32], "the younger launch only wakes after the older one");
+                assert_eq!([rd(&out, 104), rd(&out, 108), rd(&out, 112)], [64, groups * 32, 0],
+                    "release-all must wake every lane in both launches without leaving credits");
+                assert_eq!([rd(&out, 116), rd(&out, 120)], [32, 0],
+                    "one post must resume the one-group direct dispatch first");
+                assert_eq!([rd(&out, 124), rd(&out, 128)], [32, 32],
+                    "release-all must resume the one-group indirect dispatch exactly once");
+                assert_eq!(rd(&out, 136), 1, "both waves pass the barrier but only one has a semaphore credit");
+                assert_eq!(rd(&out, 140), 2, "release-all resumes the wave still waiting in the mixed shader");
+                assert_eq!([rd(&out, 144), rd(&out, 148)], [0, 32],
+                    "direct cooperative release-all wakes the previous dispatch");
+                assert_eq!([rd(&out, 152), rd(&out, 156)], [0, 32],
+                    "indirect cooperative release-all wakes the previous dispatch");
+                let batch = |offset| [rd(&out, offset), rd(&out, offset + 4), rd(&out, offset + 8)];
+                assert_eq!(batch(160), [6, 0, 0], "a zero-count batch must leave the observation intact");
+                assert_eq!(batch(172), [1, 1, 2], "one active row must wake the older wave exactly once");
+                assert_eq!(batch(184), [0, 1, 3], "the second row must see the earlier wake and clear its increment");
+                assert_eq!(batch(196), [0, 1, 11], "all four rows must run and wake the indirect waiter exactly once");
+                assert_eq!(batch(208), [0, 32, 64], "DispatchX must resume the two waves independently");
+                assert_eq!(batch(220), [0, 32, 64], "ExecuteIndirect must resume the two waves independently");
+                assert_eq!(batch(232), [0, 32, 16 * 32],
+                    "one PSO must resume all 16 waves in a three-dimensional dispatch");
+                assert_eq!(batch(244), [0, 32, routed_groups * 32],
+                    "the indirect waiter must resume with the GPU-provided grid");
+            }
+        };
+        check_resume(5, 16);
         if phased {
             // A second submission must start with zeroed checkpoints even though
             // the command list and its scratch allocation are the same.
             let scratch_alive = crate::gws_scratch::recording_probe(raw);
+            let scratch_before_submit = scratch_alive();
+            assert!(scratch_before_submit > 1);
+            let (upload, _, _) = indirect_inputs.as_ref().unwrap();
+            core::ptr::write_volatile(upload.cpu.cast::<u32>(), 4);
+            core::ptr::write_volatile(upload.cpu.add(80).cast::<u32>(), 7);
+            core::ptr::write_volatile(upload.cpu.add(160).cast::<u32>(), 1);
+            core::ptr::write_volatile(upload.cpu.add(224).cast::<u32>(), 8);
+            core::ptr::write_volatile(upload.cpu.add(240).cast::<[u32; 4]>(), [2, 3, 2, 0]);
             let gate = fence(g.dev);
-            assert!(call!(g.a, 15, (*mut c_void, u64) -> i32, gate, 1) >= 0);
-            submit(g.a, list, f, 2);
+            assert!(call!(command_queue, 15, (*mut c_void, u64) -> i32, gate, 1) >= 0);
+            submit(command_queue, list, f, 2);
             let mut alloc = core::ptr::null_mut();
             assert!(call!(g.dev, 9, (u32, *const Guid, *mut *mut c_void) -> i32, 0, &IID_ALLOCATOR, &mut alloc) >= 0);
             let reset_hr = call!(list, 10, (*mut c_void, *mut c_void) -> i32, alloc, core::ptr::null_mut());
             let held_while_in_flight = scratch_alive();
             assert!(call!(gate, 10, (u64) -> i32, 1) >= 0);
             assert!(reset_hr >= 0);
-            assert!(held_while_in_flight);
-            assert!(reached(f, 2, Duration::from_secs(5)));
-            assert_eq!(rd(&out, 0), expected);
+            assert_eq!(held_while_in_flight, scratch_before_submit);
+            assert!(reached(f, 2, Duration::from_secs(15)), "GWS stress resubmission did not complete");
+            assert_eq!(rd(&out, 0), expected - 4, "resubmission must route the updated dimensions and counts");
+            check_resume(8, 12);
+            if resume {
+                call!(command_queue, 2, () -> u32);
+            }
             let start = Instant::now();
-            while scratch_alive() {
-                assert!(start.elapsed() < Duration::from_secs(5), "scratch survives completion and reset");
+            // Queue-owned checkpoints can outlive Reset. Temporary allocations
+            // unrelated to pending waves must still retire after the fence.
+            let allowed = if resume { 1 } else { 0 };
+            while scratch_alive() > allowed {
+                assert!(start.elapsed() < Duration::from_secs(5), "temporary scratch survives completion and reset");
                 std::thread::sleep(Duration::from_millis(2));
             }
         }

@@ -225,11 +225,28 @@ unsafe fn place_at(this: *mut c_void, va: u64, rdesc: *const u8, state: u32) -> 
     (hr >= 0 && !out.is_null()).then_some(out as usize)
 }
 
+fn same_view_texture(expected: &[u8; 0x38], physical: &[u8; 0x38]) -> bool {
+    let format = rd32(expected, 0x20);
+    let physical_format = rd32(physical, 0x20);
+    expected[..4] == physical[..4]
+        && expected[0x10..0x20] == physical[0x10..0x20]
+        && expected[0x24..0x2c] == physical[0x24..0x2c]
+        && crate::title_heap::group(format) == crate::title_heap::group(physical_format)
+}
+
 unsafe fn resolve(this: *mut c_void, va: u64, rdesc: *const u8, view: &mut [u8], at: BufferView, state: u32, what: &str) -> Option<usize> {
     let rd: [u8; 0x38] = unsafe { core::ptr::read_unaligned(rdesc as *const [u8; 0x38]) };
+    if va == 0 {
+        return None;
+    }
     let is_buffer = rd32(&rd, 0) == 1;
     if let Target::Existing(res, off) = choose_target(crate::gpu_va::lookup_gpu(va), is_buffer) {
-        if !is_buffer || rebase_buffer_view(view, at, off) {
+        if is_buffer && rebase_buffer_view(view, at, off) {
+            return Some(res);
+        }
+        if !is_buffer && crate::placed::lookup(res as *mut c_void)
+            .is_some_and(|placement| same_view_texture(&rd, &placement.desc))
+        {
             return Some(res);
         }
     }
@@ -255,7 +272,17 @@ unsafe fn null_view(this: *mut c_void, rdesc: *const u8, dest: usize, srv: bool)
     let real = unsafe { real_device(this) };
     let (dim, fmt) = if rdesc.is_null() { (3, 0) } else { unsafe { (core::ptr::read_unaligned(rdesc as *const u32), core::ptr::read_unaligned(rdesc.add(0x20) as *const u32)) } };
     let mut d = [0u8; 0x28];
-    d[0..4].copy_from_slice(&fmt.to_le_bytes());
+    let format = if fmt == 0 && dim == 1 {
+        // D3D12 requires an element interpretation even for a null buffer view.
+        // R32_TYPELESS with the RAW flag is valid for both descriptor classes.
+        d[32..36].copy_from_slice(&1u32.to_le_bytes());
+        39
+    } else if fmt == 0 {
+        28
+    } else {
+        crate::device_ext_a::typed_view_format(fmt)
+    };
+    d[0..4].copy_from_slice(&format.to_le_bytes());
     d[4..8].copy_from_slice(&null_view_dimension(dim, srv).to_le_bytes());
     if srv {
         d[8..12].copy_from_slice(&0x1688u32.to_le_bytes());

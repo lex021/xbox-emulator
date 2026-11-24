@@ -503,7 +503,7 @@ unsafe extern "system" fn copy_texture_x(this: *mut c_void, dst: *const u8, x: u
 }
 
 
-unsafe fn buffer_width(res: *mut c_void) -> Option<u64> {
+pub(crate) unsafe fn buffer_width(res: *mut c_void) -> Option<u64> {
     let mut d = [0u8; 0x38];
     unsafe {
         let g: unsafe extern "system" fn(*mut c_void, *mut u8) -> *mut u8 = core::mem::transmute(*(*(res as *const *const usize)).add(RES_GET_DESC));

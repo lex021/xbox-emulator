@@ -26,8 +26,13 @@ impl Emitter<'_> {
     }
 
     fn detect_rootmem(&self) -> bool {
-        if self.ex.root_sig.as_ref().map_or(true, |r| r.params.is_empty()) {
+        let Some(root) = self.ex.root_sig.as_ref().filter(|r| !r.params.is_empty()) else {
             return false;
+        };
+        // D3D12XBOX_ROOT_SIGNATURE_FLAG_FORCE_MEMORY_BASED_ABI is explicit.
+        // In particular, a lane-selection branch may precede the first s0 load.
+        if root.flags & 0x0100_0000 != 0 {
+            return true;
         }
         let mut ptr: Vec<u8> = vec![0];
         for ins in &self.insns {
@@ -58,6 +63,10 @@ impl Emitter<'_> {
         false
     }
 
+    pub(super) fn xdxr_root(&self) -> bool {
+        self.is_cs && self.ex.root_sig.as_ref().is_some_and(|root| root.flags & 0x0300_0000 == 0x0300_0000)
+    }
+
     pub(super) fn rm_ptr(&self, table: u8) -> bool {
         if self.dg().is_some() {
             return table == 0 && self.dg_has_mem();
@@ -69,7 +78,13 @@ impl Emitter<'_> {
         if self.dg().is_some() {
             return self.dg_mem(dword);
         }
-        let mut at = if dword >= super::durango::SGPR_END { dword - super::durango::SGPR_END } else { dword };
+        // XDXR stores the whole root block consecutively in memory.
+        // Its offsets continue above DWORD 15 instead of aliasing the first 16.
+        let mut at = if !self.xdxr_root() && dword >= super::durango::SGPR_END {
+            dword - super::durango::SGPR_END
+        } else {
+            dword
+        };
         for (i, p) in self.ex.root_sig.as_ref()?.params.iter().enumerate() {
             let n = match &p.kind {
                 RootParamKind::Table(_) => 2,
@@ -151,17 +166,38 @@ impl Emitter<'_> {
 
     pub(super) fn sgpr_dead_after(&self, idx: usize, r: u32) -> bool {
         let reads = |ins: &Insn| {
-            let span = match ins.enc {
-                Enc::Smem | Enc::Mubuf | Enc::Mtbuf => 4,
-                Enc::Mimg => 8,
-                Enc::Vop1 | Enc::Vop2 | Enc::Vopc | Enc::Sop1 | Enc::Sop2 | Enc::Sopc | Enc::Sopk if !ins.mnemonic.contains("64") => 1,
-                _ => 2,
-            };
-            ins.src.iter().any(|o| matches!(o, Opnd::Sgpr(n) if (*n as u32..*n as u32 + span).contains(&r)))
+            if ins.mnemonic == "v_nop" || ins.mnemonic.starts_with("s_setreg_imm") {
+                return false;
+            }
+            if ins.enc == Enc::Smem && (ins.op <= 4 || (8..=12).contains(&ins.op)) {
+                let offset = ins.raw[1] >> 25;
+                if offset <= 107 && offset == r {
+                    return true;
+                }
+            }
+            ins.src.iter().enumerate().any(|(i, o)| {
+                let Opnd::Sgpr(base) = *o else { return false };
+                let span = match ins.enc {
+                    Enc::Smem if ins.op <= 4 => 2,
+                    Enc::Smem => 4,
+                    Enc::Mubuf | Enc::Mtbuf if i == 1 => 4,
+                    Enc::Mubuf | Enc::Mtbuf => 1,
+                    Enc::Mimg => 8,
+                    Enc::Vop3 if ins.mnemonic == "v_cndmask_b32" => if i == 2 && self.wave64 { 2 } else { 1 },
+                    Enc::Vop3 if matches!(ins.mnemonic.as_str(), "v_lshl_add_u32" | "v_add_lshl_u32" | "v_add3_u32" | "v_mul_lo_u32") => 1,
+                    Enc::Vop1 | Enc::Vop2 | Enc::Vopc | Enc::Sop1 | Enc::Sop2 | Enc::Sopc | Enc::Sopk if !ins.mnemonic.contains("64") => 1,
+                    _ => 2,
+                };
+                (u32::from(base)..u32::from(base) + span).contains(&r)
+            })
         };
         let writes = |ins: &Insn| {
+            // VOP3 READLANE encodes its scalar result in the vector destination field.
+            if ins.mnemonic == "v_readlane_b32" {
+                return matches!(ins.dst.first(), Some(Opnd::Sgpr(n) | Opnd::Vgpr(n)) if u32::from(*n) == r);
+            }
             let extra = match ins.enc {
-                Enc::Smem if ins.op <= 4 => (1u32 << ins.op) - 1,
+                Enc::Smem if ins.op <= 4 || (8..=12).contains(&ins.op) => (1u32 << (ins.op & 7)) - 1,
                 _ if ins.mnemonic.ends_with("_b64") => 1,
                 _ => 0,
             };
@@ -209,9 +245,21 @@ impl Emitter<'_> {
         let n = 1u32 << ins.op;
         for k in 0..n {
             let Some((p, i)) = self.rm_param(off / 4 + k) else { continue };
-            if let Some(RootParamKind::Constants { .. }) = self.rm_kind_of(p) {
-                self.rm_used.insert(p);
-                self.ws(&sreg_opnd(base + k as u8), &format!("tb_rc{p}_{i}"))?;
+            match self.rm_kind_of(p) {
+                Some(RootParamKind::Constants { .. }) => {
+                    self.rm_used.insert(p);
+                    self.ws(&sreg_opnd(base + k as u8), &format!("tb_rc{p}_{i}"))?;
+                }
+                Some(RootParamKind::Descriptor { .. }) if self.xdxr_root()
+                    && self.res.values().any(|r| r.contains(&super::Res::GlobalScalar)) =>
+                {
+                    if p >= crate::global_abi::TB_GLOBAL_ROOT_VAS {
+                        return Err(format!("global memory ABI cannot represent root descriptor {p}"));
+                    }
+                    self.uses_global = true;
+                    self.ws(&sreg_opnd(base + k as u8), &format!("tb_root_va[{p}][{i}]"))?;
+                }
+                _ => {}
             }
         }
         Ok(Some(()))

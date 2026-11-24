@@ -1,8 +1,14 @@
 //! Bind the compute PSO compiled for the guest dispatch dimensions.
+mod indirect;
+mod resume;
+mod tables;
+pub(crate) use resume::enabled as resume_enabled;
+
 use crate::device_wrap::Guid;
 use compat_common::record;
 use core::ffi::c_void;
 use core::ptr::null_mut;
+use tombox_xshader::gds_abi::{tb_gws_group_count, tb_gws_phase_word, tb_gws_scratch_bytes};
 use core::sync::atomic::{
     AtomicBool, AtomicUsize,
     Ordering::{Acquire, Relaxed, Release},
@@ -29,6 +35,10 @@ static SKIPPED: AtomicUsize = AtomicUsize::new(0);
 const PHASED_VARIANT: u32 = 16;
 const PHASED_PLAN: u32 = 32;
 const PHASED_ROOT: u32 = 48;
+const INDIRECT_DISPATCH_STRIDE: u32 = 49;
+const NO_GWS: u32 = 50;
+const GWS_SIGNAL: u32 = 51;
+const TABLE_LAYOUT: u32 = 52;
 
 pub(crate) fn phased_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -69,10 +79,72 @@ unsafe fn set_private<const N: usize>(object: *mut c_void, id: u32, data: &[u32;
     unsafe { set(object, &key(id), (N * 4) as u32, data.as_ptr().cast()) }
 }
 
-pub(crate) unsafe fn note_phased_root(root: *mut c_void, index: u32) {
-    if !root.is_null() {
-        unsafe { set_private(root, PHASED_ROOT, &[index]) };
+pub(crate) unsafe fn note_phased_root(root: *mut c_void, index: u32, bytecode: &[u8]) {
+    if root.is_null() {
+        return;
     }
+    unsafe { set_private(root, PHASED_ROOT, &[index]) };
+    if let Ok(layout) = tombox_xshader::parse_root_signature(bytecode) {
+        let spans = tables::root_spans(&layout);
+        unsafe { set_private(root, TABLE_LAYOUT, &spans) };
+    }
+}
+
+pub(crate) unsafe fn note_indirect_signature(
+    signature: *mut c_void,
+    stride: u32,
+    args: &[[u32; 4]],
+) {
+    if let [dispatch] = args {
+        if !signature.is_null() && dispatch[0] == 2 && stride >= 12 && stride % 4 == 0 {
+            unsafe { set_private(signature, INDIRECT_DISPATCH_STRIDE, &[stride]) };
+        }
+    }
+}
+
+pub(crate) unsafe fn indirect_stride(signature: *mut c_void) -> Option<u32> {
+    let mut stride = 0u32;
+    (!signature.is_null()
+        && unsafe {
+            get_private(signature, INDIRECT_DISPATCH_STRIDE, (&mut stride as *mut u32).cast(), 4)
+        })
+    .then_some(stride)
+}
+
+pub(crate) unsafe fn note_compute(pso: *mut c_void, bytecode: *const u8, len: usize) {
+    if !resume::enabled() || pso.is_null() || bytecode.is_null() || !(32..=0x40_0000).contains(&len) {
+        return;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(bytecode, len) };
+    let Ok(shader) = tombox_xshader::extract(blob) else {
+        return;
+    };
+    let instructions = tombox_xshader::rdna2::disassemble(&shader.isa);
+    let decoded_bytes = instructions.last().map_or(0, |ins| ins.offset + ins.dwords * 4);
+    if decoded_bytes != shader.isa.len() || instructions.is_empty() {
+        return;
+    }
+    if !instructions.iter().any(|ins| ins.mnemonic.starts_with("ds_gws_")) {
+        unsafe { set_private(pso, NO_GWS, &[1]) };
+    } else if instructions.iter().any(|ins| matches!(
+        ins.mnemonic.as_str(), "ds_gws_sema_v" | "ds_gws_sema_br" | "ds_gws_sema_release_all"
+    )) {
+        unsafe { set_private(pso, GWS_SIGNAL, &[1]) };
+    }
+}
+
+unsafe fn can_signal(pso: *mut c_void) -> bool {
+    let mut tag = 0u32;
+    !pso.is_null()
+        && unsafe { get_private(pso, GWS_SIGNAL, (&mut tag as *mut u32).cast(), 4) }
+        && tag == 1
+}
+
+unsafe fn cannot_signal(pso: *mut c_void) -> bool {
+    let mut tag = 0u32;
+    !pso.is_null()
+        && unsafe { get_private(pso, NO_GWS, (&mut tag as *mut u32).cast(), 4) }
+        && tag == 1
 }
 
 unsafe fn phased_root(root: *mut c_void) -> Option<u32> {
@@ -140,11 +212,24 @@ pub(crate) unsafe fn try_create(
     }
     let blob = unsafe { core::slice::from_raw_parts(ptr, len) };
     let ex = tombox_xshader::extract(blob).ok()?;
-    if !matches!(ex.stage, tombox_xshader::Stage::Compute)
-        || !tombox_xshader::rdna2::disassemble(&ex.isa)
-            .iter()
-            .any(|i| matches!(i.mnemonic.as_str(), "ds_gws_sema_p" | "ds_gws_barrier"))
-    {
+    if !matches!(ex.stage, tombox_xshader::Stage::Compute) {
+        return None;
+    }
+    let instructions = tombox_xshader::rdna2::disassemble(&ex.isa);
+    let semaphore_wait = instructions.iter().any(|i| i.mnemonic == "ds_gws_sema_p");
+    let barriers = instructions.iter().filter(|i| i.mnemonic == "ds_gws_barrier").count();
+    let ordered_wait = semaphore_wait && instructions.iter().filter(|i| i.mnemonic.starts_with("ds_gws_")).count() == 1;
+    let releases_semaphores = instructions.iter().any(|i| i.mnemonic == "ds_gws_sema_release_all");
+    let resume_mode = if ordered_wait {
+        3
+    } else if semaphore_wait {
+        1
+    } else if barriers == 1 {
+        if releases_semaphores { 4 } else { 2 }
+    } else {
+        0
+    };
+    if !semaphore_wait && barriers == 0 {
         return None;
     }
     if !out.is_null() {
@@ -198,9 +283,9 @@ pub(crate) unsafe fn try_create(
         Some((groups, variant))
     });
     let can_phase = phased_enabled() && unsafe { phased_root(root) }.is_some();
-    let phased = (2..=8).filter(|_| can_phase).filter_map(|groups| {
+    let phased = can_phase.then_some(()).and_then(|()| {
         let compiled =
-            std::panic::catch_unwind(|| crate::shader_xlat::compile_phased_gws(&ex, groups));
+            std::panic::catch_unwind(|| crate::shader_xlat::compile_phased_gws(&ex));
         let Ok(Ok((code, plan))) = compiled else {
             return None;
         };
@@ -210,12 +295,12 @@ pub(crate) unsafe fn try_create(
             return None;
         }
         let address = root as u64;
-        let plan = [plan[0], plan[1], address as u32, (address >> 32) as u32];
+        let plan = [plan[0], plan[1], address as u32, (address >> 32) as u32, resume_mode];
         if unsafe { set_private(variant, PHASED_PLAN, &plan) } < 0 {
             unsafe { release(variant) };
             return None;
         }
-        Some((PHASED_VARIANT + groups, variant))
+        Some((PHASED_VARIANT, variant))
     });
     let hr = unsafe { attach_variants(base, variants.chain(phased)) };
     let hr = if hr >= 0 && !out.is_null() {
@@ -251,46 +336,88 @@ unsafe fn get_variant(pso: *mut c_void, id: u32) -> *mut c_void {
     }
 }
 
-unsafe fn phased_dispatch(list: *mut c_void, pso: *mut c_void, x: u32, bind: Bind) -> bool {
+unsafe fn allocate_phase(list: *mut c_void, pso: *mut c_void, groups: [u32; 3], routed: bool) -> Option<(Phase, u32)> {
     if !matches!(unsafe { crate::fill::list_type(list) }, 0 | 2)
         || crate::cl2_state::predication_of(list).is_some()
     {
-        return false;
+        return None;
     }
-    let root = crate::cl2_state::compute_root(list).unwrap_or(0);
-    let Some(index) = (unsafe { phased_root(root as *mut c_void) }) else {
-        return false;
-    };
-    let mut plan = [0u32; 4];
-    if !unsafe { get_private(pso, PHASED_PLAN, plan.as_mut_ptr().cast(), 16) } {
-        return false;
+    let root = crate::cl2_state::compute_root(list)?;
+    let index = unsafe { phased_root(root as *mut c_void) }?;
+    let count = tb_gws_group_count(groups)?;
+    let mut plan = [0u32; 5];
+    if !unsafe { get_private(pso, PHASED_PLAN, plan.as_mut_ptr().cast(), 20) } {
+        return None;
     }
-    let [bytes, rounds, root_lo, root_hi] = plan;
+    let [steps, waves_per_group, root_lo, root_hi, resume_mode] = plan;
     if root as u64 != (u64::from(root_lo) | (u64::from(root_hi) << 32)) {
-        return false;
+        return None;
     }
-    let Some(scratch) = (unsafe { crate::gws_scratch::begin(list, pso, bytes, index + 1) }) else {
+    let waves = count * waves_per_group;
+    let rounds = steps * waves + 1;
+    let bytes = tb_gws_scratch_bytes(waves);
+    let (scratch, va) = unsafe { crate::gws_scratch::begin(list, pso, bytes) }?;
+    Some((Phase { scratch, va, pso: pso as usize, groups, waves, rounds, index, routed }, resume_mode))
+}
+
+unsafe fn phased_dispatch(list: *mut c_void, pso: *mut c_void, groups: [u32; 3], bind: Bind) -> bool {
+    let Some((phase, resume_mode)) = (unsafe { allocate_phase(list, pso, groups, false) }) else {
         return false;
     };
-    let constant: unsafe extern "system" fn(*mut c_void, u32, u32, u32) =
-        unsafe { core::mem::transmute(slot(list, 33)) };
-    let dispatch: Dispatch = unsafe { core::mem::transmute(slot(list, 14)) };
-    let barrier: unsafe extern "system" fn(*mut c_void, u32, *const u64) =
-        unsafe { core::mem::transmute(slot(list, 26)) };
-    let uav_barrier = [2u64, 0, 0, 0];
+    let kind = resume::Kind::from_mode(resume_mode);
     unsafe {
-        bind(list, pso);
-        barrier(list, 1, uav_barrier.as_ptr());
-        for _ in 0..rounds {
-            for selected in 0..x {
-                constant(list, index + 2, selected, 0);
-                dispatch(list, x, 1, 1);
-                barrier(list, 1, uav_barrier.as_ptr());
-            }
+        if kind == Some(resume::Kind::OrderedSemaphore) {
+            resume::before_ordered_wait(list, bind);
         }
-        crate::gws_scratch::end(list, scratch);
+        phase.run(list, bind);
+        if let Some(kind) = kind {
+            resume::remember(list, phase, kind, bind);
+        } else {
+            resume::forget(list);
+        }
     }
     true
+}
+
+#[derive(Clone, Copy)]
+struct Phase {
+    scratch: usize,
+    va: u64,
+    pso: usize,
+    groups: [u32; 3],
+    waves: u32,
+    rounds: u32,
+    index: u32,
+    routed: bool,
+}
+
+impl Phase {
+    unsafe fn run(self, list: *mut c_void, bind: Bind) {
+        let dispatch: Dispatch = unsafe { core::mem::transmute(slot(list, 14)) };
+        let Self { scratch, va, pso, groups, waves, rounds, index, routed } = self;
+        let bind_uav: unsafe extern "system" fn(*mut c_void, u32, u64) =
+            unsafe { core::mem::transmute(slot(list, 41)) };
+        let constant: unsafe extern "system" fn(*mut c_void, u32, u32, u32) =
+            unsafe { core::mem::transmute(slot(list, 33)) };
+        let barrier: unsafe extern "system" fn(*mut c_void, u32, *const u64) =
+            unsafe { core::mem::transmute(slot(list, 26)) };
+        let uav_barrier = [2u64, 0, 0, 0];
+        unsafe {
+            crate::fill::barrier_pub(list, scratch, crate::gws_scratch::COPY_DEST, crate::gws_scratch::UAV);
+            bind_uav(list, index + 1, va);
+            bind(list, pso as *mut c_void);
+            barrier(list, 1, uav_barrier.as_ptr());
+            for _ in 0..rounds {
+                for selected in 0..waves {
+                    let control = if routed { selected } else { tb_gws_phase_word(groups, waves, selected) };
+                    constant(list, index + 2, control, 0);
+                    dispatch(list, 1, 1, 1);
+                    barrier(list, 1, uav_barrier.as_ptr());
+                }
+            }
+            crate::gws_scratch::end(list, scratch);
+        }
+    }
 }
 
 unsafe fn dispatch_for_pso(
@@ -303,27 +430,28 @@ unsafe fn dispatch_for_pso(
     let variants = unsafe { mask(pso) };
     if variants == 0 {
         unsafe { dispatch(list, groups[0], groups[1], groups[2]) };
+        if !pso.is_null() && !groups.contains(&0) {
+            unsafe { resume::after_dispatch(list, pso, bind) };
+        }
         return;
     }
     if groups.contains(&0) {
         return;
     }
-    if let [x @ 2..=8, 1, 1] = groups {
-        let id = PHASED_VARIANT + x;
-        if variants & (1 << id) != 0 {
-            let variant = unsafe { get_variant(pso, id) };
-            if !variant.is_null() {
-                let ran = unsafe { phased_dispatch(list, variant, x, bind) };
-                if ran {
-                    unsafe { bind(list, pso) };
-                }
-                unsafe { release(variant) };
-                if ran {
-                    return;
-                }
+    if variants & (1 << PHASED_VARIANT) != 0 && (groups != [1, 1, 1] || resume::enabled()) {
+        let variant = unsafe { get_variant(pso, PHASED_VARIANT) };
+        if !variant.is_null() {
+            let ran = unsafe { phased_dispatch(list, variant, groups, bind) };
+            if ran {
+                unsafe { bind(list, pso) };
+            }
+            unsafe { release(variant) };
+            if ran {
+                return;
             }
         }
     }
+    resume::forget(list);
     if let [x @ 1..=4, 1, 1] = groups {
         let mut variant: *mut c_void = null_mut();
         if variants & (1 << x) != 0
@@ -362,7 +490,10 @@ unsafe extern "system" fn dispatch(list: *mut c_void, x: u32, y: u32, z: u32) {
 }
 
 pub(crate) unsafe fn dispatch_with(list: *mut c_void, x: u32, y: u32, z: u32, prev: Dispatch) {
-    if !ACTIVE.load(Acquire) {
+    if ![x, y, z].contains(&0) && !unsafe { crate::global_bind::before_dispatch(list) } {
+        return;
+    }
+    if !ACTIVE.load(Acquire) && !resume::enabled() {
         unsafe { prev(list, x, y, z) };
         return;
     }
@@ -380,17 +511,37 @@ unsafe extern "system" fn indirect(
     count_buf: *mut c_void,
     count_offset: u64,
 ) {
-    if ACTIVE.load(Acquire) {
+    if count != 0 && !unsafe { crate::global_bind::before_indirect(list) } {
+        return;
+    }
+    let mut resume_after = None;
+    if ACTIVE.load(Acquire) || resume::enabled() {
         let pso = crate::cl2_state::bound_pso(list).unwrap_or(0) as *mut c_void;
         if unsafe { mask(pso) } != 0 {
+            if count == 0 {
+                return;
+            }
+            let result = unsafe { indirect::run(list, pso, signature, count, args, offset, count_buf, count_offset) };
+            if result.is_ok() {
+                return;
+            }
+            resume::forget(list);
             if SKIPPED.fetch_add(1, Relaxed) < 16 {
+                let reason = result.unwrap_err();
                 record(
                     "d3d12_xs",
                     "gws_dispatch",
-                    "cooperative GWS ExecuteIndirect is unsupported; skipped",
+                    &format!("cooperative GWS ExecuteIndirect skipped: {reason}"),
                 );
             }
             return;
+        }
+        if count != 0 {
+            if !pso.is_null() && resume::enabled() && unsafe { indirect_stride(signature) }.is_some() {
+                resume_after = Some(pso);
+            } else {
+                resume::forget(list);
+            }
         }
     }
     let prev: Indirect = unsafe { core::mem::transmute(PREV_INDIRECT.load(Relaxed)) };
@@ -405,7 +556,13 @@ unsafe extern "system" fn indirect(
             count_offset,
         )
     };
+    if let Some(pso) = resume_after {
+        let bind: Bind = unsafe { core::mem::transmute(crate::cmdlist_wrap::real_method(25)) };
+        unsafe { resume::after_dispatch(list, pso, bind) };
+    }
 }
+
+pub(crate) use resume::{forget as forget_checkpoint, forget_signals, submit_lists, queue_signal, queue_wait};
 
 pub(crate) fn install(vt: &[AtomicUsize]) {
     PREV_DISPATCH.store(

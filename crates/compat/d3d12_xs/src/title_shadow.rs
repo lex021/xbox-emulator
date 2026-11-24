@@ -158,6 +158,16 @@ fn regions(lo: u64, hi: u64, ok: fn(&Mbi) -> bool) -> Vec<(u64, u64)> {
     out
 }
 
+pub(crate) fn is_readable_range(base: usize, len: usize) -> bool {
+    let Some(end) = base.checked_add(len) else { return false };
+    base != 0 && len != 0 && regions(base as u64, end as u64, readable).as_slice() == [(base as u64, end as u64)]
+}
+
+pub(crate) fn is_writable_range(base: usize, len: usize) -> bool {
+    let Some(end) = base.checked_add(len) else { return false };
+    base != 0 && len != 0 && regions(base as u64, end as u64, writable).as_slice() == [(base as u64, end as u64)]
+}
+
 const WATCH_PAGE: u64 = 0x1000;
 const WRITE_WATCH_FLAG_RESET: u32 = 1;
 
@@ -495,16 +505,43 @@ pub fn tiles_for(len: u64) -> u32 {
     len.div_ceil(TILE) as u32
 }
 
+fn tile_span(offset: u64, tiles: u32, heap_size: u64) -> Option<u32> {
+    if tiles == 0 || offset % TILE != 0 {
+        return None;
+    }
+    let end = offset.checked_add(u64::from(tiles) * TILE)?;
+    (end <= heap_size).then(|| u32::try_from(offset / TILE).ok()).flatten()
+}
+
+unsafe fn tile_heap_size(heap: usize) -> u64 {
+    let mut desc = [0u8; 0x30];
+    unsafe { vcall!(heap as *mut c_void, 8, fn(*mut u8) -> *mut u8, desc.as_mut_ptr()) };
+    u64::from_le_bytes(desc[..8].try_into().unwrap())
+}
+
 pub unsafe fn place_reserved(real: *mut c_void, heap: usize, offset: u64, desc: &[u8; 0x38], init_state: u32, ppv: *mut *mut c_void) -> i32 {
+    if ppv.is_null() {
+        return 0x8007_0057u32 as i32;
+    }
+    unsafe { *ppv = core::ptr::null_mut() };
+    if heap == 0 {
+        return 0x8007_0057u32 as i32;
+    }
+    let width = u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap());
+    let Ok(tiles) = u32::try_from(width.div_ceil(TILE)) else {
+        return 0x8007_0057u32 as i32;
+    };
+    let Some(heap_tile) = tile_span(offset, tiles, unsafe { tile_heap_size(heap) }) else {
+        return 0x8007_0057u32 as i32;
+    };
     let hr = unsafe { vcall!(real, 30, fn(*const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32, desc.as_ptr(), init_state, core::ptr::null(), &IID_RESOURCE, ppv) };
     if hr < 0 || unsafe { *ppv }.is_null() {
         return hr;
     }
     let res = unsafe { *ppv };
-    let width = u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap());
     let ok = unsafe {
         with_tiles(real, |t| {
-            t.map(res, tiles_for(width), heap as *mut c_void, (offset / TILE) as u32);
+            t.map(res, tiles, heap as *mut c_void, heap_tile);
             t.flush()
         })
     };
@@ -517,6 +554,13 @@ pub unsafe fn place_reserved(real: *mut c_void, heap: usize, offset: u64, desc: 
 }
 
 pub unsafe fn place_tiled(real: *mut c_void, heap: usize, offset: u64, desc: &[u8; 0x38], init_state: u32, pclear: *const c_void, ppv: *mut *mut c_void) -> i32 {
+    if ppv.is_null() {
+        return 0x8007_0057u32 as i32;
+    }
+    unsafe { *ppv = core::ptr::null_mut() };
+    if heap == 0 {
+        return 0x8007_0057u32 as i32;
+    }
     let mut d = *desc;
     d[8..16].copy_from_slice(&0u64.to_le_bytes());
     d[0x2c..0x30].copy_from_slice(&2u32.to_le_bytes());
@@ -531,16 +575,13 @@ pub unsafe fn place_tiled(real: *mut c_void, heap: usize, offset: u64, desc: &[u
     let mut shape = [0u32; 3];
     let mut subs = 0u32;
     unsafe { vcall!(real, 42, fn(*mut c_void, *mut u32, *mut u32, *mut u32, *mut u32, u32, *mut c_void) -> (), res, &mut tiles, packed.as_mut_ptr(), shape.as_mut_ptr(), &mut subs, 0, core::ptr::null_mut()) };
-    let mut hd = [0u8; 0x30];
-    unsafe { vcall!(heap as *mut c_void, 8, fn(*mut u8) -> *mut u8, hd.as_mut_ptr()) };
-    let heap_size = u64::from_le_bytes(hd[0..8].try_into().unwrap());
-    let fits = tiles != 0 && offset % TILE == 0 && offset + tiles as u64 * TILE <= heap_size;
-    let ok = fits && unsafe {
+    let heap_size = unsafe { tile_heap_size(heap) };
+    let ok = tile_span(offset, tiles, heap_size).is_some_and(|heap_tile| unsafe {
         with_tiles(real, |t| {
-            t.map(res, tiles, heap as *mut c_void, (offset / TILE) as u32);
+            t.map(res, tiles, heap as *mut c_void, heap_tile);
             t.flush()
-        })
-    } == Some(true);
+        }) == Some(true)
+    });
     if !ok {
         record("d3d12_xs", "title_shadow", &format!("tiled MSAA at heap {heap:#x}+{offset:#x}: {tiles} tile(s) in a {heap_size:#x} heap could not be mapped"));
         unsafe { vcall!(res, 2, fn() -> u32) };

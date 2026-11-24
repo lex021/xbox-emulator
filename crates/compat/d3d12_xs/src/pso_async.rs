@@ -149,7 +149,12 @@ fn pool() -> &'static Mutex<std::sync::mpsc::Sender<Job>> {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        for _ in 0..cores.saturating_sub(2).clamp(1, 6) {
+        let default_workers = cores.saturating_sub(2).clamp(1, 6);
+        let workers = std::env::var("TOMBOX_PSO_ASYNC_WORKERS").ok()
+            .and_then(|n| n.parse::<usize>().ok())
+            .filter(|&n| (1..=default_workers).contains(&n))
+            .unwrap_or(default_workers);
+        for _ in 0..workers {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name("tombox-pso-async".into()).stack_size(64 << 20).spawn(move || loop {
                 let job = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();

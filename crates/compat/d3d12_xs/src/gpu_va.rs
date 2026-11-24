@@ -18,6 +18,7 @@ struct Tables {
     ranges: Vec<BTreeMap<u64, Entry>>,
     cpu: Vec<BTreeMap<u64, Entry>>,
     texture_va: HashMap<usize, u64>,
+    placed_buffers: HashMap<usize, (u64, u64, u64)>,
     state: HashMap<usize, u32>,
     width: HashMap<usize, u64>,
 }
@@ -27,7 +28,7 @@ static NEXT_SYNTH: AtomicU64 = AtomicU64::new(SYNTHETIC_TEXTURE_BASE);
 
 fn with<R>(f: impl FnOnce(&mut Tables) -> R) -> R {
     let mut g = T.lock().unwrap_or_else(|e| e.into_inner());
-    let t = g.get_or_insert_with(|| Tables { ranges: Vec::new(), cpu: Vec::new(), texture_va: HashMap::new(), state: HashMap::new(), width: HashMap::new() });
+    let t = g.get_or_insert_with(|| Tables { ranges: Vec::new(), cpu: Vec::new(), texture_va: HashMap::new(), placed_buffers: HashMap::new(), state: HashMap::new(), width: HashMap::new() });
     f(t)
 }
 
@@ -111,6 +112,32 @@ pub fn lookup_buffer(va: u64) -> Option<(Entry, u64)> {
     })
 }
 
+/// Convert an address in a title placement into the corresponding address
+/// of the real PC buffer. Native GPU addresses already in use pass through.
+pub(crate) fn host_buffer_address(va: u64) -> u64 {
+    with(|t| {
+        let binding = t.ranges.iter()
+            .filter_map(|m| m.range(..=va).next_back().map(|(_, e)| e))
+            .filter_map(|entry| t.placed_buffers.get(&entry.res))
+            .filter_map(|&(guest, host, size)| {
+                let offset = va.checked_sub(guest)?;
+                (offset < size).then_some((size, host + offset))
+            })
+            .min_by_key(|&(size, _)| size);
+        binding.map_or(va, |(_, host)| host)
+    })
+}
+
+pub(crate) fn forget_placed_buffer(resource: usize) {
+    with(|t| { t.placed_buffers.remove(&resource); });
+}
+
+pub(crate) fn buffer_base(resource: usize) -> Option<u64> {
+    with(|t| t.ranges.iter().flat_map(|level| level.values())
+        .find(|entry| entry.buffer && entry.res == resource)
+        .map(|entry| entry.start))
+}
+
 pub fn lookup_gpu(va: u64) -> Option<(Entry, u64)> {
     with(|t| find_in(&t.ranges, va))
 }
@@ -155,6 +182,28 @@ pub fn assign_texture_va(res: usize, len: u64, placed_va: Option<u64>) -> u64 {
     va
 }
 
+static SCARLETT_DISPLAY_VAS: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+
+pub(crate) fn note_scarlett_display_va(res: *mut c_void, va: u64) {
+    // The console allocation belongs to the title's display arena. Retire
+    // the association when the Windows resource is destroyed.
+    if unsafe { crate::title_gpu::register_destruction(res, forget_scarlett_display_va, res) } {
+        SCARLETT_DISPLAY_VAS.lock().unwrap_or_else(|e| e.into_inner()).insert(res as usize, va);
+    }
+}
+
+unsafe extern "system" fn forget_scarlett_display_va(res: *mut c_void) {
+    let res = res as usize;
+    SCARLETT_DISPLAY_VAS.lock().unwrap_or_else(|e| e.into_inner()).remove(&res);
+    with(|t| {
+        t.texture_va.remove(&res);
+        t.state.remove(&res);
+        for ranges in &mut t.ranges {
+            ranges.retain(|_, entry| entry.res != res);
+        }
+    });
+}
+
 static PATCHED: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
 static ORIGINAL: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
 static ORIGINAL_MAP: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
@@ -196,6 +245,9 @@ unsafe extern "system" fn get_gpu_va_x(this: *mut c_void) -> u64 {
     };
     if va != 0 {
         return va + crate::placed_offset::bytes(this as usize);
+    }
+    if let Some(&va) = SCARLETT_DISPLAY_VAS.lock().unwrap_or_else(|e| e.into_inner()).get(&(this as usize)) {
+        return va;
     }
     if expose_texture_va() {
         texture_va(this as usize).filter(|&v| v < SYNTHETIC_TEXTURE_BASE).unwrap_or(0)
@@ -324,8 +376,14 @@ pub unsafe fn free_backing(va: u64) -> bool {
 pub unsafe fn free_texture_backing(res: usize) -> bool {
     let va = with(|t| {
         let va = t.texture_va.remove(&res);
-        if va.is_some() {
-            t.ranges.remove(res);
+        if let Some(address) = va {
+            for levels in [&mut t.ranges, &mut t.cpu] {
+                for map in levels {
+                    if map.get(&address).is_some_and(|entry| entry.res == res) {
+                        map.remove(&address);
+                    }
+                }
+            }
         }
         t.state.remove(&res);
         t.width.remove(&res);
@@ -368,6 +426,7 @@ pub unsafe fn note_resource(real_device: *mut c_void, res: *mut c_void, desc: &[
     if res.is_null() || desc.len() < 0x38 {
         return;
     }
+    let placed_va = placed_va.filter(|&va| va != 0);
     set_state(res as usize, init_state);
     let buffer = u32::from_le_bytes(desc[0..4].try_into().unwrap()) == 1;
     let rvt = unsafe { *(res as *const *const usize) };
@@ -383,6 +442,9 @@ pub unsafe fn note_resource(real_device: *mut c_void, res: *mut c_void, desc: &[
         }
         if let Some(x) = placed_va {
             insert(Entry { start: x, len: width, res: res as usize, buffer: true });
+            if pc_va != 0 && crate::alias::is_aliased(res) {
+                with(|t| { t.placed_buffers.insert(res as usize, (x, pc_va, width)); });
+            }
         }
         crate::va_census::note(res as usize, desc, placed_va.unwrap_or(pc_va), width, placed_va.is_some());
         crate::firstuse::note(res as usize, crate::firstuse::CREATE);
@@ -398,6 +460,22 @@ pub unsafe fn note_resource(real_device: *mut c_void, res: *mut c_void, desc: &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_views_translate_live_placed_buffer_addresses() {
+        let res = 0x7272;
+        let guest = 0x750_0000_0000;
+        let host = 0x22_7000_0000;
+        let size = 0x30000;
+        insert(Entry { start: guest, len: size, res, buffer: true });
+        insert(Entry { start: host, len: size, res, buffer: true });
+        with(|t| { t.placed_buffers.insert(res, (guest, host, size)); });
+        assert_eq!(host_buffer_address(guest + 0x1ff80), host + 0x1ff80);
+        assert_eq!(host_buffer_address(guest + size), guest + size);
+        assert_eq!(host_buffer_address(host + 0x1ff80), host + 0x1ff80);
+        forget_placed_buffer(res);
+        assert_eq!(host_buffer_address(guest + 0x1ff80), guest + 0x1ff80);
+    }
 
     #[test]
     fn lookup_and_overlap_eviction() {
@@ -603,10 +681,7 @@ mod tests {
         assert_ne!(mbi_after.state, MEM_COMMIT, "backing memory must be decommitted / released");
 
         // Clean up unbacked test resource and drop heap boxes:
-        with(|t| {
-            t.texture_va.remove(&(mock_unbacked as usize));
-            t.ranges.remove(mock_unbacked as usize);
-        });
+        unsafe { free_texture_backing(mock_unbacked as usize) };
         unsafe {
             drop(Box::from_raw(mock_res as *mut *const usize));
             drop(Box::from_raw(mock_unbacked as *mut *const usize));

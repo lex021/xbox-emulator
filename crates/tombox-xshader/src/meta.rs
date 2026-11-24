@@ -251,6 +251,83 @@ pub struct StaticSampler {
     pub visibility: u32,
 }
 
+/// The Scarlett packed graphics table uses shader-local descriptor types and
+/// register numbers. The serialized signature only describes its first pair.
+pub const SCARLETT_PACKED_TABLE_SLOTS: u32 = 7;
+pub const SCARLETT_PACKED_SRV_REGISTER: u32 = 32;
+pub const SCARLETT_PACKED_CBV_REGISTER: u32 = 16;
+
+pub fn scarlett_packed_graphics_table(root: &RootSig) -> bool {
+    let [table, constants] = root.params.as_slice() else { return false };
+    let RootParamKind::Table(ranges) = &table.kind else { return false };
+    let [srv, cbv] = ranges.as_slice() else { return false };
+    root.version == 2 && root.flags == 0x801 && root.num_static_samplers == 0
+        && table.visibility == 0 && constants.visibility == 0
+        && matches!(constants.kind, RootParamKind::Constants { register: 500, space: 0, num32: 2 })
+        && srv.range_type == 0 && srv.num == 1 && srv.base_register == 2 && srv.space == 1
+        && matches!(srv.offset_in_table, 0 | u32::MAX)
+        && cbv.range_type == 2 && cbv.num == 1 && cbv.base_register == 0 && cbv.space == 1
+        && matches!(cbv.offset_in_table, 1 | u32::MAX)
+}
+
+/// The media pipeline uses the same packed table, with only b27 described
+/// in RTS0. The pixel code embeds several complete sampler descriptors.
+pub fn scarlett_media_table(root: &RootSig) -> bool {
+    let [table] = root.params.as_slice() else { return false };
+    let RootParamKind::Table(ranges) = &table.kind else { return false };
+    let [cbv] = ranges.as_slice() else { return false };
+    root.version == 2 && root.flags == 1 && root.num_static_samplers == 0
+        && table.visibility == 0 && cbv.range_type == 2 && cbv.num == 1
+        && cbv.base_register == 27 && cbv.space == 1
+        && matches!(cbv.offset_in_table, 0 | u32::MAX)
+}
+
+pub fn scarlett_graphics_table_slots(root: &RootSig) -> Option<u32> {
+    if scarlett_media_table(root) {
+        // Media shaders load a CBV descriptor at byte offset 0xe0 (slot 7).
+        Some(8)
+    } else if scarlett_packed_graphics_table(root) {
+        Some(SCARLETT_PACKED_TABLE_SLOTS)
+    } else {
+        None
+    }
+}
+
+pub const SCARLETT_MEDIA_SAMPLERS: [(u32, [u32; 4]); 3] = [
+    (29, [0x092, 0x00c00000, 0x14000000, 0]),
+    (30, [0x400, 0x00c00000, 0x18f00000, 0]),
+    (31, [0x092, 0x00c00000, 0x14500000, 0]),
+];
+
+/// Read the type of one static descriptor in the compiler's FSSM binding list.
+/// The offsets in source 3 are dword offsets within a user-data descriptor table.
+pub(crate) fn scarlett_fssm_table_kind(
+    fssm: &[u8], table_sgpr: u8, byte_offset: u32,
+) -> Option<u32> {
+    if fssm.get(..4) != Some(b"FSSM") || byte_offset % 32 != 0 {
+        return None;
+    }
+    let start = (u32_at(fssm, 0xf0).ok()? as usize).checked_add(16)?;
+    let count = u32_at(fssm, 0xfc).ok()? as usize;
+    let end = start.checked_add(count.checked_mul(20)?)?;
+    let mut kind = None;
+    for record in fssm.get(start..end)?.chunks_exact(20) {
+        let source = u32_at(record, 0).ok()?;
+        let location = u32_at(record, 16).ok()?;
+        if source >> 8 != 3 || location >> 8 != u32::from(table_sgpr)
+            || u32_at(record, 4).ok()? != byte_offset / 4
+        {
+            continue;
+        }
+        let next = source & 0xff;
+        if !matches!(next, 0 | 2) || kind.is_some_and(|previous| previous != next) {
+            return None;
+        }
+        kind = Some(next);
+    }
+    kind
+}
+
 /// Parse an RTS0 (serialized root signature) chunk body.
 pub fn parse_rts0(body: &[u8]) -> Result<RootSig, String> {
     let version = u32_at(body, 0)?;

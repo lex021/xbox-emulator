@@ -292,6 +292,37 @@ fn queue_creation_validation() {
 }
 
 #[test]
+fn scarlett_factory_slot_ten_reads_memory_and_signals_status() {
+    unsafe {
+        let mut f = core::ptr::null_mut();
+        assert_eq!(DStorageGetFactory(IID_SCARLETT_FACTORY_X.as_ptr().cast(), &mut f), S_OK);
+        let create: unsafe extern "system" fn(*mut c_void, *const u8, *const c_void, *mut *mut c_void) -> i32 =
+            core::mem::transmute(slot(f, 10));
+        let mut desc = [0u8; XQUEUE_DESC_SIZE + 8];
+        desc[0..4].copy_from_slice(&QUEUE_SOURCE_MEMORY.to_le_bytes());
+        desc[8..10].copy_from_slice(&64u16.to_le_bytes());
+        desc[10] = PRIORITY_REALTIME as u8;
+        let mut q = core::ptr::null_mut();
+        assert_eq!(create(f, desc.as_ptr(), IID_SCARLETT_QUEUE_X.as_ptr().cast(), &mut q), E_NOTIMPL);
+        assert!(q.is_null());
+        desc[XQUEUE_DESC_SIZE] = 1;
+        assert_eq!(create(f, desc.as_ptr(), IID_SCARLETT_QUEUE_X.as_ptr().cast(), &mut q), S_OK);
+        let bytes = pattern(512);
+        let compressed = zlib(&bytes);
+        let mut out = [0u8; 512];
+        let request = build_request(OPT_SOURCE_MEMORY | OPT_ZLIB, out.as_mut_ptr() as u64, 512, compressed.as_ptr() as u64, 0, compressed.len() as u32, 0);
+        let status = create_status(f, 1);
+        enqueue(q, &request);
+        enqueue_status(q, status, 0);
+        submit(q);
+        assert_eq!(wait(status, 0), S_OK);
+        assert_eq!(out.as_slice(), bytes);
+        assert_eq!(release(status), 0);
+        assert_eq!(release(q), 0);
+    }
+}
+
+#[test]
 fn file_queue_end_to_end() {
     let data = pattern(200_000);
     let comp = zlib(&data[100_000..165_536]);

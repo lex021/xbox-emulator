@@ -203,6 +203,12 @@ pub const DXGI_FORMAT_R16_UINT: u32 = 57;
 pub const PREFETCH_MAX_BYTES: u32 = 0x20_0000;
 pub const GRAPHICS_VA_HIGH_MASK: u64 = 0xffff_ff00_0000_0000;
 
+pub(crate) fn known_scarlett_buffer_address(va: u64, bytes: u64) -> bool {
+    crate::bop64::scarlett() && crate::gpu_va::lookup_buffer(va).is_some_and(|(entry, offset)| {
+        offset.checked_add(bytes).is_some_and(|end| end <= entry.len)
+    })
+}
+
 unsafe fn pc_fn(list: *mut c_void, slot: usize) -> usize {
     unsafe { *(*(list as *const *const usize)).add(slot) }
 }
@@ -306,7 +312,9 @@ static WBI_LOG: AtomicUsize = AtomicUsize::new(0);
 pub(crate) unsafe fn write_immediate(list: *mut c_void, va: u64, words: &[u32], mode: u32, what: &str) {
     let _ij = unsafe { crate::inject::scope(list, crate::inject::COPY) };
     let align = 4 * words.len() as u64;
-    if va == 0 || va & GRAPHICS_VA_HIGH_MASK != 0 || va % align != 0 {
+    if va == 0 || va % align != 0
+        || (va & GRAPHICS_VA_HIGH_MASK != 0 && !known_scarlett_buffer_address(va, align))
+    {
         if once(&WBI_LOG, 8) {
             record("d3d12_xs", "console_slots", &format!("{what}: destination {va:#x} must be {align}-byte aligned (console validation)"));
         }
@@ -340,7 +348,7 @@ pub(crate) unsafe fn write_immediate(list: *mut c_void, va: u64, words: &[u32], 
             return;
         }
     }
-    let params = wbi_params(va, words);
+    let params = wbi_params(crate::gpu_va::host_buffer_address(va), words);
     let modes = vec![mode; params.len()];
     unsafe {
         if let Some((a, b)) = db { crate::fill::barrier_pub(list, e.res, a, b); }

@@ -402,7 +402,9 @@ pub unsafe extern "system" fn create_command_signature_x(this: *mut c_void, desc
         unsafe { core::mem::transmute(*vt(real).add(41)) };
     let hr = unsafe { f(real, pc_desc.as_ptr(), pass_root, riid, ppv) };
     if hr >= 0 {
-        crate::replay::note_signature(unsafe { *ppv } as usize, stride, &args, pass_root as usize);
+        let signature = unsafe { *ppv };
+        unsafe { crate::gws_dispatch::note_indirect_signature(signature, stride, &args) };
+        crate::replay::note_signature(signature as usize, stride, &args, pass_root as usize);
     }
     if hr < 0 || once(&N, 6) {
         record("d3d12_xs", "CreateCommandSignature", &format!(

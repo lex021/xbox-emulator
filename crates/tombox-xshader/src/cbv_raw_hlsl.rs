@@ -152,6 +152,9 @@ pub fn table_cbv_ranges(rs: Option<&crate::meta::RootSig>) -> Vec<(u32, u32, u32
             v.extend(ranges.iter().filter(|r| r.range_type == 2).map(|r| (r.base_register, r.num.max(1), r.space)));
         }
     }
+    if let Some(slots) = rs.and_then(crate::meta::scarlett_graphics_table_slots) {
+        v.push((crate::meta::SCARLETT_PACKED_CBV_REGISTER, slots, 1));
+    }
     v
 }
 
@@ -161,7 +164,7 @@ pub fn in_table(t: &[(u32, u32, u32)], reg: u32, space: u32) -> bool {
 
 pub fn rewrite_tables(h: &str, rs: Option<&crate::meta::RootSig>) -> Result<String, String> {
     let t = table_cbv_ranges(rs);
-    if t.is_empty() {
+    if t.is_empty() && !h.contains("ConstantBuffer<TbHeapCb") {
         return Ok(h.to_string());
     }
     rewrite_hlsl_where(h, &|r, sp| in_table(&t, r, sp))
@@ -178,7 +181,20 @@ fn rewrite_sel(h: &str, pick: &dyn Fn(u32, u32) -> bool, all: bool) -> Result<St
     let mut names = Vec::new();
     let mut body = String::with_capacity(h.len() + 256);
     for line in h.split_inclusive('\n') {
-        if let Some((name, r, space)) = parse_decl(line) {
+        if let Some(rest) = line.strip_prefix("ConstantBuffer<TbHeapCb") {
+            let (slot, function) = rest.split_once('>').ok_or("invalid heap constant buffer declaration")?;
+            let slot = slot.parse::<u32>().map_err(|_| "invalid heap constant buffer slot")?;
+            let (_, read) = function.split_once("ResourceDescriptorHeap[").ok_or("heap CBV has no descriptor lookup")?;
+            let (index, _) = read.split_once("];").ok_or("invalid heap CBV lookup")?;
+            body.push_str(&format!(
+                "ByteAddressBuffer tb_get_raw_cb{slot}() {{ ByteAddressBuffer value = ResourceDescriptorHeap[{index}]; return value; }}\n#define tb_cbr{slot} tb_get_raw_cb{slot}()\n",
+            ));
+            names.push(format!("cb{slot}"));
+        } else if line.strip_prefix("#define cb").and_then(|s| s.strip_suffix("_.v\n"))
+            .is_some_and(|s| s.split_once(" cb").is_some_and(|(left, right)| left == right && names.iter().any(|n| n[2..] == *left)))
+        {
+            continue;
+        } else if let Some((name, r, space)) = parse_decl(line) {
             if !pick(r, space) {
                 body.push_str(line);
                 continue;

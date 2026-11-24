@@ -235,6 +235,31 @@ pub unsafe extern "system" fn XGValidateDepthStencilSwizzleMode(a1: usize, a2: u
     }
 }
 
+/// Suggest the Scarlett layout using the same descriptor conversion as the texture computer.
+#[no_mangle]
+pub unsafe extern "system" fn XGSuggestSwizzleMode(desc: *const u8, flags: u32, layout: *mut u32) -> i32 {
+    console!("XGSuggestSwizzleMode", fn(*const u8, u32, *mut u32) -> i32, desc, flags, layout);
+    if desc.is_null() || layout.is_null() {
+        return E_INVALIDARG;
+    }
+    if flags != 0 {
+        return E_NOTIMPL;
+    }
+    let d = unsafe { D3D12Desc::read(desc) };
+    if !(2..=4).contains(&d.dimension) {
+        return E_INVALIDARG;
+    }
+    let (bind, misc) = d.xg_flags();
+    let mode = if bind & 0x40 != 0 {
+        24
+    } else {
+        optimal_swizzle(d.dimension, d.format, d.width, d.height, u32::from(d.depth_or_array),
+            d.samples, bind & 0x20 != 0, bind & 0x80 != 0, d.layout == 2)
+    };
+    unsafe { layout.write_unaligned(0x100 | mode) };
+    S_OK
+}
+
 pub struct D3D12Desc {
     pub dimension: u32,
     pub width: u64,
@@ -265,11 +290,7 @@ impl D3D12Desc {
         }
     }
 
-    pub fn to_tex2d(&self) -> Result<Tex2DDesc, layout::Fail> {
-        use layout::Fail;
-        if self.dimension <= 1 {
-            return Err(Fail::Invalid("dimension"));
-        }
+    fn xg_flags(&self) -> (u32, u32) {
         let fl = self.flags;
         let mut bind = 8 | (fl & 2) << 5;
         if fl & 1 != 0 {
@@ -291,6 +312,15 @@ impl D3D12Desc {
         if fl & 0x80_0000 != 0 {
             misc |= 0x8000;
         }
+        (bind, misc)
+    }
+
+    pub fn to_tex2d(&self) -> Result<Tex2DDesc, layout::Fail> {
+        use layout::Fail;
+        if self.dimension <= 1 {
+            return Err(Fail::Invalid("dimension"));
+        }
+        let (bind, mut misc) = self.xg_flags();
         let lay = self.layout;
         let mode = if lay & !2 == 0 {
             if lay == 2 {

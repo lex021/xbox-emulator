@@ -80,15 +80,29 @@ impl Emitter<'_> {
         n > 0 && n <= 64 && self.insns.iter().any(|i| i.enc == crate::rdna2::Enc::Ds && i.mnemonic != "ds_swizzle_b32")
     }
 
+    pub(super) fn lds_dwords(&self) -> usize {
+        if self.xdxr_root() && self.ex.fssm.get(..8) == Some(b"FSSM\x01\x01\0\0")
+            && self.ex.isa_offset_in_fssm == 0x150
+        {
+            if let Some(bytes) = self.ex.fssm.get(0x10c..0x110) {
+                let bytes = u32::from_le_bytes(bytes.try_into().unwrap()) as usize;
+                if (4..=32768).contains(&bytes) && bytes % 4 == 0 {
+                    return bytes / 4;
+                }
+            }
+        }
+        8192
+    }
+
     pub(super) fn xlane_header(&self) -> Result<Option<String>, String> {
         if !self.is_cs || !self.body.contains("tb_xl[") {
             return Ok(None);
         }
-        if self.uses_lds {
-            return Err("ds_permute/ds_bpermute in a compute shader that also uses LDS: the 32-lane exchange needs groupshared space beyond the 32 KiB LDS mirror".into());
-        }
         let (x, y, z) = self.cs_threads();
         let n = x * y * z;
+        if self.uses_lds && self.lds_dwords() + n as usize * 3 > 8192 {
+            return Err("DS lane exchange and the shader's LDS allocation exceed the 32 KiB D3D12 groupshared limit".into());
+        }
         Ok(Some(format!("#define TB_XL_GS 1\ngroupshared uint tb_xl[{n}];\ngroupshared uint tb_xm[{n}];\ngroupshared uint tb_xa[{n}];")))
     }
 

@@ -35,6 +35,7 @@ struct Heap {
     gpu: u64,
     count: usize,
     inc: usize,
+    kind: Option<u32>,
 }
 
 struct Buf {
@@ -87,8 +88,12 @@ pub fn increment(heap_type: u32) -> usize {
 pub fn note_heap(cpu: usize, gpu: u64, count: u32, heap_type: u32) {
     with(|s| {
         let inc = s.inc.get(heap_type as usize).copied().unwrap_or(0);
+        if crate::gws_dispatch::resume_enabled() {
+            let end = cpu.saturating_add((count as usize).saturating_mul(inc));
+            s.descs.retain(|&handle, _| !(cpu..end).contains(&handle));
+        }
         s.heaps.retain(|h| h.cpu != cpu);
-        s.heaps.push(Heap { cpu, gpu, count: count as usize, inc });
+        s.heaps.push(Heap { cpu, gpu, count: count as usize, inc, kind: Some(heap_type) });
     });
 }
 
@@ -193,6 +198,32 @@ pub fn heaps() -> Vec<(usize, u64, usize, usize)> {
     with(|s| s.heaps.iter().map(|h| (h.cpu, h.gpu, h.count, h.inc)).collect())
 }
 
+pub(crate) fn descriptor_snapshot(
+    cpu: usize,
+    gpu: u64,
+    tables: &[(u64, usize)],
+) -> Option<(usize, Vec<Desc>)> {
+    with(|s| {
+        let heap = s.heaps.iter().find(|heap| heap.cpu == cpu && heap.gpu == gpu && heap.kind == Some(0))?;
+        if cpu == 0 || gpu == 0 || heap.inc == 0 {
+            return None;
+        }
+        let mut entries = Vec::new();
+        for &(start, count) in tables {
+            let offset = usize::try_from(start.checked_sub(gpu)?).ok()?;
+            let end = (offset / heap.inc).checked_add(count)?;
+            if offset % heap.inc != 0 || end > heap.count {
+                return None;
+            }
+            for index in offset / heap.inc..end {
+                let address = cpu.checked_add(index.checked_mul(heap.inc)?)?;
+                entries.push(s.descs.get(&address)?.d.clone());
+            }
+        }
+        Some((heap.inc, entries))
+    })
+}
+
 pub fn descs_in(cpu: usize, len: usize) -> Vec<(usize, Desc)> {
     with(|s| {
         let mut v: Vec<(usize, Desc)> = s.descs.iter().filter(|(k, _)| **k >= cpu && **k < cpu + len).map(|(k, e)| (*k, e.d.clone())).collect();
@@ -247,7 +278,7 @@ pub unsafe fn read_va(va: u64, n: usize) -> Option<Vec<u8>> {
 pub fn note_heap_inc(cpu: usize, gpu: u64, count: u32, inc: usize) {
     with(|s| {
         s.heaps.retain(|h| h.cpu != cpu);
-        s.heaps.push(Heap { cpu, gpu, count: count as usize, inc });
+        s.heaps.push(Heap { cpu, gpu, count: count as usize, inc, kind: None });
     });
 }
 

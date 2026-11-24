@@ -111,7 +111,9 @@ pub fn plan(scarlett: bool, list_type: u32, closed: bool, va: u64, value: u64, f
         return Plan::Reject("64 bit value writes cannot be inserted into a closed command list.");
     }
     if let Err(e) = bop64_route(va, flags) {
-        return Plan::Reject(e);
+        if !(scarlett && va != 0 && va % 8 == 0 && crate::console_slots::known_scarlett_buffer_address(va, 8)) {
+            return Plan::Reject(e);
+        }
     }
     let eop = if scarlett { decode_release_mem(&release_mem(va, value, flush, flags), flush) } else { decode(&packet(va, value, flush, flags)) };
     match eop {
@@ -236,7 +238,7 @@ unsafe fn write_value(list: *mut c_void, va: u64, value: u64) {
             record("d3d12_xs", "bop64", &format!("{W} {va:#x}: {why}"));
         }
     };
-    let Some((e, off)) = crate::gpu_va::lookup(va) else {
+    let Some((e, off)) = crate::gpu_va::lookup_buffer(va).or_else(|| crate::gpu_va::lookup(va)) else {
         return fallback("destination is not in graphics memory owned by a tracked resource");
     };
     if !e.buffer || off + 8 > e.len {

@@ -5,11 +5,11 @@ use core::ffi::c_void;
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 
-const COPY_DEST: u32 = 0x400;
-const UAV: u32 = 8;
+pub(crate) const COPY_DEST: u32 = 0x400;
+pub(crate) const UAV: u32 = 8;
 const GENERIC_READ: u32 = 0xac3;
 
-struct Resource(usize);
+pub(crate) struct Resource(pub(crate) usize);
 
 impl Drop for Resource {
     fn drop(&mut self) {
@@ -20,18 +20,14 @@ impl Drop for Resource {
     }
 }
 
-struct Scratch {
-    _gpu: Resource,
-    _upload: Resource,
-    _pipeline: Resource,
-}
+pub(crate) type Scratch = Arc<Vec<Resource>>;
 
 struct Submission {
     fence: Option<Resource>,
-    _scratch: Vec<Arc<Scratch>>,
+    _scratch: Vec<Scratch>,
 }
 
-static RECORDINGS: LazyLock<Mutex<HashMap<usize, Vec<Arc<Scratch>>>>> =
+static RECORDINGS: LazyLock<Mutex<HashMap<usize, Vec<Scratch>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static SUBMISSIONS: Mutex<Vec<Submission>> = Mutex::new(Vec::new());
 static WAKE: Condvar = Condvar::new();
@@ -85,7 +81,10 @@ fn collect() {
 }
 
 pub(crate) fn forget(list: *mut c_void) {
-    if !crate::gws_dispatch::phased_enabled() {
+    if crate::gws_dispatch::phased_enabled() {
+        crate::gws_dispatch::forget_checkpoint(list);
+        crate::gws_dispatch::forget_signals(list);
+    } else if !crate::global_bind::enabled() {
         return;
     }
     let scratch = RECORDINGS.lock().unwrap().remove(&(list as usize));
@@ -96,7 +95,7 @@ pub(crate) fn forget(list: *mut c_void) {
 }
 
 pub(crate) unsafe fn submitted(queue: *mut c_void, lists: &[*mut c_void]) {
-    if !crate::gws_dispatch::phased_enabled() {
+    if !crate::gws_dispatch::phased_enabled() && !crate::global_bind::enabled() {
         return;
     }
     let recordings = RECORDINGS.lock().unwrap();
@@ -107,6 +106,10 @@ pub(crate) unsafe fn submitted(queue: *mut c_void, lists: &[*mut c_void]) {
         .cloned()
         .collect();
     drop(recordings);
+    unsafe { retain_submission(queue, scratch) };
+}
+
+pub(crate) unsafe fn retain_submission(queue: *mut c_void, scratch: Vec<Scratch>) {
     if scratch.is_empty() {
         return;
     }
@@ -116,7 +119,7 @@ pub(crate) unsafe fn submitted(queue: *mut c_void, lists: &[*mut c_void]) {
     } else {
         let fence = Resource(fence);
         let signal: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> i32 =
-            unsafe { core::mem::transmute(slot(queue, 14)) };
+            unsafe { core::mem::transmute(crate::present::host_queue_signal(queue)) };
         (unsafe { signal(queue, fence.0 as *mut c_void, 1) } >= 0).then_some(fence)
     };
     if fence.is_none() {
@@ -135,17 +138,16 @@ pub(crate) unsafe fn submitted(queue: *mut c_void, lists: &[*mut c_void]) {
 }
 
 #[cfg(test)]
-pub(crate) fn recording_probe(list: *mut c_void) -> impl Fn() -> bool {
-    let weak = Arc::downgrade(&RECORDINGS.lock().unwrap()[&(list as usize)][0]);
-    move || weak.strong_count() != 0
+pub(crate) fn recording_probe(list: *mut c_void) -> impl Fn() -> usize {
+    let weak: Vec<_> = RECORDINGS.lock().unwrap()[&(list as usize)].iter().map(Arc::downgrade).collect();
+    move || weak.iter().filter(|item| item.strong_count() != 0).count()
 }
 
 pub(crate) unsafe fn begin(
     list: *mut c_void,
     pso: *mut c_void,
     bytes: u32,
-    root: u32,
-) -> Option<usize> {
+) -> Option<(usize, u64)> {
     collect();
     let bytes = u64::from(bytes);
     let (gpu, va) = unsafe { crate::gds::create_buffer(list, bytes, 1, 4, COPY_DEST) }?;
@@ -168,26 +170,28 @@ pub(crate) unsafe fn begin(
     let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 =
         unsafe { core::mem::transmute(slot(pso, 1)) };
     unsafe { add_ref(pso) };
-    RECORDINGS
-        .lock()
-        .unwrap()
-        .entry(list as usize)
-        .or_default()
-        .push(Arc::new(Scratch {
-            _gpu: gpu,
-            _upload: upload,
-            _pipeline: Resource(pso as usize),
-        }));
+    retain(list, vec![gpu, upload, Resource(pso as usize)]);
     let copy: unsafe extern "system" fn(*mut c_void, usize, u64, *mut c_void, u64, u64) =
         unsafe { core::mem::transmute(slot(list, 15)) };
-    let bind: unsafe extern "system" fn(*mut c_void, u32, u64) =
-        unsafe { core::mem::transmute(slot(list, 41)) };
-    unsafe {
-        copy(list, dst, 0, src, 0, bytes);
-        crate::fill::barrier_pub(list, dst, COPY_DEST, UAV);
-        bind(list, root, va);
-    }
-    Some(dst)
+    unsafe { copy(list, dst, 0, src, 0, bytes) };
+    Some((dst, va))
+}
+
+pub(crate) fn retain(list: *mut c_void, resources: Vec<Resource>) {
+    RECORDINGS.lock().unwrap().entry(list as usize).or_default().push(Arc::new(resources));
+}
+
+pub(crate) fn recording(source: *mut c_void, needed: impl Fn(usize) -> bool) -> Option<Vec<Scratch>> {
+    let recordings = RECORDINGS.lock().unwrap();
+    let retained: Vec<_> = recordings.get(&(source as usize))?.iter()
+        .filter(|allocation| allocation.iter().any(|resource| needed(resource.0)))
+        .cloned()
+        .collect();
+    (!retained.is_empty()).then_some(retained)
+}
+
+pub(crate) fn retain_shared(list: *mut c_void, resources: &[Scratch]) {
+    RECORDINGS.lock().unwrap().entry(list as usize).or_default().extend_from_slice(resources);
 }
 
 pub(crate) unsafe fn end(list: *mut c_void, resource: usize) {

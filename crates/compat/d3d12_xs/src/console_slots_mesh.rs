@@ -175,10 +175,12 @@ unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, bl
     let b = unsafe { core::slice::from_raw_parts(blob, len) };
     let flags = console_root_flags(b);
     let pc = pc_root_blob(b);
-    let hr = match &pc {
-        Some(p) => unsafe { f(this, mask, p.as_ptr(), p.len(), riid, ppv) },
-        None => unsafe { f(this, mask, blob, len, riid, ppv) },
-    };
+    let (ptr, size) = pc.as_ref().map_or((blob, len), |p| (p.as_ptr(), p.len()));
+    let extended = flags.filter(|&fl| crate::rs_xbox::XboxRoot(fl).internal_xdxr())
+        .and_then(|_| unsafe {
+            crate::global_bind::create_root(ptr, size, riid, ppv, |p, n| f(this, mask, p, n, riid, ppv))
+        });
+    let hr = extended.unwrap_or_else(|| unsafe { f(this, mask, ptr, size, riid, ppv) });
     if hr >= 0 && !ppv.is_null() && !unsafe { *ppv }.is_null() {
         if let Some(fl) = flags {
             unsafe { store_root_data(*ppv, b) };

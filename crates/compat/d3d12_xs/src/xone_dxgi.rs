@@ -56,7 +56,7 @@ unsafe fn com_addref(o: usize) {
     }
 }
 
-unsafe fn com_release(o: usize) -> u32 {
+pub(crate) unsafe fn com_release(o: usize) -> u32 {
     if o == 0 {
         return 0;
     }
@@ -81,24 +81,39 @@ extern "system" {
     fn GetProcAddress(h: *mut c_void, n: *const u8) -> *mut c_void;
 }
 
-fn host_adapter(real_device: *mut c_void) -> usize {
+fn host_factory() -> Result<*mut c_void, i32> {
     let name: Vec<u16> = r"C:\Windows\System32\dxgi.dll".encode_utf16().chain(std::iter::once(0)).collect();
     let dxgi = unsafe { LoadLibraryW(name.as_ptr()) };
     if dxgi.is_null() {
         record("d3d12_xs", "xone.IDXGIDevice", "dxgi.dll not loadable -> no adapter");
-        return 0;
+        return Err(DXGI_ERROR_NOT_FOUND);
     }
     let cf = unsafe { GetProcAddress(dxgi, b"CreateDXGIFactory2\0".as_ptr()) };
     if cf.is_null() {
-        return 0;
+        return Err(E_NOINTERFACE);
     }
     let cf: unsafe extern "system" fn(u32, *const G, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(cf) };
     let mut factory: *mut c_void = core::ptr::null_mut();
     let hr = unsafe { cf(0, &IID_IDXGIFACTORY4, &mut factory) };
     if hr != S_OK || factory.is_null() {
         record("d3d12_xs", "xone.IDXGIDevice", &format!("CreateDXGIFactory2(IDXGIFactory4) hr={hr:#010x}"));
-        return 0;
+        return Err(if hr < 0 { hr } else { E_POINTER });
     }
+    Ok(factory)
+}
+
+pub(crate) fn warp_adapter() -> Result<*mut c_void, i32> {
+    let factory = host_factory()?;
+    let mut adapter = core::ptr::null_mut();
+    let enumerate: unsafe extern "system" fn(*mut c_void, *const G, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(slot(factory, 27)) };
+    let hr = unsafe { enumerate(factory, &IID_IDXGIADAPTER, &mut adapter) };
+    unsafe { com_release(factory as usize) };
+    if hr < 0 { Err(hr) } else if adapter.is_null() { Err(E_POINTER) } else { Ok(adapter) }
+}
+
+fn host_adapter(real_device: *mut c_void) -> usize {
+    let Ok(factory) = host_factory() else { return 0 };
     let mut luid = 0u64;
     if !real_device.is_null() {
         let get_luid: unsafe extern "system" fn(*mut c_void, *mut u64) -> *mut u64 = unsafe { core::mem::transmute(slot(real_device, 43)) };

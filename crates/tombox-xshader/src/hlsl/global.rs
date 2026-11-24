@@ -2,7 +2,7 @@ use super::{r, Emitter};
 use crate::global_abi::{TB_GLOBAL_FAULT_UAV, TB_GLOBAL_SPACE, TB_GLOBAL_WINDOWS};
 use crate::rdna2::{Enc, Insn, Opnd};
 
-pub const HELPERS: &str = r#"cbuffer TbGlobal : register(bCBV, spaceSPACE) { uint4 tb_gwin[NWIN]; uint4 tb_msin; };
+pub const HELPERS: &str = r#"cbuffer TbGlobal : register(bCBV, spaceSPACE) { uint4 tb_gwin[NWIN]; uint4 tb_msin; uint4 tb_root_va[NROOT]; };
 RWByteAddressBuffer tb_gw0 : register(u0, spaceSPACE);
 RWByteAddressBuffer tb_gw1 : register(u1, spaceSPACE);
 RWByteAddressBuffer tb_gfault : register(uFAULT, spaceSPACE);
@@ -70,6 +70,38 @@ void tb_gmem_store_n(uint2 va, uint v, uint nbytes) {
     if (first < nbytes) tb_gstore_bits(tb_gva(va.x, va.y, first, 0), v >> (first * 8u), nbytes - first);
 }
 void tb_gmem_store(uint2 va, uint v) { tb_gmem_store_n(va, v, 4u); }
+uint tb_gfloat_key(uint b) {
+    return (b & 0x80000000u) != 0u ? ~b : (b ^ 0x80000000u);
+}
+uint tb_gfloat_extreme(uint old, uint value, bool upper) {
+    uint a = old & 0x7fffffffu, b = value & 0x7fffffffu;
+    // The ordered comparison keeps the existing bits on NaN and equal values,
+    // including signed zero. Integer keys also preserve subnormal ordering.
+    if (max(a, b) > 0x7f800000u || (a | b) == 0u) return old;
+    uint ka = tb_gfloat_key(old), kb = tb_gfloat_key(value);
+    return (upper ? kb > ka : kb < ka) ? value : old;
+}
+uint tb_gatomic(uint2 va, uint value, uint op) {
+    uint o;
+    uint w = tb_gwhich(va, o);
+    if (w == 0xffffffffu || (o & 3u) != 0u) { tb_gmiss(va); return 0u; }
+    uint before;
+    if (op < 2u) {
+        uint delta = op == 0u ? value : (0u - value);
+        if (w == 0u) tb_gw0.InterlockedAdd(o, delta, before);
+        else tb_gw1.InterlockedAdd(o, delta, before);
+        return before;
+    }
+    before = tb_gload_al(w, o);
+    [allow_uav_condition] for (;;) {
+        uint after = tb_gfloat_extreme(before, value, op == 3u);
+        uint seen;
+        if (w == 0u) tb_gw0.InterlockedCompareExchange(o, before, after, seen);
+        else tb_gw1.InterlockedCompareExchange(o, before, after, seen);
+        if (seen == before) return before;
+        before = seen;
+    }
+}
 #define TB_GMEM 1
 #ifndef TB_AMP_GMEM
 #define tb_gload tb_gmem_load
@@ -84,6 +116,7 @@ pub fn helpers() -> String {
         .replace("uFAULT", &format!("u{TB_GLOBAL_FAULT_UAV}"))
         .replace("NWINu", &format!("{TB_GLOBAL_WINDOWS}u"))
         .replace("NWIN", &TB_GLOBAL_WINDOWS.to_string())
+        .replace("NROOT", &crate::global_abi::TB_GLOBAL_ROOT_VAS.to_string())
         .replace("SPACE", &TB_GLOBAL_SPACE.to_string())
 }
 
@@ -156,6 +189,35 @@ impl<'a> Emitter<'a> {
         if bytes == 4 { format!("tb_gstore({a}, {val});") } else { format!("tb_gstore_n({a}, {val}, {bytes}u);") }
     }
 
+    pub(super) fn emit_global_scalar(&mut self, ins: &Insn) -> Result<(), String> {
+        let base = ins.src.first().and_then(super::sreg_num).ok_or("global scalar read needs an SGPR pair")?;
+        let dst = ins.dst.first().and_then(super::sreg_num).ok_or("global scalar read needs an SGPR destination")?;
+        let lo = super::sreg_opnd(base);
+        let hi = super::sreg_opnd(base + 1);
+        self.touch(&lo);
+        self.touch(&hi);
+        let offset = (ins.raw[1] >> 25) as u8;
+        let dynamic = match offset {
+            0x7d => "0u".to_string(),
+            0..=107 => {
+                let reg = Opnd::Sgpr(offset);
+                self.touch(&reg);
+                format!("({} & ~3u)", r(&reg)?)
+            }
+            _ => return Err(format!("global scalar read at {:#x}: unsupported SOFFSET {offset}", ins.offset)),
+        };
+        let imm = (ins.aux.imm as i32) & !3;
+        let t = self.tmp;
+        self.tmp += 1;
+        self.uses_global = true;
+        // SGPR bits above the 48-bit address carry scalar load control and cache fields.
+        self.line(&format!("uint2 g{t} = tb_gva({} & ~3u, {} & 0xffffu, {dynamic}, {imm});", r(&lo)?, r(&hi)?));
+        for i in 0..(1u8 << ins.op) {
+            self.ws(&super::sreg_opnd(dst + i), &self.global_load_expr(&format!("g{t}"), i, 4, false))?;
+        }
+        Ok(())
+    }
+
     pub(super) fn emit_global(&mut self, ins: &Insn) -> Result<(), String> {
         let m = ins.mnemonic.as_str();
         if ins.aux.mask == 1 {
@@ -163,6 +225,28 @@ impl<'a> Emitter<'a> {
         }
         if ins.raw.first().is_some_and(|w| (w >> 13) & 1 != 0) {
             return Err(format!("{m}: LDS=1 (memory <-> LDS transfer) is not lowered"));
+        }
+        let atom = match m {
+            "flat_atomic_add" => Some(0),
+            "flat_atomic_sub" => Some(1),
+            "flat_atomic_fmin" => Some(2),
+            "flat_atomic_fmax" => Some(3),
+            _ => None,
+        };
+        if let Some(atom) = atom {
+            let addr = self.global_va(ins)?;
+            let data = ins.src.get(1).ok_or("global atomic lacks a data operand")?;
+            self.touch(data);
+            let expr = format!("tb_gatomic({addr}, {}, {atom}u)", r(data)?);
+            if ins.raw[0] & (1 << 16) != 0 {
+                let dst = ins.dst.first().ok_or("global atomic lacks a return register")?;
+                let t = self.tmp;
+                self.tmp += 1;
+                self.line(&format!("uint g{t} = 0u; if (exec_lo & 1u) g{t} = {expr};"));
+                return self.wv(dst, &format!("g{t}"));
+            }
+            self.line(&format!("if (exec_lo & 1u) {{ {expr}; }}"));
+            return Ok(());
         }
         let (store, n, bytes, signed) = width(m).ok_or_else(|| format!("{m}: global/flat operation unsupported"))?;
         let va = self.global_va(ins)?;

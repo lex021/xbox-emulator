@@ -219,6 +219,123 @@ unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, s
     }
 }
 
+pub const SC_BARRIER: usize = 146;
+const PC_BARRIER: usize = 80;
+const IID_LIST7: Guid = Guid {
+    d1: 0xdd171223,
+    d2: 0x8b61,
+    d3: 0x4769,
+    d4: [0x90, 0xe3, 0x16, 0x0c, 0xcd, 0xe4, 0xe2, 0xc1],
+};
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct BarrierGroup {
+    kind: u32,
+    count: u32,
+    barriers: *const c_void,
+}
+
+unsafe fn host_enhanced_barriers(list: *mut c_void) -> Result<(), i32> {
+    let get_device: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(pc_fn(list, PC_SLOT_GET_DEVICE)) };
+    let mut device = core::ptr::null_mut();
+    let hr = unsafe { get_device(list, &IID_DEVICE, &mut device) };
+    if hr < 0 || device.is_null() {
+        return Err(hr);
+    }
+    let check: unsafe extern "system" fn(*mut c_void, u32, *mut u32, u32) -> i32 =
+        unsafe { core::mem::transmute(pc_fn(device, 13)) };
+    let mut options12 = [0; 3];
+    let hr = unsafe { check(device, 41, options12.as_mut_ptr(), 12) };
+    let release: unsafe extern "system" fn(*mut c_void) -> u32 =
+        unsafe { core::mem::transmute(pc_fn(device, 2)) };
+    unsafe { release(device) };
+    if hr < 0 {
+        return Err(hr);
+    }
+    if options12[1] == 0 {
+        return Err(0x8000_4001u32 as i32);
+    }
+    Ok(())
+}
+
+/// Scarlett builds the same 16-byte groups and 64-byte texture/40-byte buffer
+/// barriers as Windows D3D12. The host method is on command-list interface 7.
+pub(crate) unsafe extern "system" fn scarlett_barrier(
+    list: *mut c_void, count: u32, groups: *const BarrierGroup,
+) {
+    if count == 0 {
+        return;
+    }
+    if std::env::var_os("TOMBOX_SCARLETT_BARRIER_TRACE").is_some() && !groups.is_null() {
+        static TRACE_CALLS: AtomicUsize = AtomicUsize::new(0);
+        if TRACE_CALLS.fetch_add(1, Ordering::Relaxed) < 24 {
+            for group in unsafe { core::slice::from_raw_parts(groups, count as usize) } {
+                if group.kind == 1 && !group.barriers.is_null() {
+                    for index in 0..group.count.min(10) as usize {
+                        let ptr = unsafe { group.barriers.cast::<[u32; 16]>().add(index) };
+                        let entry = unsafe { ptr.read_unaligned() };
+                        record("d3d12_xs", "ScarlettBarrierDetail", &format!(
+                            "list={list:p} index={index} sync={:x?} access={:x?} layouts={:?} resource={:08x}{:08x} subs={:x?}",
+                            &entry[..2], &entry[2..4], &entry[4..6], entry[7], entry[6], &entry[8..15],
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let result = (|| {
+        unsafe { host_enhanced_barriers(list) }?;
+        let query: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 =
+            unsafe { core::mem::transmute(pc_fn(list, 0)) };
+        let mut list7 = core::ptr::null_mut();
+        let hr = unsafe { query(list, &IID_LIST7, &mut list7) };
+        if hr < 0 || list7.is_null() {
+            return Err(hr);
+        }
+        let barrier: unsafe extern "system" fn(*mut c_void, u32, *const BarrierGroup) =
+            unsafe { core::mem::transmute(pc_fn(list7, PC_BARRIER)) };
+        // Scarlett has a separate display layout (31). The desktop display
+        // layout aliases COMMON (0). Only map transitions marked NO_ACCESS.
+        let mut texture_groups: Vec<Vec<[u32; 16]>> = Vec::new();
+        let mut translated = unsafe { core::slice::from_raw_parts(groups, count as usize) }.to_vec();
+        for group in translated.iter_mut().filter(|group| group.kind == 1 && group.count != 0) {
+            let textures = unsafe {
+                core::slice::from_raw_parts(group.barriers.cast::<[u32; 16]>(), group.count as usize)
+            };
+            if !textures.iter().any(|entry| entry[4] == 31 || entry[5] == 31) {
+                continue;
+            }
+            let mut adjusted = textures.to_vec();
+            for entry in &mut adjusted {
+                if entry[4] == 31 && entry[2] == 0x8000_0000 && entry[0] == 0 {
+                    entry[4] = 0;
+                }
+                if entry[5] == 31 && entry[3] == 0x8000_0000 && entry[1] == 0 {
+                    entry[5] = 0;
+                }
+            }
+            group.barriers = adjusted.as_ptr().cast();
+            texture_groups.push(adjusted);
+        }
+        unsafe { barrier(list7, count, translated.as_ptr()) };
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 =
+            unsafe { core::mem::transmute(pc_fn(list7, 2)) };
+        unsafe { release(list7) };
+        Ok(())
+    })();
+    if let Err(hr) = result {
+        record("d3d12_xs", "ScarlettBarrier", &format!("slot=146 groups={count} failed hr={hr:#010x}"));
+        extern "system" { fn ExitProcess(code: u32) -> !; }
+        unsafe { ExitProcess(0xe001_0146) };
+    }
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    if CALLS.fetch_add(1, Ordering::Relaxed) < 6 {
+        record("d3d12_xs", "ScarlettBarrier", &format!("slot=146 forwarded {count} group(s) via host Barrier"));
+    }
+}
+
 pub const CL_GET_DEVICE: usize = 7;
 const E_POINTER: i32 = 0x8000_4003u32 as i32;
 

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use crate::sys::*;
-use compat_common::record;
+use compat_common::{physical_pages::{FIRST_TITLE_FRAME, FRAMES_PER_PAGE}, record};
 
 #[path = "phys_runs.rs"]
 mod runs;
@@ -12,8 +12,8 @@ const M: &str = "xmem";
 pub use compat_common::physical_pages::PAGE_BYTES as PAGE;
 
 const MEM_PRIVATE: u32 = 0x2_0000;
-const MEM_RESERVE_PLACEHOLDER: u32 = 0x4_0000;
-const MEM_REPLACE_PLACEHOLDER: u32 = 0x4000;
+pub(crate) const MEM_RESERVE_PLACEHOLDER: u32 = 0x4_0000;
+pub(crate) const MEM_REPLACE_PLACEHOLDER: u32 = 0x4000;
 const MEM_PRESERVE_PLACEHOLDER: u32 = 0x2;
 const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
 const SEC_COMMIT: u32 = 0x800_0000;
@@ -75,6 +75,9 @@ impl Frozen {
                 CloseHandle(snap);
             }
             let handles: Vec<usize> = ids.iter().map(|&t| OpenThread(0x2 | 0x8, 0, t)).filter(|&h| h != 0).collect();
+            // A suspended thread may own the process heap lock. Drop temporary
+            // allocations before suspending any threads.
+            drop(ids);
             let mut f = Frozen { suspended: vec![false; handles.len()], handles, _ctx: Box::new(Context([0u8; 0x4d0])) };
             let ctx = f._ctx.0.as_mut_ptr();
             for i in 0..f.handles.len() {
@@ -109,6 +112,15 @@ extern "system" {
     fn UnmapViewOfFile2(process: Handle, base: *mut c_void, flags: u32) -> i32;
 }
 
+pub(crate) fn alloc_placeholder(base: usize, len: usize, flags: u32, protect: u32) -> *mut c_void {
+    unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(), base as *mut c_void, len, flags, protect,
+            core::ptr::null_mut(), 0,
+        )
+    }
+}
+
 struct Section {
     handle: usize,
     live: usize,
@@ -135,7 +147,7 @@ static S: Mutex<Option<State>> = Mutex::new(None);
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let mut g = S.lock().unwrap_or_else(|e| e.into_inner());
     let s = g.get_or_insert_with(|| State {
-        next_pfn: compat_common::physical_pages::FIRST_TITLE_PAGE,
+        next_pfn: FIRST_TITLE_FRAME,
         next_section: 1,
         sections: HashMap::new(),
         pfns: HashMap::new(),
@@ -192,12 +204,60 @@ fn query(addr: usize) -> Option<MemoryBasicInformation> {
     if n == 0 { None } else { Some(m) }
 }
 
+// Diagnostic backing store for hosts with limited Windows commit. Each section
+// still has shared views, with the temporary file removed on the last close.
+fn file_backed_section(dir: &std::path::Path, bytes: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const GENERIC_READ_WRITE_EXECUTE_DELETE: u32 = 0xe001_0000;
+    const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("tombox-xmem-{}-{id}.bin", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .access_mode(GENERIC_READ_WRITE_EXECUTE_DELETE)
+        .share_mode(0)
+        .attributes(FILE_ATTRIBUTE_TEMPORARY)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+        .open(path)?;
+    let handle = unsafe {
+        CreateFileMappingW(file.as_raw_handle() as usize, core::ptr::null(),
+            PAGE_EXECUTE_READWRITE, (bytes >> 32) as u32, bytes as u32, core::ptr::null())
+    };
+    if handle == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(handle)
+}
+
 pub fn allocate(n: usize) -> Option<Vec<u64>> {
     if n == 0 {
         return Some(Vec::new());
     }
     let bytes = (n as u64).checked_mul(PAGE as u64)?;
-    let h = unsafe { CreateFileMappingW(usize::MAX, core::ptr::null(), PAGE_EXECUTE_READWRITE | SEC_COMMIT, (bytes >> 32) as u32, bytes as u32, core::ptr::null()) };
+    let h = if let Some(dir) = std::env::var_os("TOMBOX_XMEM_BACKING_DIR").filter(|p| !p.is_empty()) {
+        match file_backed_section(std::path::Path::new(&dir), bytes) {
+            Ok(handle) => {
+                record(M, "physical backing", &format!("temporary file section for {n} pages ({bytes} bytes)"));
+                handle
+            }
+            Err(error) => {
+                record(M, "physical backing", &format!("temporary file section failed: {error}"));
+                unsafe { SetLastError(error.raw_os_error().unwrap_or(ERROR_INVALID_PARAMETER as i32) as u32) };
+                return None;
+            }
+        }
+    } else {
+        unsafe { CreateFileMappingW(usize::MAX, core::ptr::null(), PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+            (bytes >> 32) as u32, bytes as u32, core::ptr::null()) }
+    };
     if h == 0 {
         return None;
     }
@@ -206,10 +266,12 @@ pub fn allocate(n: usize) -> Option<Vec<u64>> {
         s.next_section += 1;
         s.sections.insert(sid, Section { handle: h, live: n });
         let base = s.next_pfn;
-        s.next_pfn += n as u64;
+        // The guest uses 4 KiB frame numbers even for a 64 KiB mapping.
+        s.next_pfn += n as u64 * FRAMES_PER_PAGE;
         (0..n as u64).map(|i| {
-            s.pfns.insert(base + i, (sid, i * PAGE as u64));
-            base + i
+            let pfn = base + i * FRAMES_PER_PAGE;
+            s.pfns.insert(pfn, (sid, i * PAGE as u64));
+            pfn
         }).collect()
     }))
 }

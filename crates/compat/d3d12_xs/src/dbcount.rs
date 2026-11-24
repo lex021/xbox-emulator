@@ -1128,6 +1128,60 @@ struct Owned {
 unsafe impl Send for Owned {}
 unsafe impl Sync for Owned {}
 
+unsafe fn create_pc_stream(
+    dev: *mut c_void, stream: &[u8], out: *mut *mut c_void,
+) -> Result<i32, String> {
+    let qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(vslot(dev, 0)) };
+    let mut dev2: *mut c_void = core::ptr::null_mut();
+    if unsafe { qi(dev, &IID_DEVICE2, &mut dev2) } < 0 || dev2.is_null() {
+        return Err("no ID3D12Device2 for a pipeline stream".into());
+    }
+    let create: unsafe extern "system" fn(*mut c_void, *const [u64; 2], *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(vslot(dev2, DEV2_CREATE_PIPELINE_STATE)) };
+    let desc = [stream.len() as u64, stream.as_ptr() as u64];
+    let hr = unsafe { create(dev2, &desc, &IID_PSO, out) };
+    unsafe { release(dev2) };
+    Ok(hr)
+}
+
+pub(crate) unsafe fn rect_stream_pso(dev: *mut c_void, pso: usize) -> Option<usize> {
+    static RECT: Mutex<Option<HashMap<usize, (Arc<StreamRec>, usize)>>> = Mutex::new(None);
+    let source = stream_rec(pso)?;
+    if dev.is_null() {
+        return Some(0);
+    }
+    let mut cache = RECT.lock().unwrap_or_else(|e| e.into_inner());
+    let variants = cache.get_or_insert_with(HashMap::new);
+    if let Some((saved, variant)) = variants.get(&pso) {
+        if Arc::ptr_eq(saved, &source) {
+            return Some(*variant);
+        }
+    }
+    let result = crate::rectlist::expand_stream(&source).and_then(|stream| {
+        let mut out = core::ptr::null_mut();
+        let hr = unsafe { create_pc_stream(dev, &stream, &mut out) }?;
+        if hr < 0 || out.is_null() {
+            return Err(format!("stream variant creation failed, hr={hr:#010x}"));
+        }
+        Ok(out as usize)
+    });
+    let variant = match result {
+        Ok(variant) => {
+            if once(8) {
+                record("d3d12_xs", "rectlist", &format!("PC stream variant {variant:#x} for {pso:#x}"));
+            }
+            variant
+        }
+        Err(why) => {
+            crate::rectlist::refuse(0, pso as u64, &why);
+            0
+        }
+    };
+    variants.insert(pso, (source, variant));
+    Some(variant)
+}
+
 unsafe fn create_variant(list: *mut c_void, src: &Src, pass: Pass, vk: Option<VariantKey>, ps: Option<Arc<Vec<u8>>>) -> Result<(usize, Owned), String> {
     let real = crate::cl2_state::real_device();
     let dev = if real.is_null() { unsafe { device_of(list) } } else { real };
@@ -1154,15 +1208,7 @@ unsafe fn create_variant(list: *mut c_void, src: &Src, pass: Pass, vk: Option<Va
         }
         Src::Stream(r) => {
             let s = variant_stream(&r.stream, &r.subs, pass, ps.as_ref().map(|c| c.as_slice()));
-            let qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(dev, 0)) };
-            let mut d2: *mut c_void = core::ptr::null_mut();
-            if unsafe { qi(dev, &IID_DEVICE2, &mut d2) } < 0 || d2.is_null() {
-                return Err("no ID3D12Device2 for a pipeline stream".into());
-            }
-            let f: unsafe extern "system" fn(*mut c_void, *const [u64; 2], *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(d2, DEV2_CREATE_PIPELINE_STATE)) };
-            let desc = [s.len() as u64, s.as_ptr() as u64];
-            let hr = unsafe { f(d2, &desc, &IID_PSO, &mut out) };
-            unsafe { release(d2) };
+            let hr = unsafe { create_pc_stream(dev, &s, &mut out) }?;
             (s, hr)
         }
     };

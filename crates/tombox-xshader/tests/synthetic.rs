@@ -875,6 +875,114 @@ fn compute_with(words: &[u32], preamble: [u32; 4]) -> String {
     translate(&ex).expect("compute shader translates").hlsl
 }
 
+#[test]
+fn compute_mbcnt_counts_masked_lanes_from_the_guest_local_id() {
+    // v_mbcnt_lo_u32_b32 v0, -1, 0
+    let low = compute_with(&[0xd765_0000, 0x0001_00c1, S_ENDPGM], [0, 8, 4, 1]);
+    assert!(low.contains("((gtid.x % 8u) + 8u * (gtid.y + 4u * gtid.z)) & 31u"), "{low}");
+    assert!(low.contains("min(tb_mbcnt_lane, 32u)") && low.contains("countbits("), "{low}");
+
+    // v_mbcnt_hi_u32_b32 v1, 1, v0
+    let high = compute_with(&[0xd765_0000, 0x0001_00c1, 0xd766_0001, 0x0002_0081, S_ENDPGM], [0, 8, 4, 2]);
+    assert!(high.contains("((gtid.x % 8u) + 8u * (gtid.y + 4u * gtid.z)) & 63u"), "{high}");
+    assert!(high.contains("max(tb_mbcnt_lane, 32u) - 32u") && high.contains("v0 + countbits(0x1u &"), "{high}");
+}
+
+#[test]
+fn explicit_compute_root_memory_abi_handles_a_lane_selection_branch() {
+    let words = [
+        0xbf88_0004, // s_cbranch_execz to s_endpgm
+        0xf404_0000, 0xfa00_0000, // s_load_dwordx2 s0, s[0:1], 0
+        0xf424_0200, 0xfa00_0020, // s_buffer_load_dwordx2 s[8:9], s[0:3], 32
+        S_ENDPGM,
+    ];
+    let root = RootSig {
+        version: 2,
+        flags: 0x0100_0000,
+        params: vec![
+            RootParam { visibility: 0, kind: RootParamKind::Descriptor { kind: 3, register: 0, space: 0 } },
+            RootParam { visibility: 0, kind: RootParamKind::Constants { register: 0, space: 0, num32: 16 } },
+        ],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    };
+    let ex = shader(Stage::Compute, &words, vec![], vec![], Some(root));
+    let h = translate(&ex).expect("compute shader translates").hlsl;
+    assert!(h.contains("sbuf0 : register(t0)") && h.contains("tb_sbw_sbuf0(t0 + 0u)"), "{h}");
+    assert!(!h.contains("cbuffer CB0"), "{h}");
+}
+
+#[test]
+fn global_atomics_use_the_window_and_only_glc_writes_vdst() {
+    // v0:v1 is the address, v2 is the data operand, and v3 is the old value.
+    let words = [
+        0xdcc8_8000, 0x037f_0200, // global_atomic_add without GLC
+        0xdccd_8000, 0x037f_0200, // global_atomic_sub with GLC
+        0xdcfc_8000, 0x037f_0200, // global_atomic_fmin without GLC
+        0xdd01_8000, 0x037f_0200, // global_atomic_fmax with GLC
+        S_ENDPGM,
+    ];
+    let ex = shader(Stage::Compute, &words, vec![], vec![], None);
+    let translated = translate(&ex).expect("global atomics translate");
+    let body = translated.hlsl.split("void main").last().unwrap();
+    assert!(translated.needs_global);
+    for op in 0..4 {
+        assert!(body.contains(&format!("tb_gatomic(tb_gva(v0, v1, 0u, 0), v2, {op}u)")), "{body}");
+    }
+    assert_eq!(body.matches("v3 = TB_WV(").count(), 2, "{body}");
+}
+
+#[test]
+fn xdxr_scalar_load_uses_a_root_view_after_the_first_sixteen_words() {
+    let words = [
+        0xf404_0200, 0xfa00_004c, // s_load_dwordx2 s[8:9], s[0:1], 76
+        0xf400_0104, 0xfa00_000c, // s_load_dword s4, s[8:9], 12
+        S_ENDPGM,
+    ];
+    let root = RootSig {
+        version: 2,
+        flags: 0x0300_0000,
+        params: vec![
+            RootParam { visibility: 0, kind: RootParamKind::Constants { register: 0, space: 0, num32: 19 } },
+            RootParam { visibility: 0, kind: RootParamKind::Descriptor { kind: 4, register: 0, space: 0 } },
+        ],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    };
+    let ex = shader(Stage::Compute, &words, vec![], vec![], Some(root));
+    let out = translate(&ex).expect("scalar GPU load translates");
+    assert!(out.needs_global);
+    assert!(out.hlsl.contains("s8 = tb_root_va[1][0];"), "{}", out.hlsl);
+    assert!(out.hlsl.contains("s9 = tb_root_va[1][1];"), "{}", out.hlsl);
+    assert!(out.hlsl.contains("tb_gva(s8 & ~3u, s9 & 0xffffu, 0u, 12)"), "{}", out.hlsl);
+}
+
+#[test]
+fn readlane_overwrites_padding_read_by_a_wide_root_load() {
+    let words = [
+        0xf404_0200, 0xfa00_0000, // s_load_dwordx2 s[8:9], s[0:1], 0
+        0xd760_0009, 0x0001_0100, // v_readlane_b32 s9, v0, 0
+        0x7e00_0209, // v_mov_b32 v0, s9
+        S_ENDPGM,
+    ];
+    let root = RootSig {
+        version: 2,
+        flags: 0x0300_0000,
+        params: vec![RootParam {
+            visibility: 0,
+            kind: RootParamKind::Constants { register: 0, space: 0, num32: 1 },
+        }],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    };
+    let pass = shader(Stage::Compute, &words, vec![], vec![], Some(root.clone()));
+    assert!(translate(&pass).unwrap().hlsl.contains("WaveReadLaneAt("));
+    let mut live = words;
+    live[2] = 0xd760_000a; // writes s10, so the use of s9 still reads padding
+    let fail = shader(Stage::Compute, &live, vec![], vec![], Some(root));
+    assert!(matches!(translate(&fail), Err(e) if e.contains("s9 is read before it is rewritten")));
+}
+
 fn consecutive_lds() -> [u32; 7] {
     [0xd834_0000, 0x0000_0909, 0xd834_0000, 0x0000_0a09, 0xd8d8_0000, 0x0700_0007, S_ENDPGM]
 }

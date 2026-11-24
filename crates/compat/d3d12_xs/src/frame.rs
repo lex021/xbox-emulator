@@ -304,7 +304,8 @@ fn timer_thread() {
             continue;
         }
         let now = qpc();
-        let mut best: Option<(i64, usize)> = None;
+        let mut deadline = i64::MAX;
+        let mut due = Vec::with_capacity(pl.events.len());
         for (i, (ty, off, _, _)) in pl.events.iter().enumerate() {
             let (mut d, _) = next_deadline(pl.base, pl.interval, *off, now - 1);
             if uncapped && last[*ty] > i64::MIN / 2 {
@@ -312,21 +313,28 @@ fn timer_thread() {
             } else if d - last[*ty] < pl.interval / 2 {
                 d += pl.interval;
             }
-            if best.map(|b| d < b.0).unwrap_or(true) {
-                best = Some((d, i));
+            if d < deadline {
+                deadline = d;
+                due.clear();
+            }
+            if d == deadline {
+                due.push(i);
             }
         }
-        let Some((deadline, idx)) = best else { continue };
-        if !sleep_until(timer, wake, deadline) {
+        if due.is_empty() || !sleep_until(timer, wake, deadline) {
             continue;
         }
-        let (ty, _, internal, dups) = &pl.events[idx];
-        let still = with(|p| p.generation == pl.generation && p.types[*ty].scheduled);
-        if !still {
-            continue;
+        // Frame events may share the origin's deadline. Deliver them all
+        // before calculating the next frame's deadlines.
+        let now = qpc();
+        for i in due {
+            let (ty, _, internal, dups) = &pl.events[i];
+            if !with(|p| p.generation == pl.generation && p.types[*ty].scheduled) {
+                continue;
+            }
+            last[*ty] = if uncapped { now } else { deadline };
+            fire(*ty, *internal, dups, now, deadline, &mut origins);
         }
-        last[*ty] = if uncapped { qpc() } else { deadline };
-        fire(*ty, *internal, dups, qpc(), deadline, &mut origins);
     }
 }
 
@@ -750,6 +758,21 @@ mod tests {
             assert!(schedule_frame_event_x(this, 2, 0, core::ptr::null(), FLAG_UNSCHEDULE) >= 0);
             assert_eq!(wait_frame_event_x(this, 2, 0, core::ptr::null(), 0, &mut tok), E_INVALIDARG);
             CloseHandle(ev);
+        }
+        reset();
+    }
+
+    #[test]
+    fn origin_and_present_event_at_same_deadline_both_fire() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset();
+        let this = core::ptr::null_mut();
+        unsafe {
+            assert_eq!(set_frame_interval_x(this, core::ptr::null_mut(), 16667, 3, 0), S_FALSE);
+            assert!(schedule_frame_event_x(this, 0, 0, core::ptr::null(), 0) >= 0);
+            assert!(schedule_frame_event_x(this, 2, 0, core::ptr::null(), 0) >= 0);
+            assert_eq!(wait_frame_event_x(this, 0, 200, core::ptr::null(), 0, core::ptr::null_mut()), S_OK);
+            assert_eq!(wait_frame_event_x(this, 2, 200, core::ptr::null(), 0, core::ptr::null_mut()), S_OK);
         }
         reset();
     }

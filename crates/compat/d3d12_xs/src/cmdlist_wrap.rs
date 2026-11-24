@@ -28,9 +28,147 @@ extern "system" {
 }
 const PAGE_READWRITE: u32 = 0x04;
 
-/// Number of Xbox vtable slots we materialize. Max observed call is Xbox slot 50
-/// (OMSetRenderTargets); 128 leaves generous headroom.
-const N: usize = 128;
+// Scarlett extends the command-list interface through its enhanced barrier slot.
+const N: usize = 256;
+pub(crate) const IID_SCARLETT_GRAPHICS_COMMAND_LIST6: crate::device_wrap::Guid =
+    crate::device_wrap::Guid {
+        d1: 0xc382_7890,
+        d2: 0x4024,
+        d3: 0x474c,
+        d4: [0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74],
+    };
+
+pub(crate) fn scarlett_list6_probe() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TOMBOX_SCARLETT_LIST6_PROBE").as_deref() == Ok("1"))
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn ExitProcess(code: u32) -> !;
+}
+
+unsafe extern "system" fn unsupported_scarlett_list6_slot(
+    _list: *mut c_void, a: u32, b: u32, c: u32, mask: u64,
+) {
+    record("d3d12_xs", "scarlett_list6_probe", &format!(
+        "unsupported extension args={a:#x},{b:#x},{c:#x},{mask:#x}"
+    ));
+    unsafe { ExitProcess(0xe001_0130) }
+}
+
+unsafe extern "system" fn scarlett_list6_slot131(list: *mut c_void, a: u32, b: u32, c: u32, mask: u64) {
+    record("d3d12_xs", "scarlett_list6_probe", &format!("slot=131 args={a:#x},{b:#x},{c:#x},{mask:#x}"));
+    // Run the startup probe without submitting unverified console register operations to the GPU.
+    if !matches!((a, b, c, mask), (0xc3c0, 0x8002_0000, 0, 0xffff_ffff_ff00) | (0xc380 | 0xc280, 0x0002_0000, 0, 0xffff_ffff_ff00)) {
+        unsafe { unsupported_scarlett_list6_slot(list, a, b, c, mask) }
+    }
+}
+
+unsafe extern "system" fn scarlett_list6_slot132(list: *mut c_void, a: u32, b: u32, c: u32, mask: u64) {
+    record("d3d12_xs", "scarlett_list6_probe", &format!("slot=132 args={a:#x},{b:#x},{c:#x},{mask:#x}"));
+    if !matches!((a, b, c, mask), (0x70_0000 | 0x10_0000, 0, 0, 0xffff_ffff_ff00)) {
+        unsafe { unsupported_scarlett_list6_slot(list, a, b, c, mask) }
+    }
+}
+unsafe extern "system" fn scarlett_sample_mask(list: *mut c_void, mask: u64) {
+    // Scarlett supplies four 16-bit coverage masks. An all-ones mask
+    // leaves the host PSO's sample coverage unchanged.
+    if mask != u64::MAX {
+        record("d3d12_xs", "ScarlettSampleMask", &format!("slot=142 unsupported mask={mask:#018x}"));
+        unsafe { unsupported_scarlett_list6_slot(list, mask as u32, 0, 0, mask) };
+    }
+}
+
+unsafe extern "system" fn scarlett_reset_x(
+    list: *mut c_void, allocator: *mut c_void, pso: *mut c_void, flags: u32,
+) -> i32 {
+    if flags != 0 {
+        record("d3d12_xs", "ScarlettReset", &format!("slot=139 unsupported flags={flags:#x}"));
+        return 0x8000_4001u32 as i32;
+    }
+    let reset: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(vt_get(10)) };
+    let hr = unsafe { reset(list, allocator, pso) };
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    if CALLS.fetch_add(1, Ordering::Relaxed) < 6 || hr < 0 {
+        record("d3d12_xs", "ScarlettReset", &format!("slot=139 allocator={allocator:p} pso={pso:p} hr={hr:#010x}"));
+    }
+    hr
+}
+
+static ROOT_VIEW_PREV: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+
+unsafe extern "system" fn scarlett_root_view<const SLOT: usize>(
+    list: *mut c_void, parameter: u32, va: u64,
+) {
+    let forward: unsafe extern "system" fn(*mut c_void, u32, u64) =
+        unsafe { core::mem::transmute(ROOT_VIEW_PREV[SLOT - 43].load(Ordering::Relaxed)) };
+    let host = crate::gpu_va::host_buffer_address(va);
+    if host != va {
+        static REBASED: AtomicUsize = AtomicUsize::new(0);
+        if REBASED.fetch_add(1, Ordering::Relaxed) < 12 {
+            record("d3d12_xs", "ScarlettRootView",
+                &format!("slot={SLOT} param={parameter} guest={va:#x} host={host:#x}"));
+        }
+    }
+    unsafe { forward(list, parameter, host) };
+}
+
+// Vertex and index views share the address/length prefix and a 16-byte ABI.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IaView {
+    location: u64,
+    size: u32,
+    stride_or_format: u32,
+}
+
+impl IaView {
+    fn on_host(mut self) -> Self {
+        let host = crate::gpu_va::host_buffer_address(self.location);
+        if self.location != host {
+            static REBASED: AtomicUsize = AtomicUsize::new(0);
+            if REBASED.fetch_add(1, Ordering::Relaxed) < 12 {
+                record("d3d12_xs", "ScarlettInputBuffer",
+                    &format!("guest={:#x} host={host:#x} size={:#x}", self.location, self.size));
+            }
+            self.location = host;
+        }
+        self
+    }
+}
+
+static IA_INDEX_PREV: AtomicUsize = AtomicUsize::new(0);
+static IA_VERTEX_PREV: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "system" fn scarlett_index_buffer(list: *mut c_void, view: *const IaView) {
+    let forward: unsafe extern "system" fn(*mut c_void, *const IaView) =
+        unsafe { core::mem::transmute(IA_INDEX_PREV.load(Ordering::Relaxed)) };
+    if view.is_null() {
+        unsafe { forward(list, view) };
+    } else {
+        let mapped = unsafe { view.read_unaligned() }.on_host();
+        unsafe { forward(list, &mapped) };
+    }
+}
+
+unsafe extern "system" fn scarlett_vertex_buffers(
+    list: *mut c_void, start: u32, count: u32, views: *const IaView,
+) {
+    let forward: unsafe extern "system" fn(*mut c_void, u32, u32, *const IaView) =
+        unsafe { core::mem::transmute(IA_VERTEX_PREV.load(Ordering::Relaxed)) };
+    if views.is_null() || count == 0 || start.checked_add(count).is_none_or(|end| end > 32) {
+        unsafe { forward(list, start, count, views) };
+        return;
+    }
+    let mut mapped = [IaView { location: 0, size: 0, stride_or_format: 0 }; 32];
+    for (i, view) in mapped[..count as usize].iter_mut().enumerate() {
+        *view = unsafe { views.add(i).read_unaligned() }.on_host();
+    }
+    unsafe { forward(list, start, count, mapped.as_ptr()) };
+}
+
 static XBOX_VT: [AtomicUsize; N] = [const { AtomicUsize::new(0) }; N];
 static BUILT: AtomicBool = AtomicBool::new(false);
 static mut REAL_VT_PTR: *const usize = core::ptr::null();
@@ -433,6 +571,45 @@ pub fn apply(real_list: *mut c_void) {
             crate::cbv_raw::install_draw_check(&XBOX_VT);
             crate::passcap::install(&XBOX_VT);
             crate::gpuprof::install_ops(&XBOX_VT);
+            if scarlett_list6_probe() {
+                let root_views = [
+                    scarlett_root_view::<43> as *const () as usize,
+                    scarlett_root_view::<44> as *const () as usize,
+                    scarlett_root_view::<45> as *const () as usize,
+                    scarlett_root_view::<46> as *const () as usize,
+                ];
+                for (i, handler) in root_views.into_iter().enumerate() {
+                    ROOT_VIEW_PREV[i].store(vt_get(i + 43), Ordering::Relaxed);
+                    vt_set(i + 43, handler);
+                }
+                IA_INDEX_PREV.store(vt_get(47), Ordering::Relaxed);
+                vt_set(47, scarlett_index_buffer as *const () as usize);
+                IA_VERTEX_PREV.store(vt_get(48), Ordering::Relaxed);
+                vt_set(48, scarlett_vertex_buffers as *const () as usize);
+                // Newer Scarlett command lists insert two entries before
+                // ExecuteIndirect. Alias the confirmed early blocks from the
+                // final legacy handlers so tracking stays in the call chain.
+                for (first, last) in [(61, 65), (70, 74), (85, 87)] {
+                    for slot in (first..=last).rev() {
+                        vt_set(slot, vt_get(slot - 2));
+                    }
+                }
+                record("d3d12_xs", "ScarlettCommandList",
+                    "newer Scarlett layout: ExecuteIndirect 61, Write64BitValueBottomOfPipeX 72, Wait64BitValueX 74, CopyTextureRegionX 85");
+                for slot in &XBOX_VT[128..131] {
+                    slot.store(unsupported_scarlett_list6_slot as *const () as usize, Ordering::Relaxed);
+                }
+                XBOX_VT[131].store(scarlett_list6_slot131 as *const () as usize, Ordering::Relaxed);
+                XBOX_VT[132].store(scarlett_list6_slot132 as *const () as usize, Ordering::Relaxed);
+                for slot in &XBOX_VT[133..] {
+                    slot.store(unsupported_scarlett_list6_slot as *const () as usize, Ordering::Relaxed);
+                }
+                XBOX_VT[139].store(scarlett_reset_x as *const () as usize, Ordering::Relaxed);
+                XBOX_VT[142].store(scarlett_sample_mask as *const () as usize, Ordering::Relaxed);
+                XBOX_VT[crate::cl_console_fix::SC_BARRIER].store(
+                    crate::cl_console_fix::scarlett_barrier as *const () as usize, Ordering::Relaxed,
+                );
+            }
             XBOX_VT[CONSOLE_NULL_SLOT].store(0, Ordering::Relaxed);
             record("d3d12_xs", "cmdlist.vtable",
                 &format!("built Xbox-layout cmdlist vtable from real {real_vt:p} (+4 shift at PC28)"));
@@ -468,10 +645,10 @@ pub fn apply(real_list: *mut c_void) {
 // Status: the layout fact (+0x18 write ptr, +0x30 end ptr) is observed at one call site;
 // other inline fields the title may read are served zeros (unverified).
 
-/// Offset of the real ID3D12GraphicsCommandList pointer inside the shim.
-const SHIM_REAL_OFF: usize = 0x38;
-/// Shim size: generous and zero-filled, for any other inline field the title reads.
-const SHIM_SIZE: usize = 0x4000;
+/// Keep the PC pointer beyond the entire console-visible inline body.
+/// Scarlett writes console fields around offset 0x38 during startup.
+const SHIM_REAL_OFF: usize = 0x4000;
+const SHIM_SIZE: usize = SHIM_REAL_OFF + core::mem::size_of::<usize>();
 static SHIM_VT: [AtomicUsize; N] = [const { AtomicUsize::new(0) }; N];
 static SHIM_BUILT: std::sync::Once = std::sync::Once::new();
 
@@ -488,7 +665,9 @@ unsafe fn build_shim_thunks() {
     }
     for i in 0..N {
         let p = code.add(i * 32);
-        let mut b: Vec<u8> = vec![0x48, 0x8B, 0x49, SHIM_REAL_OFF as u8];
+        // mov rcx, [rcx + disp32], then forward to the original thunk.
+        let mut b = vec![0x48, 0x8B, 0x89];
+        b.extend_from_slice(&(SHIM_REAL_OFF as u32).to_le_bytes());
         if timed && !is_probe(XBOX_VT[i].load(Ordering::Relaxed)) {
             b.extend_from_slice(&[0x41, 0xBA]);
             b.extend_from_slice(&(i as u32).to_le_bytes());

@@ -74,7 +74,14 @@ unsafe fn list_type(list: *mut c_void) -> u32 {
 }
 
 unsafe fn res_desc(res: *mut c_void) -> Option<[u8; 56]> {
-    if res.is_null() {
+    let address = res as usize;
+    if address < 0x1_0000 || address % core::mem::align_of::<usize>() != 0
+        || !crate::title_shadow::is_readable_range(address, core::mem::size_of::<usize>())
+    {
+        return None;
+    }
+    let vtable = unsafe { res.cast::<usize>().read() };
+    if !crate::title_shadow::is_readable_range(vtable, (RES_SLOT_GET_DESC + 1) * core::mem::size_of::<usize>()) {
         return None;
     }
     let mut d = [0u8; 56];
@@ -254,6 +261,12 @@ unsafe extern "system" fn cl_execute_indirect_bundle(this: *mut c_void, bundle: 
     let offset = offset as u32 as u64;
     let bw = unsafe { res_desc(bundle) }.map(|d| desc_width(&d));
     let sw = unsafe { res_desc(size_buf) }.map(|d| desc_width(&d));
+    if (!bundle.is_null() && bw.is_none()) || (!size_buf.is_null() && sw.is_none()) {
+        if once(&BUNDLE_LOG, 8) {
+            record("d3d12_xs", "cl_ext", &format!("{W}: invalid resource arguments bundle={bundle:p} size_buffer={size_buf:p}"));
+        }
+        return;
+    }
     let ty = unsafe { list_type(this) };
     // The retail UMD always writes zero. The debug UMD rejects a nonzero argument.
     let pred_off = if crate::cmdlist_x::debug_umd(this) { pred_off } else { 0 };
@@ -348,10 +361,14 @@ static HIS_LOG: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "system" fn cl_set_hi_stencil(_this: *mut c_void, res: *mut c_void, ctrl: *const [u32; 2]) {
     let flags = unsafe { res_desc(res) }.map(|d| desc_flags(&d));
-    if let Some(e) = hi_stencil_error(flags, !ctrl.is_null()) {
+    if !res.is_null() && flags.is_none() {
+        return reject(&HIS_LOG, "SetHiStencilStateX", "invalid resource address");
+    }
+    let has_control = crate::title_shadow::is_readable_range(ctrl as usize, 8);
+    if let Some(e) = hi_stencil_error(flags, has_control) {
         return reject(&HIS_LOG, "SetHiStencilStateX", e);
     }
-    let c = unsafe { *ctrl };
+    let c = unsafe { ctrl.read_unaligned() };
     if once(&HIS_LOG, 2) {
         record("d3d12_xs", "cl_ext", &format!("SetHiStencilStateX res={res:p} state0={:?} state1={:?}: HTILE stencil-result compares only let the hardware cull tiles that would fail anyway (conservative); PC drivers keep their own HiS",
             crate::cmdlist_x::decode_hi_stencil(c[0]), crate::cmdlist_x::decode_hi_stencil(c[1])));

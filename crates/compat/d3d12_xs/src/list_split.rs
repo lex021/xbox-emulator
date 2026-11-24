@@ -141,16 +141,23 @@ unsafe fn acquire(like: *mut c_void) -> *mut c_void {
             return p.list as *mut c_void;
         }
     }
+    let Some((l, a)) = (unsafe { new_part(like, ty) }) else { return core::ptr::null_mut() };
+    POOL.lock().unwrap_or_else(|e| e.into_inner()).push(Pooled { list: l as usize, alloc: a as usize, ty, busy: true, fence: 0, value: 0 });
+    crate::dred_marks::begin_recording(l as usize);
+    l
+}
+
+pub(crate) unsafe fn new_part(like: *mut c_void, ty: u32) -> Option<(*mut c_void, *mut c_void)> {
     let dev = unsafe { device_of(like) };
     if dev.is_null() {
-        return core::ptr::null_mut();
+        return None;
     }
     let ca: unsafe extern "system" fn(*mut c_void, u32, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(dev, DEV_CREATE_ALLOCATOR)) };
     let mut a: *mut c_void = core::ptr::null_mut();
     let hr = unsafe { ca(dev, ty, &IID_ALLOCATOR, &mut a) };
     if hr < 0 || a.is_null() {
         record("d3d12_xs", "list_split", &format!("segment allocator create FAILED hr={hr:#010x}"));
-        return core::ptr::null_mut();
+        return None;
     }
     let cl: unsafe extern "system" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(dev, DEV_CREATE_LIST)) };
     let mut l: *mut c_void = core::ptr::null_mut();
@@ -159,11 +166,9 @@ unsafe fn acquire(like: *mut c_void) -> *mut c_void {
         record("d3d12_xs", "list_split", &format!("segment list create FAILED hr={hr:#010x}"));
         let release: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(vslot(a, 2)) };
         unsafe { release(a) };
-        return core::ptr::null_mut();
+        return None;
     }
-    POOL.lock().unwrap_or_else(|e| e.into_inner()).push(Pooled { list: l as usize, alloc: a as usize, ty, busy: true, fence: 0, value: 0 });
-    crate::dred_marks::begin_recording(l as usize);
-    l
+    Some((l, a))
 }
 
 unsafe fn give_back(seg: usize) {

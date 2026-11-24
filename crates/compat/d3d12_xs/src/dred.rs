@@ -271,6 +271,9 @@ unsafe fn report(device: *mut c_void, dred: *mut c_void) {
     let reason: unsafe extern "system" fn(*mut c_void) -> i32 = core::mem::transmute(slot(device, 37));
     let hr = reason(device);
     record(M, "dred.removed", &format!("device removed: GetDeviceRemovedReason={hr:#010x} ({})", removed_reason_name(hr)));
+    if std::env::var_os("TOMBOX_D3D12_DEBUG_CAPTURE").is_some() {
+        crate::cmdlist_x::dump_device_messages(device, "PcD3D12Removal");
+    }
     if dred.is_null() {
         record(M, "dred.removed", "no DRED interface on this device: no breadcrumbs or page-fault data");
         return;
@@ -393,6 +396,7 @@ pub fn describe_fault(va: u64, near: &[crate::gpu_va::Entry]) -> Vec<String> {
 pub fn removed_reason_name(hr: i32) -> &'static str {
     match hr as u32 {
         0 => "S_OK (not removed)",
+        0x887A_0001 => "DXGI_ERROR_INVALID_CALL",
         0x887A_0005 => "DXGI_ERROR_DEVICE_REMOVED",
         0x887A_0006 => "DXGI_ERROR_DEVICE_HUNG",
         0x887A_0007 => "DXGI_ERROR_DEVICE_RESET",

@@ -292,6 +292,24 @@ fn log_pack_miss(hash: u64, rtfmt: &[u8; 8], linked: bool, src: &str, profile: &
 }
 
 pub(crate) fn runtime_source(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, root: Option<&[u8]>, mode: &tombox_xshader::pack_key::Mode) -> Result<RtSrc, String> {
+    runtime_source_for(blob, hash, rtfmt, link, root, mode, false)
+}
+
+pub(crate) fn compile_global_compute(blob: &[u8], root: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    let mode = runtime_mode();
+    let source = runtime_source_for(blob, fnv1a(blob), &[0; 8], &InputInterp::default(), root, mode, true)?;
+    if !source.use_dxc {
+        return Err("global compute translation requires DXC".into());
+    }
+    let flags = ["-O0"];
+    let opts = tombox_xshader::pack_key::extra(mode, &["global-compute", flags[0]]);
+    // DXC's optimizer can spend minutes simplifying large translated BVH control flow.
+    tombox_xshader::shader_cache::compile_cached_with(&source.hlsl, &source.profile, mode.fma, &opts, || {
+        tombox_xshader::dxc::compile_fma(&source.hlsl, &source.profile, mode.fma, &flags)
+    }).map(|result| result.code)
+}
+
+fn runtime_source_for(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, root: Option<&[u8]>, mode: &tombox_xshader::pack_key::Mode, global_compute: bool) -> Result<RtSrc, String> {
     let mut ex = tombox_xshader::extract(blob).map_err(|e| {
         dump_failure(hash, blob, None, &e);
         format!("extract: {e}")
@@ -324,7 +342,10 @@ pub(crate) fn runtime_source(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Inp
         dump_failure(hash, blob, None, &why);
         return Err(format!("bind: {why}"));
     }
-    if let Some(why) = crate::global_bind::refusal(t.needs_global) {
+    if global_compute && (!t.needs_global || ex.stage != tombox_xshader::Stage::Compute) {
+        return Err("expected a compute shader with global memory".into());
+    }
+    if let Some(why) = crate::global_bind::refusal(t.needs_global && !global_compute) {
         dump_failure(hash, blob, None, &why);
         return Err(format!("bind: {why}"));
     }
@@ -404,11 +425,17 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Input
         let dir = std::env::temp_dir().join("tombox_shaders");
         let inflight = dir.join(format!("inflight_{hash:016x}.dxbc"));
         let fma = mode.fma;
-        let r = tombox_xshader::shader_cache::compile_cached_with(&t.hlsl, &profile, fma, &tombox_xshader::pack_key::extra(mode, &[]), || {
-            log_pack_miss(hash, rtfmt, !link.0.is_empty(), &t.hlsl, &profile, mode, &[]);
+        static QUICK_DXC: OnceLock<bool> = OnceLock::new();
+        let opts: &[&str] = if *QUICK_DXC.get_or_init(|| std::env::var("TOMBOX_STARTUP_FAST_DXC").as_deref() == Ok("1")) {
+            &["-O0"]
+        } else {
+            &[]
+        };
+        let r = tombox_xshader::shader_cache::compile_cached_with(&t.hlsl, &profile, fma, &tombox_xshader::pack_key::extra(mode, opts), || {
+            log_pack_miss(hash, rtfmt, !link.0.is_empty(), &t.hlsl, &profile, mode, opts);
             let _ = std::fs::create_dir_all(&dir);
             let _ = std::fs::write(&inflight, blob);
-            let compiled = tombox_xshader::dxc::compile_fma(&t.hlsl, &profile, fma, &[]);
+            let compiled = tombox_xshader::dxc::compile_fma(&t.hlsl, &profile, fma, opts);
             let _ = std::fs::remove_file(&inflight);
             compiled
         });
@@ -479,9 +506,9 @@ pub(crate) fn compile_gws(ex: &tombox_xshader::ShaderExtract, x: u32) -> Result<
     compile_gws_variant(tombox_xshader::hlsl::translate_gws_fused_dispatch(ex, [x, 1, 1])?)
 }
 
-pub(crate) fn compile_phased_gws(ex: &tombox_xshader::ShaderExtract, x: u32) -> Result<(Vec<u8>, [u32; 2]), String> {
-    let plan = tombox_xshader::hlsl::translate_gws_phased_dispatch(ex, [x, 1, 1])?;
-    Ok((compile_gws_variant(plan.shader)?, [plan.scratch_bytes, plan.max_rounds]))
+pub(crate) fn compile_phased_gws(ex: &tombox_xshader::ShaderExtract) -> Result<(Vec<u8>, [u32; 2]), String> {
+    let plan = tombox_xshader::hlsl::translate_gws_phased_dispatch(ex, [1, 1, 1])?;
+    Ok((compile_gws_variant(plan.shader)?, [(plan.max_rounds - 1) / plan.waves, plan.waves]))
 }
 
 fn compile_gws_variant(t: tombox_xshader::hlsl::Translated) -> Result<Vec<u8>, String> {

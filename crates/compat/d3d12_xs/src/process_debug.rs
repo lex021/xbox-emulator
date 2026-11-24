@@ -2,6 +2,114 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use compat_common::record;
 
+pub fn install_native_exception_log() {
+    if std::env::var_os("TOMBOX_SCARLETT_NATIVE_AV").is_none() {
+        return;
+    }
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| unsafe {
+        AddVectoredExceptionHandler(1, log_native_access_violation);
+    });
+}
+
+extern "system" {
+    fn AddVectoredExceptionHandler(first: u32, handler: unsafe extern "system" fn(*const [usize; 2]) -> i32) -> *mut c_void;
+    fn GetModuleHandleExW(flags: u32, address: *const u16, output: *mut usize) -> i32;
+    fn GetModuleFileNameW(module: usize, name: *mut u16, capacity: u32) -> u32;
+    fn GetStdHandle(kind: u32) -> *mut c_void;
+    fn WriteFile(handle: *mut c_void, data: *const u8, size: u32, written: *mut u32, overlapped: *mut c_void) -> i32;
+}
+
+#[repr(C, align(16))]
+struct X64Context([u64; 154]);
+
+extern "system" {
+    fn GetCurrentThreadId() -> u32;
+    fn GetCurrentThreadStackLimits(low: *mut usize, high: *mut usize);
+    fn RtlLookupFunctionEntry(pc: u64, base: *mut u64, history: *mut c_void) -> *const c_void;
+    fn RtlVirtualUnwind(kind: u32, base: u64, pc: u64, entry: *const c_void,
+        context: *mut X64Context, data: *mut *mut c_void, frame: *mut u64,
+        pointers: *mut c_void) -> *mut c_void;
+}
+
+unsafe fn exception_stack(original: usize, first_pc: usize) -> String {
+    use std::fmt::Write;
+    const RSP: usize = 0x98 / 8;
+    const RIP: usize = 0xf8 / 8;
+    let mut context = X64Context([0; 154]);
+    unsafe { core::ptr::copy_nonoverlapping(original as *const u8,
+        context.0.as_mut_ptr().cast(), core::mem::size_of::<X64Context>()) };
+    let (mut low, mut high) = (0, 0);
+    unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+    let tid = unsafe { GetCurrentThreadId() };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    let mut result = format!("ScarlettNativeStack time={now} tid={tid} fault={first_pc:#x}\n");
+    for n in 0..24 {
+        let pc = context.0[RIP];
+        let sp = context.0[RSP];
+        if pc == 0 || (sp as usize) < low || (sp as usize) > high.saturating_sub(8) {
+            break;
+        }
+        let mut module = 0usize;
+        let mut path = [0u16; 512];
+        let len = if unsafe { GetModuleHandleExW(6, pc as *const u16, &mut module) } != 0 {
+            unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) as usize }
+        } else { 0 };
+        let name = String::from_utf16_lossy(&path[..len.min(path.len())]);
+        let name = name.rsplit([char::from(92), '/']).next().unwrap_or_default();
+        let _ = writeln!(result, "  {n:02} {name}+{:#x} pc={pc:#x} sp={sp:#x}", pc.wrapping_sub(module as u64));
+        let mut base = 0;
+        let lookup_pc = pc - u64::from(n != 0);
+        let entry = unsafe { RtlLookupFunctionEntry(lookup_pc, &mut base, core::ptr::null_mut()) };
+        if entry.is_null() {
+            if module == 0 { break; }
+            context.0[RIP] = unsafe { (sp as *const u64).read_unaligned() };
+            context.0[RSP] = sp + 8;
+        } else {
+            let (mut data, mut frame) = (core::ptr::null_mut(), 0);
+            unsafe { RtlVirtualUnwind(0, base, lookup_pc, entry, &mut context,
+                &mut data, &mut frame, core::ptr::null_mut()) };
+        }
+        if context.0[RSP] <= sp { break; }
+    }
+    result
+}
+
+unsafe extern "system" fn log_native_access_violation(info: *const [usize; 2]) -> i32 {
+    let [exception, context] = unsafe { *info };
+    let fields = exception as *const usize;
+    if exception == 0 || context == 0 || unsafe { *fields as u32 } != 0xc000_0005 {
+        return 0;
+    }
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 16 {
+        return 0;
+    }
+    let address = unsafe { *fields.add(2) };
+    let action = unsafe { *fields.add(4) };
+    let target = unsafe { *fields.add(5) };
+    let mut module = 0usize;
+    let mut path = [0u16; 512];
+    if unsafe { GetModuleHandleExW(6, address as *const u16, &mut module) } != 0 {
+        unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
+    }
+    let end = path.iter().position(|&word| word == 0).unwrap_or(path.len());
+    let name = String::from_utf16_lossy(&path[..end]);
+    let registers = [0x78, 0x80, 0x88, 0x90, 0x98, 0xa8, 0xb0].map(|off| {
+        unsafe { *((context + off) as *const u64) }
+    });
+    let message = format!(
+        "ScarlettNativeAV {name}+{:#x} at {address:#x} kind={action} target={target:#x} rax rcx rdx rbx rsp rsi rdi={registers:x?}\n",
+        address.wrapping_sub(module),
+    );
+    let mut written = 0;
+    unsafe { WriteFile(GetStdHandle((-12i32) as u32), message.as_ptr(), message.len() as u32, &mut written, core::ptr::null_mut()) };
+    let stack = unsafe { exception_stack(context, address) };
+    unsafe { WriteFile(GetStdHandle((-12i32) as u32), stack.as_ptr(), stack.len() as u32, &mut written, core::ptr::null_mut()) };
+    0
+}
+
 pub const SET_MASK: u32 = 0x83f0_0001;
 pub const SET_MASK_19041: u32 = 0x81f0_0001;
 pub const NEW_ABI_BUILD: u32 = 22000;
@@ -118,6 +226,55 @@ pub unsafe fn on_create_device(params: *const c_void, env_forced: bool) -> (Driv
         ),
     );
     (d, claimed)
+}
+
+/// Route high-severity debug-layer messages to the compatibility log. Suppress
+/// repeated startup shader diagnostics in this callback to keep GPU traces short.
+pub(crate) unsafe fn capture_messages(device: *mut c_void) {
+    use crate::device_wrap::Guid;
+
+    if std::env::var_os("TOMBOX_D3D12_DEBUG_CAPTURE").is_none() {
+        return;
+    }
+    const IID_INFO_QUEUE1: Guid = Guid {
+        d1: 0x2852_dd88, d2: 0xb484, d3: 0x4c0c,
+        d4: [0xb6, 0xb1, 0x67, 0x16, 0x85, 0x00, 0xe6, 0x00],
+    };
+    type MessageCallback = unsafe extern "system" fn(u32, u32, u32, *const u8, *mut c_void);
+    unsafe extern "system" fn message(
+        _category: u32, severity: u32, id: u32, desc: *const u8, _context: *mut c_void,
+    ) {
+        static SHADER_MISMATCHES: AtomicUsize = AtomicUsize::new(0);
+        if severity > 1 || desc.is_null() || (id == 688 && SHADER_MISMATCHES.fetch_add(1, Ordering::Relaxed) >= 4) {
+            return;
+        }
+        let message = unsafe { std::ffi::CStr::from_ptr(desc.cast()) }.to_string_lossy();
+        record("d3d12_xs", "PcD3D12Validation", &format!("#{id}: {message}"));
+    }
+
+    let qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(**device.cast::<*const usize>()) };
+    let mut info = core::ptr::null_mut();
+    let hr = unsafe { qi(device, &IID_INFO_QUEUE1, &mut info) };
+    if hr < 0 || info.is_null() {
+        record("d3d12_xs", "PcD3D12Validation", &format!("InfoQueue1 unavailable hr={hr:#010x}"));
+        return;
+    }
+    let vt = unsafe { *info.cast::<*const usize>() };
+    let register: unsafe extern "system" fn(*mut c_void, MessageCallback, u32, *mut c_void, *mut u32) -> i32 =
+        unsafe { core::mem::transmute(*vt.add(38)) };
+    let mute: unsafe extern "system" fn(*mut c_void, i32) =
+        unsafe { core::mem::transmute(*vt.add(36)) };
+    let release: unsafe extern "system" fn(*mut c_void) -> u32 =
+        unsafe { core::mem::transmute(*vt.add(2)) };
+    let mut cookie = 0;
+    const IGNORE_DEBUG_FILTERS: u32 = 1;
+    let hr = unsafe { register(info, message, IGNORE_DEBUG_FILTERS, core::ptr::null_mut(), &mut cookie) };
+    if hr >= 0 {
+        unsafe { mute(info, 1) };
+    }
+    unsafe { release(info) };
+    record("d3d12_xs", "PcD3D12Validation", &format!("logging callback hr={hr:#010x}"));
 }
 
 #[no_mangle]

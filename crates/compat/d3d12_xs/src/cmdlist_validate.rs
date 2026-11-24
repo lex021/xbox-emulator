@@ -60,6 +60,20 @@ fn next(slot: usize) -> usize {
     NEXT[slot].load(Ordering::Relaxed)
 }
 
+pub(crate) fn trace_recent(list: *mut c_void) {
+    if !enabled() {
+        return;
+    }
+    let recent = with(|s| s.lists.get(&(list as usize))
+        .map(|l| (l.seq, l.log.clone(), l.violations.clone())));
+    if let Some((total, commands, violations)) = recent {
+        record("d3d12_xs", "ScarlettSubmitHistory", &format!("list={list:p} total={total} violations={}", violations.len()));
+        for command in commands.into_iter().chain(violations) {
+            record("d3d12_xs", "ScarlettSubmitHistory", &command);
+        }
+    }
+}
+
 fn list_type(list: *mut c_void) -> Option<u32> {
     let f = crate::cmdlist_wrap::vt_get(8);
     if f == 0 || list.is_null() {
@@ -900,8 +914,9 @@ unsafe extern "system" fn h_set_heaps(this: *mut c_void, n: u32, heaps: *const *
             bad.push(format!("two heaps of type {}", d[0]));
         }
         seen.push((d[0], d[1]));
-        let gpu: unsafe extern "system" fn(*mut c_void) -> u64 = core::mem::transmute(*vt.add(10));
-        let base = gpu(h);
+        let gpu: unsafe extern "system" fn(*mut c_void, *mut u64) -> *mut u64 = core::mem::transmute(*vt.add(10));
+        let mut base = 0u64;
+        gpu(h, &mut base);
         let stride = if d[0] == 1 { 32u64 } else { 64u64 };
         ranges.push((base, base + d[1] as u64 * stride));
     }

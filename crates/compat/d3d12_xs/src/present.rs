@@ -883,13 +883,33 @@ qthunks!(
     (q59,x59,59),(q60,x60,60),(q61,x61,61),(q62,x62,62),(q63,x63,63),
 );
 
+unsafe extern "system" fn scarlett_execute_lists(
+    queue: *mut c_void, count: u32, lists: *const *mut c_void, frame_token: u64, flags: u32,
+) -> i32 {
+    // The desktop handles submission and fence ordering on the same queue.
+    // The frame token and flags accompany the Xbox scheduling operation.
+    if (count != 0 && lists.is_null()) || !matches!(flags, 0 | 3) {
+        return 0x8007_0057u32 as i32;
+    }
+    if count != 0 {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        if CALLS.fetch_add(1, Ordering::Relaxed) < 8 {
+            record("d3d12_xs", "ScarlettExecuteCommandLists",
+                &format!("slot=35 count={count} token={frame_token:#x} flags={flags:#x}"));
+        }
+        unsafe { exec_lists_x(queue, count, lists) };
+    }
+    0
+}
+
 /// Xbox queue slot 23 = Signal(pFence, Value, Flags) — called from FD3D12Fence::
 /// InternalSignal (EXE+0x7061d3). PC `Signal` is slot 14 and takes (pFence, Value).
 unsafe extern "system" fn signal_x(queue: *mut c_void, fence: *mut c_void, value: u64, _flags: u32) -> i32 {
+    let fence = unsafe { crate::scarlett_fence::unwrap(fence) };
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> i32 =
         core::mem::transmute(REAL_QVT[14].load(Ordering::Relaxed));
     crate::hang_cap::note_signal(queue, fence, value, "title SignalX");
-    let hr = crate::slowcall::time("queue SignalX", || f(queue, fence, value));
+    let hr = crate::slowcall::time("queue SignalX", || crate::gws_dispatch::queue_signal(queue, fence, value, f));
     static N: AtomicUsize = AtomicUsize::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 3 {
         record("d3d12_xs", "queue.SignalX", &format!("fence={fence:p} value={value} -> hr={hr:#010x}"));
@@ -963,25 +983,89 @@ unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const
     if real.is_empty() {
         return;
     }
+    let trace_setting = std::env::var("TOMBOX_SCARLETT_SUBMIT_TRACE").ok();
+    let diagnostics = trace_setting.is_some();
+    let serial = trace_setting.as_deref() == Some("serial");
+    let trace = |phase: &str| {
+        if diagnostics {
+            let reason = unsafe { crate::ecl_probe::removed_reason(queue) };
+            record("d3d12_xs", "ScarlettSubmit", &format!(
+                "queue={queue:p} lists={real:?} phase={phase} reason={reason:?}"
+            ));
+        }
+    };
+    trace("begin");
     crate::upload::submit_hook(queue);
+    trace("after uploads");
     crate::sys_ts::note_queue(queue, REAL_QVT[16].load(Ordering::Relaxed), REAL_QVT[17].load(Ordering::Relaxed));
     crate::rtcap::note_submit(queue as usize, &title, &real);
     let split = crate::cl2_state::before_execute(queue, &real);
     crate::title_heap::sync_for_execute(&real);
     crate::title_shadow::before_execute();
+    trace("after title shadow");
     crate::slowcall::time("queue ExecuteCommandLists replay hook", || crate::replay::on_execute(queue, &real));
     crate::hang_cap::note_exec(queue, &title, &real);
     crate::placed_offset::before_submit(queue, &real, f as usize, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)));
+    trace("before title submit");
     crate::gpuprof::ecl_begin(queue, f);
-    crate::slowcall::time("queue ExecuteCommandLists", || crate::gpu_wait::submit(queue, &real, f, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)), crate::hang_cap::wait_fn(REAL_QVT[15].load(Ordering::Relaxed))));
+    let signal = crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed));
+    let wait = crate::hang_cap::wait_fn(REAL_QVT[15].load(Ordering::Relaxed));
+    if !serial || !unsafe { diagnostic_serial_submit(queue, &real, f, signal, wait) } {
+        crate::slowcall::time("queue ExecuteCommandLists", || crate::gws_dispatch::submit_lists(queue, &real, f, signal, wait));
+    }
+    trace("after title submit");
+    if serial && unsafe { crate::ecl_probe::removed_reason(queue) }.is_some_and(|hr| hr < 0) {
+        for &list in &real {
+            crate::cmdlist_validate::trace_recent(list);
+        }
+    }
     crate::gpuprof::ecl_end(queue, f);
     crate::placed_offset::after_submit(queue, &real, f as usize, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)));
+    trace("after offset mirrors");
     crate::ecl_probe::check("ExecuteCommandLists", queue, REAL_QVT[18].load(Ordering::Relaxed), &title, &real, before);
     crate::title_shadow::after_execute(queue, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)), crate::hang_cap::wait_fn(REAL_QVT[15].load(Ordering::Relaxed)));
     crate::list_split::after_submit(queue, &real);
     crate::cl2_state::note_executed(queue, &real);
     crate::cl2_state::after_execute(queue, &split);
     crate::ts99::after_execute(queue, &real);
+}
+
+unsafe fn diagnostic_serial_submit(
+    queue: *mut c_void, lists: &[*mut c_void], exec: crate::gpu_wait::ExecFn,
+    signal: usize, wait: usize,
+) -> bool {
+    let mut device = core::ptr::null_mut();
+    let hr = vcall!(queue, 7, fn(*const Guid, *mut *mut c_void) -> i32, &IID_DEVICE, &mut device);
+    if hr < 0 || device.is_null() {
+        return false;
+    }
+    let mut fence = core::ptr::null_mut();
+    let hr = vcall!(device, 36, fn(u64, u32, *const Guid, *mut *mut c_void) -> i32, 0, 0, &IID_FENCE, &mut fence);
+    vcall!(device, 2, fn() -> u32);
+    if hr < 0 || fence.is_null() {
+        return false;
+    }
+    let queue_signal: QueueFenceFn = unsafe { core::mem::transmute(signal) };
+    for (i, list) in lists.iter().enumerate() {
+        let value = i as u64 + 1;
+        record("d3d12_xs", "ScarlettSubmit", &format!("serial begin {i} list={list:p} real={:p}", *list));
+        unsafe { crate::gws_dispatch::submit_lists(queue, core::slice::from_ref(list), exec, signal, wait) };
+        let hr = unsafe { queue_signal(queue, fence, value) };
+        let completed = hr >= 0 && unsafe { crate::present_wait::wait_fence(fence, value, 3000) };
+        let reason = unsafe { crate::ecl_probe::removed_reason(queue) };
+        let progress = vcall!(fence, 8, fn() -> u64);
+        record("d3d12_xs", "ScarlettSubmit", &format!(
+            "serial end {i} real={:p} fence={hr:#010x} value={progress} target={value} completed={completed} reason={reason:?}", *list,
+        ));
+        if !completed || reason.is_some_and(|value| value != 0) {
+            crate::cmdlist_validate::trace_recent(*list);
+        }
+        if reason.is_some_and(|value| value != 0) {
+            break;
+        }
+    }
+    vcall!(fence, 2, fn() -> u32);
+    true
 }
 
 unsafe extern "system" fn queue_freq(queue: *mut c_void, out: *mut u64) -> i32 {
@@ -996,6 +1080,29 @@ unsafe extern "system" fn queue_calib(queue: *mut c_void, gpu: *mut u64, cpu: *m
     let hr = crate::ts99::title_calibration(queue, gpu, cpu);
     crate::timestamp::on_calibration(queue, gpu, cpu, hr);
     hr
+}
+
+pub(crate) unsafe fn host_queue_signal(queue: *mut c_void) -> usize {
+    let table = unsafe { *queue.cast::<*const usize>() };
+    if table == QUEUE_VT.as_ptr().cast::<usize>() {
+        real_queue_slot(14)
+    } else {
+        unsafe { *table.add(14) }
+    }
+}
+
+type QueueFenceFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> i32;
+
+unsafe extern "system" fn gws_queue_signal(queue: *mut c_void, fence: *mut c_void, value: u64) -> i32 {
+    let fence = unsafe { crate::scarlett_fence::unwrap(fence) };
+    let forward: QueueFenceFn = unsafe { core::mem::transmute(crate::hang_cap::signal_fn(real_queue_slot(14))) };
+    unsafe { crate::gws_dispatch::queue_signal(queue, fence, value, forward) }
+}
+
+unsafe extern "system" fn gws_queue_wait(queue: *mut c_void, fence: *mut c_void, value: u64) -> i32 {
+    let fence = unsafe { crate::scarlett_fence::unwrap(fence) };
+    let forward: QueueFenceFn = unsafe { core::mem::transmute(crate::hang_cap::wait_fn(real_queue_slot(15))) };
+    unsafe { crate::gws_dispatch::queue_wait(queue, fence, value, forward) }
 }
 
 pub fn real_queue_slot(i: usize) -> usize {
@@ -1014,6 +1121,55 @@ unsafe extern "system" fn q_freq_dispatch() {
         "2:",
         "jmp {x}",
         base = sym EXE_BASE, size = sym EXE_SIZE, real = sym REAL_QVT, x = sym queue_freq,
+    );
+}
+
+// Scarlett queue slot 16 is Signal(fence, value) on the title path. The
+// desktop runtime still uses slot 16 for GetTimestampFrequency.
+#[unsafe(naked)]
+unsafe extern "system" fn q_scarlett_signal_dispatch() {
+    core::arch::naked_asm!(
+        "mov rax, [rsp]",
+        "sub rax, [rip + {base}]",
+        "cmp rax, [rip + {size}]",
+        "jb 2f",
+        "lea rax, [rip + {real}]",
+        "jmp qword ptr [rax + 128]",
+        "2:",
+        "jmp {signal}",
+        base = sym EXE_BASE, size = sym EXE_SIZE, real = sym REAL_QVT, signal = sym gws_queue_signal,
+    );
+}
+
+// Scarlett slot 17 is Wait; the PC queue's slot 17 is GetClockCalibration.
+#[unsafe(naked)]
+unsafe extern "system" fn q_scarlett_wait_dispatch() {
+    core::arch::naked_asm!(
+        "mov rax, [rsp]",
+        "sub rax, [rip + {base}]",
+        "cmp rax, [rip + {size}]",
+        "jb 2f",
+        "lea rax, [rip + {real}]",
+        "jmp qword ptr [rax + 136]",
+        "2:",
+        "jmp {wait}",
+        base = sym EXE_BASE, size = sym EXE_SIZE, real = sym REAL_QVT, wait = sym gws_queue_wait,
+    );
+}
+
+// Scarlett slot 18 returns the timestamp frequency. Desktop slot 18
+// remains GetDesc for host callers.
+#[unsafe(naked)]
+unsafe extern "system" fn q_scarlett_freq_dispatch() {
+    core::arch::naked_asm!(
+        "mov rax, [rsp]",
+        "sub rax, [rip + {base}]",
+        "cmp rax, [rip + {size}]",
+        "jae 2f",
+        "jmp {frequency}",
+        "2:",
+        "jmp {get_desc}",
+        base = sym EXE_BASE, size = sym EXE_SIZE, frequency = sym queue_freq, get_desc = sym l18,
     );
 }
 
@@ -1067,10 +1223,33 @@ pub fn apply_queue_vtable(queue: *mut c_void) {
             }
             install_qthunks();
             install_qlow();
+            if crate::cmdlist_wrap::scarlett_list6_probe() {
+                QUEUE_VT[18].store(q_scarlett_freq_dispatch as usize, Ordering::Relaxed);
+                XBOX_QVT[19].store(queue_calib as usize, Ordering::Relaxed);
+                XBOX_QVT[20].store(l18 as usize, Ordering::Relaxed);
+                XBOX_QVT[25].store(signal_x as usize, Ordering::Relaxed);
+                // Scarlett calls PresentX with the plane count and 72-byte plane records.
+                XBOX_QVT[32].store(present_x as *const () as usize, Ordering::Relaxed);
+                XBOX_QVT[35].store(scarlett_execute_lists as *const () as usize, Ordering::Relaxed);
+            }
             crate::hang_cap::install_queue(&QUEUE_VT, &|i| REAL_QVT[i].load(Ordering::Relaxed));
+            if crate::gws_dispatch::resume_enabled() || crate::cmdlist_wrap::scarlett_list6_probe() {
+                QUEUE_VT[14].store(gws_queue_signal as usize, Ordering::Relaxed);
+                QUEUE_VT[15].store(gws_queue_wait as usize, Ordering::Relaxed);
+            }
             QUEUE_VT[10].store(q_exec_dispatch as usize, Ordering::Relaxed);
-            QUEUE_VT[16].store(q_freq_dispatch as usize, Ordering::Relaxed);
-            QUEUE_VT[17].store(q_calib_dispatch as usize, Ordering::Relaxed);
+            let slot16 = if crate::cmdlist_wrap::scarlett_list6_probe() {
+                q_scarlett_signal_dispatch as usize
+            } else {
+                q_freq_dispatch as usize
+            };
+            QUEUE_VT[16].store(slot16, Ordering::Relaxed);
+            let slot17 = if crate::cmdlist_wrap::scarlett_list6_probe() {
+                q_scarlett_wait_dispatch as usize
+            } else {
+                q_calib_dispatch as usize
+            };
+            QUEUE_VT[17].store(slot17, Ordering::Relaxed);
             XBOX_QVT[30].store(present_x as usize, Ordering::Relaxed);
             XBOX_QVT[23].store(signal_x as usize, Ordering::Relaxed);
             let base = GetModuleHandleW(core::ptr::null()) as usize;

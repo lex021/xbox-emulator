@@ -13,6 +13,9 @@ pub const SUB_HS: u32 = 4;
 pub const SUB_GS: u32 = 5;
 pub const SUB_CS: u32 = 6;
 pub const SUB_PRIMITIVE_TOPOLOGY: u32 = 14;
+const SUB_CACHED_PSO: u32 = 19;
+const SCARLETT_TRIANGLE_TOPOLOGY: u32 = 0x13;
+const PC_TRIANGLE_TOPOLOGY: u32 = 3;
 pub const SUB_AS: u32 = 24;
 pub const SUB_MS: u32 = 25;
 pub const XBOX_SUB_AS: u32 = 23;
@@ -525,6 +528,21 @@ pub fn translate_stream(stream: &[u8], xlat: &dyn Fn(u32, &[u8], (u32, [u32; 8])
     Ok((out, keep))
 }
 
+fn normalize_scarlett_topology(stream: &mut [u8], subs: &[(u32, usize)]) -> bool {
+    let Some((_, inner)) = subs.iter().find(|(ty, inner)| {
+        *ty == SUB_PRIMITIVE_TOPOLOGY && word(stream, *inner) == SCARLETT_TRIANGLE_TOPOLOGY
+    }) else {
+        return false;
+    };
+    // The Xbox command list separately selects and expands RECTLIST draws.
+    // The host base PSO needs an ordinary triangle topology to be created.
+    stream[*inner..*inner + 4].copy_from_slice(&PC_TRIANGLE_TOPOLOGY.to_le_bytes());
+    if let Some((_, cached)) = subs.iter().find(|(ty, _)| *ty == SUB_CACHED_PSO) {
+        stream[*cached..*cached + 16].fill(0);
+    }
+    true
+}
+
 pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
     if desc.is_null() || real.is_null() || ppv.is_null() {
         return E_INVALIDARG;
@@ -534,7 +552,7 @@ pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], ri
         return E_INVALIDARG;
     }
     let raw = core::slice::from_raw_parts(ptr as *const u8, size as usize);
-    let pc_stream = match xbox_to_pc_stream(raw, &|| unsafe { crate::pso_ext::caps(real).1 }) {
+    let mut pc_stream = match xbox_to_pc_stream(raw, &|| unsafe { crate::pso_ext::caps(real).1 }) {
         Ok(s) => {
             if s.numbering == Numbering::Console {
                 note_console_stream(&s.types, &s.notes);
@@ -557,18 +575,24 @@ pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], ri
             return E_INVALIDARG;
         }
     };
+    let topology_normalized = normalize_scarlett_topology(&mut pc_stream, &subs);
+    let stream = pc_stream.as_slice();
     let root = root_signature(stream, &subs);
-    let mesh_pipeline = subs.iter().any(|&(ty, offset)| {
-        ty == SUB_MS && matches!(bytecode(stream, offset), (p, n) if p != 0 && n != 0)
-    });
     let root_data = std::cell::OnceCell::new();
     let pc_centroid = crate::centroid_bind::tag_rtfmt(root, [0; 8])[0] & crate::centroid_bind::RTFMT_PC_CENTROID != 0;
     let xlat = |ty: u32, b: &[u8], (n, f): (u32, [u32; 8]), feeds: Option<&[u8]>| {
         let link = feeds.map(|ps| crate::shader_xlat::ps_link(ps, pc_centroid)).unwrap_or_else(crate::shader_xlat::no_link);
         let k = stage_rtfmt(ty, (n, f));
         let k = if ty == SUB_PS { crate::centroid_bind::tag_rtfmt(root, k) } else { k };
-        if mesh_pipeline && matches!(ty, SUB_MS | SUB_PS) && root != 0 && crate::shader_xlat::needs_external_root_data(b) {
-            if let Some(data) = root_data.get_or_init(|| crate::console_slots_mesh::root_data(root as *mut c_void)) {
+        if root != 0 && crate::shader_xlat::needs_external_root_data(b) {
+            let pipeline_root = root_data.get_or_init(|| {
+                crate::pso_lib::root_info(root as usize)
+                    .filter(|(_, _, via_real)| !via_real)
+                    .map(|(_, blob, _)| blob.to_vec())
+                    .or_else(|| crate::console_slots_mesh::root_data(root as *mut c_void))
+                    .or_else(|| crate::pso_lib::root_info(root as usize).map(|(_, blob, _)| blob.to_vec()))
+            });
+            if let Some(data) = pipeline_root {
                 return crate::shader_xlat::translate_with_pipeline_root(b, data, k, &link).map_err(|e| e.to_string());
             }
         }
@@ -593,7 +617,23 @@ pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], ri
     let d = [out.len() as u64, out.as_ptr() as u64];
     let hr = f(dev2, &d, riid, ppv);
     if hr < 0 {
-        record("d3d12_xs", "CreatePipelineState", &format!("PC driver rejected stream hr={hr:#010x} subs=[{}]", stream_summary(&out)));
+        let stages = subs.iter().filter_map(|&(ty, inner)| {
+            if !matches!(ty, SUB_VS | SUB_PS | SUB_DS | SUB_HS | SUB_GS | SUB_CS | SUB_AS | SUB_MS) {
+                return None;
+            }
+            let (ptr, len) = bytecode(stream, inner);
+            if ptr == 0 || len == 0 {
+                return None;
+            }
+            let blob = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+            Some(format!("{ty}:{:016x}", crate::shader_xlat::fnv1a(blob)))
+        }).collect::<Vec<_>>().join(",");
+        record("d3d12_xs", "CreatePipelineState", &format!(
+            "PC driver rejected stream hr={hr:#010x} subs=[{}] console_shaders=[{stages}]",
+            stream_summary(&out),
+        ));
+    } else if topology_normalized {
+        record("d3d12_xs", "CreatePipelineState", "PC accepted Scarlett topology 0x13 as a triangle PSO");
     }
     if hr >= 0 && !(*ppv).is_null() && subs.iter().any(|(t, o)| *t == SUB_AS && bytecode(stream, *o).0 != 0) {
         crate::console_slots_mesh::note_as_pso(*ppv as usize);
@@ -701,6 +741,19 @@ mod tests {
     }
 
     #[test]
+    fn scarlett_topology_normalizes_the_triangle_variant_and_discards_its_cached_pso() {
+        for (input, expected, changed) in [(0x13u32, 3, true), (3, 3, false), (0x14, 0x14, false)] {
+            let mut stream = Vec::new();
+            push(&mut stream, SUB_PRIMITIVE_TOPOLOGY, &input.to_le_bytes());
+            push(&mut stream, SUB_CACHED_PSO, &[1; 16]);
+            let subs = parse(&stream).unwrap();
+            assert_eq!(normalize_scarlett_topology(&mut stream, &subs), changed);
+            assert_eq!(word(&stream, 4), expected);
+            assert_eq!(&stream[16..32], &[if changed { 0 } else { 1 }; 16]);
+        }
+    }
+
+    #[test]
     fn create_pipeline_state_accepts_root_signature_at_end_of_stream() {
         const E_NOINTERFACE: i32 = 0x8000_4002u32 as i32;
         unsafe extern "system" fn query_device2(_: *mut c_void, _: *const Guid, _: *mut *mut c_void) -> i32 {
@@ -710,7 +763,7 @@ mod tests {
         let vtable = [query_device2 as *const () as usize];
         let mut device = vtable.as_ptr();
         let mut stream = Vec::new();
-        push(&mut stream, SUB_MS, &[0; 16]);
+        push(&mut stream, SUB_PRIMITIVE_TOPOLOGY, &3u32.to_le_bytes());
         push(&mut stream, SUB_ROOT_SIGNATURE, &0x1234u64.to_le_bytes());
         let desc = [stream.len() as u64, stream.as_ptr() as u64];
         let mut pipeline = core::ptr::null_mut();

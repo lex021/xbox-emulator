@@ -70,6 +70,21 @@ fn virtual_alloc_inner(address: *mut c_void, size: usize, alloc_type: u32, attri
     let (base, len) = round_range(address as usize, size, gran);
     let wt = win_alloc_type(alloc_type);
     let wp = win_protect(protect);
+    let placeholder = alloc_type & (crate::phys::MEM_RESERVE_PLACEHOLDER | crate::phys::MEM_REPLACE_PLACEHOLDER);
+    if placeholder != 0 {
+        let p = crate::phys::alloc_placeholder(base, len, wt | placeholder, wp);
+        if p.is_null() {
+            let err = unsafe { GetLastError() };
+            record(M, "XMemVirtualAlloc", &format!(
+                "placeholder addr={address:p} size={size:#x} flags={:#x} -> NULL (err={err})",
+                wt | placeholder
+            ));
+            unsafe { SetLastError(err) };
+        } else if wt & MEM_COMMIT != 0 {
+            crate::write_note::committed(p as usize, len);
+        }
+        return p;
+    }
     if base != 0 && wt & MEM_COMMIT != 0 {
         if let Some(r) = crate::phys::commit_owned(base, len, wp) {
             crate::write_note::committed(r, len);
@@ -311,6 +326,27 @@ mod tests {
     }
 
     #[test]
+    fn virtual_placeholder_split_and_replace() {
+        let reserve = MEM_RESERVE | crate::phys::MEM_RESERVE_PLACEHOLDER;
+        let replace = MEM_RESERVE | MEM_COMMIT | crate::phys::MEM_REPLACE_PLACEHOLDER;
+        let base = XMemVirtualAlloc(core::ptr::null_mut(), 2 * XMEM_PAGE, reserve, 7, PAGE_NOACCESS);
+        assert!(!base.is_null());
+        let free: unsafe extern "system" fn(usize, usize, u32) -> i32 =
+            unsafe { core::mem::transmute(crate::hooks::vfree_wrapper()) };
+        unsafe {
+            let right = base.cast::<u8>().add(XMEM_PAGE).cast::<c_void>();
+            assert_ne!(free(base as usize, XMEM_PAGE, MEM_RELEASE | 2), 0);
+            let block = XMemVirtualAlloc(base, XMEM_PAGE, replace | XMEM_64K_PAGES, 0x27, PAGE_READWRITE);
+            assert_eq!(block, base);
+            assert_eq!(block.cast::<u8>().read_volatile(), 0);
+            block.cast::<u8>().write_volatile(0xa5);
+            assert_eq!(block.cast::<u8>().read_volatile(), 0xa5);
+            assert_ne!(free(base as usize, 0, MEM_RELEASE), 0);
+            assert_ne!(free(right as usize, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
     fn physical_pages_map_and_unmap() {
         let _g = crate::phys::map_test_guard();
         let va = XMemVirtualAlloc(core::ptr::null_mut(), 4 * XMEM_PAGE, MEM_RESERVE | XMEM_64K_PAGES, 0, PAGE_READWRITE);
@@ -398,7 +434,10 @@ mod tests {
         let mut n = 2usize;
         let mut pfns = [0u64; 2];
         assert_eq!(unsafe { XMemAllocatePhysicalPages(XMEM_64K_PAGES as u64, &mut n, pfns.as_mut_ptr()) }, 1);
-        assert!(pfns[0] != 0 && pfns[1] != pfns[0]);
+        let stride = compat_common::physical_pages::FRAMES_PER_PAGE;
+        assert_ne!(pfns[0], 0);
+        assert_eq!(pfns[0] & (stride - 1), 0);
+        assert_eq!(pfns[1] - pfns[0], stride);
         let mut twice = [pfns[0], pfns[0], pfns[1], 0];
         assert_eq!(unsafe { XMemMapPhysicalPages(va as *mut c_void, 4, twice.as_mut_ptr()) } as usize, va);
         unsafe {

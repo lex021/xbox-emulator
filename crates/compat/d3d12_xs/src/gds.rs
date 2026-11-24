@@ -15,7 +15,7 @@ pub const PARAM_CONSTANTS: u32 = 1;
 pub const PARAM_UAV: u32 = 4;
 pub const ROOT_DWORD_LIMIT: u32 = 64;
 pub const ROOT_FLAG_LOCAL: u32 = 0x80;
-const PARAM_SIZE: usize = 32;
+pub(crate) const PARAM_SIZE: usize = 32;
 const VERSION_1_1: u32 = 2;
 const STATE_COMMON: u32 = 0;
 const STATE_UAV: u32 = 0x8;
@@ -91,6 +91,34 @@ pub unsafe fn patch_root_signature_with_gws(blob: *const u8, len: usize) -> Opti
 }
 
 unsafe fn patch_root_signature_inner(blob: *const u8, len: usize, phased: bool) -> Option<(Vec<u8>, u32)> {
+    let out = unsafe { patch_root_parameters(blob, len, |params, flags| {
+        let (mut np, idx) = append_plan(params, flags)?;
+        if phased {
+            if root_cost(&np) + 3 > ROOT_DWORD_LIMIT {
+                return None;
+            }
+            let mut scratch = gds_param();
+            scratch[8..12].copy_from_slice(&1u32.to_le_bytes()); // u1 in the GDS space
+            np.extend_from_slice(&scratch);
+            let mut control = [0u8; PARAM_SIZE];
+            control[..4].copy_from_slice(&PARAM_CONSTANTS.to_le_bytes());
+            control[12..16].copy_from_slice(&TB_GDS_SPACE.to_le_bytes());
+            control[16..20].copy_from_slice(&1u32.to_le_bytes()); // b0, one DWORD
+            np.extend_from_slice(&control);
+        }
+        Some((np, idx))
+    }) };
+    if out.is_none() && !phased && once(8) {
+        record("d3d12_xs", "gds", "root signature could not be extended with the GDS UAV");
+    }
+    out
+}
+
+pub(crate) unsafe fn patch_root_parameters(
+    blob: *const u8,
+    len: usize,
+    append: impl FnOnce(&[u8], u32) -> Option<(Vec<u8>, u32)>,
+) -> Option<(Vec<u8>, u32)> {
     if blob.is_null() || len == 0 {
         return None;
     }
@@ -112,41 +140,22 @@ unsafe fn patch_root_signature_inner(blob: *const u8, len: usize, phased: bool) 
         let n = u32_at(&vd, 8) as usize;
         let pp = u64::from_le_bytes(vd[16..24].try_into().unwrap()) as *const u8;
         let params = if n == 0 || pp.is_null() { Vec::new() } else { unsafe { core::slice::from_raw_parts(pp, n * PARAM_SIZE) }.to_vec() };
-        match append_plan(&params, u32_at(&vd, 40)).filter(|(np, _)| !phased || root_cost(np) + 3 <= ROOT_DWORD_LIMIT) {
-            Some((mut np, idx)) => {
-                if phased {
-                    let mut scratch = gds_param();
-                    scratch[8..12].copy_from_slice(&1u32.to_le_bytes()); // u1 in the GDS space
-                    np.extend_from_slice(&scratch);
-                    let mut control = [0u8; PARAM_SIZE];
-                    control[..4].copy_from_slice(&PARAM_CONSTANTS.to_le_bytes());
-                    control[12..16].copy_from_slice(&TB_GDS_SPACE.to_le_bytes());
-                    control[16..20].copy_from_slice(&1u32.to_le_bytes()); // b0, one DWORD
-                    np.extend_from_slice(&control);
-                }
-                let mut nd = vd.clone();
-                nd[8..12].copy_from_slice(&((np.len() / PARAM_SIZE) as u32).to_le_bytes());
-                nd[16..24].copy_from_slice(&(np.as_ptr() as u64).to_le_bytes());
-                let ser: unsafe extern "system" fn(*const u8, *mut *mut c_void, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(ser) };
-                let (mut b, mut e): (*mut c_void, *mut c_void) = (core::ptr::null_mut(), core::ptr::null_mut());
-                let hr = unsafe { ser(nd.as_ptr(), &mut b, &mut e) };
-                if hr >= 0 && !b.is_null() {
-                    let ptr: unsafe extern "system" fn(*mut c_void) -> *const u8 = unsafe { core::mem::transmute(vslot(b, 3)) };
-                    let size: unsafe extern "system" fn(*mut c_void) -> usize = unsafe { core::mem::transmute(vslot(b, 4)) };
-                    out = Some((unsafe { core::slice::from_raw_parts(ptr(b), size(b)) }.to_vec(), idx));
-                } else if once(8) {
-                    record("d3d12_xs", "gds", &format!("re-serializing a root signature with the GDS parameter FAILED hr={hr:#010x}"));
-                }
-                for o in [b, e] {
-                    if !o.is_null() {
-                        let r: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(vslot(o, 2)) };
-                        unsafe { r(o) };
-                    }
-                }
+        if let Some((np, idx)) = append(&params, u32_at(&vd, 40)) {
+            let mut nd = vd;
+            nd[8..12].copy_from_slice(&((np.len() / PARAM_SIZE) as u32).to_le_bytes());
+            nd[16..24].copy_from_slice(&(np.as_ptr() as u64).to_le_bytes());
+            let ser: unsafe extern "system" fn(*const u8, *mut *mut c_void, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(ser) };
+            let (mut b, mut e) = (core::ptr::null_mut(), core::ptr::null_mut());
+            let hr = unsafe { ser(nd.as_ptr(), &mut b, &mut e) };
+            if hr >= 0 && !b.is_null() {
+                let ptr: unsafe extern "system" fn(*mut c_void) -> *const u8 = unsafe { core::mem::transmute(vslot(b, 3)) };
+                let size: unsafe extern "system" fn(*mut c_void) -> usize = unsafe { core::mem::transmute(vslot(b, 4)) };
+                out = Some((unsafe { core::slice::from_raw_parts(ptr(b), size(b)) }.to_vec(), idx));
             }
-            None => {
-                if !phased && once(8) {
-                    record("d3d12_xs", "gds", &format!("root signature uses {} DWORDs (or is local); no room for the 2-DWORD GDS root UAV", root_cost(&params)));
+            for o in [b, e] {
+                if !o.is_null() {
+                    let r: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(vslot(o, 2)) };
+                    unsafe { r(o) };
                 }
             }
         }
@@ -243,6 +252,10 @@ unsafe fn bind(list: *mut c_void, rs: *mut c_void, slot: usize) {
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, u64) = unsafe { core::mem::transmute(crate::cmdlist_wrap::pc_method(list, slot)) };
     unsafe { f(list, idx, va) };
+}
+
+pub(crate) unsafe fn bind_compute(list: *mut c_void, root: *mut c_void) {
+    unsafe { bind(list, root, PC_SET_COMPUTE_ROOT_UAV) };
 }
 
 unsafe extern "system" fn h_croot(this: *mut c_void, rs: *mut c_void) {
