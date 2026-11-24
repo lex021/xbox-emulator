@@ -205,7 +205,8 @@ pub fn gs_hlsl(vs_out: &[El], ps_in: &[El]) -> Result<String, String> {
     let p = format!("f{pos}");
     h.push_str(&format!("    float q0 = 1.0 / v[0].{p}.w;\n    float q1 = 1.0 / v[1].{p}.w;\n    float q2 = 1.0 / v[2].{p}.w;\n"));
     h.push_str(&format!("    bool same = v[0].{p}.w == v[1].{p}.w && v[0].{p}.w == v[2].{p}.w;\n"));
-    h.push_str("    float q3 = q1 + q2 - q0;\n    float w3 = 1.0 / q3;\n    GO c[4];\n");
+    h.push_str(&format!("    float2 n0 = v[0].{p}.xy * q0, n1 = v[1].{p}.xy * q1, n2 = v[2].{p}.xy * q2;\n"));
+    h.push_str("    float d0 = dot(n1-n2,n1-n2), d1 = dot(n0-n2,n0-n2), d2 = dot(n0-n1,n0-n1);\n    uint pivot = (d1 > d0 && d1 >= d2) ? 1u : ((d2 > d0 && d2 > d1) ? 2u : 0u);\n    uint a = pivot == 0u ? 1u : 0u, b = pivot == 2u ? 1u : 2u;\n    float q[3] = {q0, q1, q2};\n    float q3 = q[a] + q[b] - q[pivot];\n    float w3 = 1.0 / q3;\n    GO c[4];\n");
     for k in 0..3 {
         for i in 0..vs_out.len() {
             h.push_str(&format!("    c[{k}].f{i} = v[{k}].f{i};\n"));
@@ -214,9 +215,9 @@ pub fn gs_hlsl(vs_out: &[El], ps_in: &[El]) -> Result<String, String> {
     for (i, e) in vs_out.iter().enumerate() {
         let f = format!("f{i}");
         let line = match mode(e, ps_in) {
-            Mode::Position => format!("    c[3].{f} = same ? v[1].{f} + v[2].{f} - v[0].{f} : float4((v[1].{f}.xyz * q1 + v[2].{f}.xyz * q2 - v[0].{f}.xyz * q0) * w3, w3);\n"),
-            Mode::Perspective => format!("    c[3].{f} = same ? v[1].{f} + v[2].{f} - v[0].{f} : (v[1].{f} * q1 + v[2].{f} * q2 - v[0].{f} * q0) * w3;\n"),
-            Mode::Affine => format!("    c[3].{f} = v[1].{f} + v[2].{f} - v[0].{f};\n"),
+            Mode::Position => format!("    c[3].{f} = same ? v[a].{f} + v[b].{f} - v[pivot].{f} : float4((v[a].{f}.xyz * q[a] + v[b].{f}.xyz * q[b] - v[pivot].{f}.xyz * q[pivot]) * w3, w3);\n"),
+            Mode::Perspective => format!("    c[3].{f} = same ? v[a].{f} + v[b].{f} - v[pivot].{f} : (v[a].{f} * q[a] + v[b].{f} * q[b] - v[pivot].{f} * q[pivot]) * w3;\n"),
+            Mode::Affine => format!("    c[3].{f} = v[a].{f} + v[b].{f} - v[pivot].{f};\n"),
             Mode::Flat => format!("    c[3].{f} = v[0].{f};\n"),
         };
         h.push_str(&line);
@@ -224,7 +225,7 @@ pub fn gs_hlsl(vs_out: &[El], ps_in: &[El]) -> Result<String, String> {
     if pid {
         h.push_str("    c[0].pid = pid;\n    c[1].pid = pid;\n    c[2].pid = pid;\n    c[3].pid = pid;\n");
     }
-    h.push_str("    s.Append(c[0]);\n    s.Append(c[1]);\n    s.Append(c[3]);\n    s.RestartStrip();\n    s.Append(c[0]);\n    s.Append(c[3]);\n    s.Append(c[2]);\n    s.RestartStrip();\n}\n");
+    h.push_str("    s.Append(c[0]);\n    s.Append(c[1]);\n    s.Append(c[pivot == 0u ? 3u : 2u]);\n    s.RestartStrip();\n    s.Append(c[0]);\n    s.Append(c[pivot == 1u ? 2u : 3u]);\n    s.Append(c[pivot == 2u ? 1u : (pivot == 1u ? 3u : 2u)]);\n    s.RestartStrip();\n}\n");
     Ok(h)
 }
 
@@ -406,17 +407,36 @@ mod tests {
         let ps = [el("COLOR", 0, 2, 0, 4, 0, COMP_FLOAT, 4), el("", 0, 0xff, 0, 1, KIND_PRIMITIVE_ID, COMP_UINT, 1)];
         let h = gs_hlsl(&vs, &ps).unwrap();
         assert!(h.contains("    noperspective float4 f0 : SV_Position;\n    float2 f1 : TEXCOORD0;\n    nointerpolation uint f2 : TEXCOORD1;\n    float4 f3 : COLOR0;\n"), "{h}");
-        assert!(h.contains("c[3].f0 = same ? v[1].f0 + v[2].f0 - v[0].f0 : float4((v[1].f0.xyz * q1"), "{h}");
-        assert!(h.contains("c[3].f1 = same ? v[1].f1 + v[2].f1 - v[0].f1 : (v[1].f1 * q1"), "{h}");
+        assert!(h.contains("c[3].f0 = same ? v[a].f0 + v[b].f0 - v[pivot].f0"), "{h}");
+        assert!(h.contains("c[3].f1 = same ? v[a].f1 + v[b].f1 - v[pivot].f1"), "{h}");
         assert!(h.contains("c[3].f2 = v[0].f2;"), "{h}");
-        assert!(h.contains("c[3].f3 = v[1].f3 + v[2].f3 - v[0].f3;"), "{h}");
+        assert!(h.contains("c[3].f3 = v[a].f3 + v[b].f3 - v[pivot].f3;"), "{h}");
         assert!(h.contains("uint pid : SV_PrimitiveID;\n};"), "{h}");
-        assert!(h.contains("s.Append(c[0]);\n    s.Append(c[1]);\n    s.Append(c[3]);\n    s.RestartStrip();\n    s.Append(c[0]);\n    s.Append(c[3]);\n    s.Append(c[2]);"), "{h}");
+        assert!(h.contains("s.Append(c[pivot == 0u ? 3u : 2u])"), "{h}");
         assert!(gs_hlsl(&vs[1..], &[]).is_err());
         assert!(gs_hlsl(&[el("", 0, 0, 0, 4, KIND_POSITION, COMP_FLOAT, 0), el("X", 0, 1, 0, 4, 0, 6, 0)], &[]).is_err());
         assert_eq!(forwarded(RECTLIST), TRIANGLELIST);
         for t in [0, 1, 2, 3, 4, 5, 19, 33] {
             assert_eq!(forwarded(t), t);
+        }
+    }
+
+    #[test]
+    fn longest_edge_finds_all_three_rectangle_pivots() {
+        for pivot in 0..3 {
+            let mut v = [[0.0f32, 0.0], [2.0, 0.0], [0.0, 1.0]];
+            v.swap(0, pivot);
+            let dist = |a: usize, b: usize| (v[a][0]-v[b][0]).powi(2) + (v[a][1]-v[b][1]).powi(2);
+            let (d0, d1, d2) = (dist(1,2), dist(0,2), dist(0,1));
+            let actual = if d1 > d0 && d1 >= d2 { 1 } else if d2 > d0 && d2 > d1 { 2 } else { 0 };
+            assert_eq!(actual, pivot);
+            let (a,b) = match pivot { 0 => (1,2), 1 => (0,2), _ => (0,1) };
+            let fourth = [v[a][0] + v[b][0] - v[pivot][0], v[a][1] + v[b][1] - v[pivot][1]];
+            assert_eq!(fourth, [2.0, 1.0]);
+            let p = [v[0], v[1], v[2], fourth];
+            let area = |i: usize, j: usize, k: usize| (p[j][0]-p[i][0])*(p[k][1]-p[i][1])-(p[j][1]-p[i][1])*(p[k][0]-p[i][0]);
+            let (first, second) = match pivot { 0 => (area(0,1,3), area(0,3,2)), 1 => (area(0,1,2), area(0,2,3)), _ => (area(0,1,2), area(0,3,1)) };
+            assert!(first * second > 0.0, "pivot {pivot}: triangle winding differs");
         }
     }
 
