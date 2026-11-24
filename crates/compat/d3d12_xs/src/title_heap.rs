@@ -671,6 +671,7 @@ pub struct RootLayout {
     pub tables: Vec<Option<Vec<TableRange>>>,
     pub direct_resources: bool,
     pub direct_samplers: bool,
+    scarlett_media: bool,
 }
 
 pub fn range_kind(range_type: u32) -> u8 {
@@ -706,7 +707,14 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<RootLayout> {
         tombox_xshader::meta::RootParamKind::Table(r) => Some(table_ranges(r)),
         _ => None,
     });
-    Some(RootLayout { tables: tables.collect(), direct_resources: rs.flags & ROOT_FLAG_DIRECT_RESOURCES != 0, direct_samplers: rs.flags & ROOT_FLAG_DIRECT_SAMPLERS != 0 })
+    let scarlett_media = tombox_xshader::meta::scarlett_media_table(&rs)
+        || matches!(rs.params.as_slice(), [tombox_xshader::meta::RootParam {
+            kind: tombox_xshader::meta::RootParamKind::Table(ranges), visibility: 0,
+        }] if rs.flags == 1 && rs.num_static_samplers == 5
+            && ranges.iter().any(|r| r.range_type == 0 && r.num == 8
+                && r.base_register == tombox_xshader::meta::SCARLETT_PACKED_SRV_REGISTER
+                && r.space == 1 && r.offset_in_table == 0));
+    Some(RootLayout { tables: tables.collect(), direct_resources: rs.flags & ROOT_FLAG_DIRECT_RESOURCES != 0, direct_samplers: rs.flags & ROOT_FLAG_DIRECT_SAMPLERS != 0, scarlett_media })
 }
 
 static ROOTS: Mutex<Option<HashMap<usize, RootLayout>>> = Mutex::new(None);
@@ -1030,7 +1038,79 @@ unsafe extern "system" fn h_cmp_table(list: *mut c_void, i: u32, h: u64) {
 
 unsafe extern "system" fn h_gfx_table(list: *mut c_void, i: u32, h: u64) {
     let f: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(next(S_GTABLE));
-    f(list, i, on_table(list as usize, 1, i, h))
+    let table = on_table(list as usize, 1, i, h);
+    if i == 0 && root_of(list as usize, 1).is_some_and(|rs| roots(|m| {
+        m.get(&rs).is_some_and(|l| l.scarlett_media)
+    })) {
+        // Scarlett copies a CPU SRV record into the guest arena directly. That
+        // copy does not populate the separate Windows shader-visible heap.
+        let original = crate::device_wrap::real_device_orig(18);
+        if original != 0 {
+            if let Some(device) = unsafe { crate::passcap::list_device(list as usize) } {
+                let write: unsafe extern "system" fn(usize, usize, *const u8, usize) =
+                    unsafe { core::mem::transmute(original) };
+                let materialize = |cpu, res, desc: [u8; 40]| {
+                    let native = crate::heap_wrap::native_cpu_handle(cpu);
+                    crate::placed_offset::with_true_desc(|| unsafe {
+                        write(device, res, desc.as_ptr(), native);
+                    });
+                };
+                if let Some((cpu, res, desc)) = crate::bindtrace::copied_scarlett_texture(table, 1) {
+                    materialize(cpu, res, desc);
+                    crate::bindtrace::trace_media_write(cpu, "guest texture -> native SRV");
+                    if once(21) {
+                        record(M, TAG, "materialized the directly copied Scarlett media SRV in the native shader-visible table");
+                    }
+                }
+                // Diagnostic: dump raw 8xu32 at slot 0 of Scarlett guest heap at h_gfx_table call time.
+                // Scenario A -> nenulevy RDNA2 V# => patch srabotaet.
+                // Scenario B/C -> nuli => patch ne pomozhet, nuzhna drugaya strategiya.
+                if once(27) {
+                    let raw: [u32; 8] = unsafe { (table as *const [u32; 8]).read_unaligned() };
+                    record(M, TAG, &format!("slot0 raw at h_gfx_table call: {:08x?}", raw));
+                }
+                // Slot 0: StructuredBuffer SRV written directly by title (bypasses API interception)
+                if let Some((cpu, res, desc)) = crate::bindtrace::copied_scarlett_buffer(table, 0) {
+                    materialize(cpu, res, desc);
+                    crate::bindtrace::trace_media_write(cpu, "guest buffer -> native SRV (slot 0, API path)");
+                    if once(25) {
+                        record(M, TAG, "materialized Scarlett StructuredBuffer SRV in slot 0 via API cache");
+                    }
+                } else if let Some(words) = crate::bindtrace::scarlett_guest_slot_words(table, 0) {
+                    // Fallback: decode raw Scarlett guest V# (title wrote directly, not via API)
+                    unsafe {
+                        write_resource_slot(device, crate::heap_wrap::native_cpu_handle(
+                            crate::bindtrace::scarlett_cpu_slot(table, 0).unwrap_or(0)
+                        ) as u64, FAMILY_SCARLETT, &words, KIND_SRV);
+                    }
+                    if once(26) {
+                        record(M, TAG, "decoded Scarlett guest V# at slot 0 directly (bypassed write path)");
+                    }
+                }
+                if crate::cbv_raw::copy_on() || crate::cbv_raw::enabled() {
+                    for slot in 0..8 {
+                        let Some((cpu, va, len)) = crate::bindtrace::copied_scarlett_cbv(table, slot) else { continue; };
+                        if slot == 0 && len == 96 && std::env::var_os("TOMBOX_BINK_TRACE").is_some()
+                            && crate::title_shadow::is_writable_range(va as usize, len as usize) && once(24) {
+                            let color = unsafe { ((va + 32) as *const [f32; 4]).read_unaligned() };
+                            record(M, TAG, &format!("early media blit color multiplier from guest memory: {color:?}"));
+                        }
+                        match crate::cbv_raw::raw_view(va, len, &crate::gpu_va::lookup_buffer) {
+                            Ok((res, desc)) => {
+                                materialize(cpu, res, desc);
+                                crate::bindtrace::trace_media_write(cpu, &format!("guest CBV va={va:#x} size={len} -> native raw SRV"));
+                                if once(22) {
+                                    record(M, TAG, "materialized a directly copied Scarlett media CBV as a native raw SRV");
+                                }
+                            }
+                            Err(error) => crate::bindtrace::trace_media_write(cpu, &format!("guest CBV va={va:#x} size={len} rejected: {error}")),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    f(list, i, table)
 }
 
 pub fn install(vt: &[AtomicUsize]) {

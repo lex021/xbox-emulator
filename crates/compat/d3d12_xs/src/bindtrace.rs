@@ -49,6 +49,8 @@ struct Buf {
 #[derive(Default)]
 struct State {
     descs: HashMap<usize, Entry>,
+    write_history: HashMap<usize, Vec<String>>,
+    guest_cbv_sources: HashMap<[u64; 4], usize>,
     heaps: Vec<Heap>,
     /// descriptor increment per D3D12_DESCRIPTOR_HEAP_TYPE
     inc: [usize; 4],
@@ -63,6 +65,46 @@ struct State {
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+fn history_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TOMBOX_DESCRIPTOR_HISTORY").is_some_and(|v| v != "0"))
+}
+
+fn history(s: &mut State, dest: usize, event: String) {
+    if !history_on() || (s.write_history.len() >= 250_000 && !s.write_history.contains_key(&dest)) { return; }
+    let events = s.write_history.entry(dest).or_default();
+    if events.len() == 4 { events.remove(0); }
+    events.push(event);
+}
+
+pub(crate) fn trace_raw_cbv_request(dest: usize, va: u64, size: u32) {
+    if history_on() {
+        with(|s| { let frame = s.frame; history(s, dest, format!("frame {frame} CBV request va={va:#x} size={size}")); });
+    }
+}
+
+pub(crate) fn trace_media_write(dest: usize, source: &str) {
+    if history_on() {
+        with(|s| { let frame = s.frame; history(s, dest, format!("frame {frame} media materialization: {source}")); });
+    }
+}
+
+pub(crate) fn trace_guest_cbv_source(source: usize, words: [u64; 4]) {
+    if history_on() {
+        with(|s| {
+            if s.guest_cbv_sources.len() < 250_000 { s.guest_cbv_sources.insert(words, source); }
+            let frame = s.frame;
+            history(s, source, format!("frame {frame} generated guest CBV record"));
+        });
+    }
+}
+
+pub(crate) fn guest_cbv_source(words: &[u32; 8]) -> Option<usize> {
+    if !history_on() { return None; }
+    let packed = std::array::from_fn(|i| words[i * 2] as u64 | ((words[i * 2 + 1] as u64) << 32));
+    with(|s| s.guest_cbv_sources.get(&packed).copied())
+}
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let mut g = STATE.lock().unwrap();
@@ -139,12 +181,18 @@ pub fn note_desc(dest: usize, d: Desc) {
     }
     with(|s| {
         let frame = s.frame;
+        let kind = match &d { Desc::Cbv { .. } => "CBV", Desc::Srv { .. } => "SRV", Desc::Uav { .. } => "UAV", Desc::Sampler { .. } => "sampler" };
+        history(s, dest, format!("frame {frame} create {kind}"));
         s.descs.insert(dest, Entry { d, frame });
     });
 }
 
 /// Mirror `CopyDescriptorsSimple` / one range pair of `CopyDescriptors`.
 pub fn copy_desc(dest: usize, src: usize, n: u32, heap_type: u32) {
+    copy_desc_api(dest, src, n, heap_type, "CopyDescriptors");
+}
+
+pub fn copy_desc_api(dest: usize, src: usize, n: u32, heap_type: u32, operation: &str) {
     with(|s| {
         let inc = s.inc.get(heap_type as usize).copied().unwrap_or(0);
         if inc == 0 {
@@ -152,6 +200,10 @@ pub fn copy_desc(dest: usize, src: usize, n: u32, heap_type: u32) {
         }
         let frame = s.frame;
         for i in 0..n as usize {
+            let source = src + i * inc;
+            let target = dest + i * inc;
+            let tracked = s.descs.contains_key(&source);
+            history(s, target, format!("frame {frame} {operation} from {source:#x}, source tracked={tracked}"));
             match s.descs.get(&(src + i * inc)).cloned() {
                 Some(mut e) => {
                     e.frame = frame;
@@ -517,6 +569,157 @@ pub fn uav_view_text(desc: Option<[u8; 40]>) -> String {
         1 => format!("fmt={fmt} Buffer first={} n={} stride={}", u64::from_le_bytes(d[8..16].try_into().unwrap()), u(16), u(20)),
         _ => format!("fmt={fmt} ViewDimension={dim}"),
     }
+}
+
+pub(crate) fn scarlett_cpu_slot(gpu: u64, slot: usize) -> Option<usize> {
+    let cpu = with(|s| {
+        let heap = s.heaps.iter().find(|h| h.inc == 32 && h.kind == Some(0)
+            && gpu.checked_sub(h.gpu).is_some_and(|off| off < h.count as u64 * 32))?;
+        let offset = gpu - heap.gpu;
+        let index = (offset / 32) as usize + slot;
+        if offset % 32 != 0 || index >= heap.count { return None; }
+        heap.cpu.checked_add(index * 32)
+    })?;
+    crate::heap_wrap::scarlett_shader_visible_cpu_range(cpu, 1).then_some(cpu)
+}
+
+pub(crate) fn copied_scarlett_cbv(gpu: u64, slot: usize) -> Option<(usize, u64, u32)> {
+    let cpu = scarlett_cpu_slot(gpu, slot)?;
+    let bytes = unsafe { desc_bytes(cpu, 32) }?;
+    let word = |i| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+    let (lo, hi, units) = (word(0), word(4), word(8));
+    if hi >> 16 != 0x0010 || word(12) != 0x0002_403c || !(1..=4096).contains(&units)
+        || bytes[16..].iter().any(|&b| b != 0) {
+        return None;
+    }
+    Some((cpu, (u64::from(hi & 0xffff) << 32) | u64::from(lo), units * 16))
+}
+
+pub(crate) fn guest_table_cbv(list: usize, param: usize, slot: usize) -> Option<(u64, u32)> {
+    let gpu = with(|s| s.tables.get(&(list, false))?.get(param).copied())?;
+    copied_scarlett_cbv(gpu, slot).map(|(_, va, len)| (va, len))
+}
+
+pub(crate) fn copied_scarlett_texture(gpu: u64, slot: usize) -> Option<(usize, usize, [u8; 40])> {
+    with(|s| {
+        let heap = s.heaps.iter().find(|h| h.inc == 32 && h.kind == Some(0)
+            && gpu.checked_sub(h.gpu).is_some_and(|off| off < h.count as u64 * 32))?;
+        let offset = gpu - heap.gpu;
+        if offset % 32 != 0 { return None; }
+        let index = (offset / 32) as usize + slot;
+        if index >= heap.count { return None; }
+        let cpu = heap.cpu.checked_add(index * 32)?;
+        if s.descs.contains_key(&cpu) || !crate::heap_wrap::scarlett_shader_visible_cpu_range(cpu, 1) {
+            return None;
+        }
+        let bytes = unsafe { desc_bytes(cpu, heap.inc) }?;
+        match s.by_bytes.get(&bytes)? {
+            Desc::Srv { res, desc: Some(desc) } if *res != 0
+                && u32::from_le_bytes(desc[4..8].try_into().unwrap()) == 4
+                && crate::gpu_va::texture_va(*res).is_some() => Some((cpu, *res, *desc)),
+            _ => None,
+        }
+    })
+}
+
+/// Like `copied_scarlett_texture` but for a Buffer SRV (dim == 1).
+/// Returns `(cpu_handle, res, desc_bytes)` if slot holds an API-recorded buffer SRV.
+pub(crate) fn copied_scarlett_buffer(gpu: u64, slot: usize) -> Option<(usize, usize, [u8; 40])> {
+    let cpu = scarlett_cpu_slot(gpu, slot)?;
+    with(|s| {
+        let d = match s.descs.get(&cpu) {
+            Some(e) => Some(&e.d),
+            None => {
+                let bytes = unsafe { desc_bytes(cpu, 32) }?;
+                s.by_bytes.get(&bytes)
+            }
+        }?;
+        match d {
+            Desc::Srv { res, desc: Some(desc) }
+                if *res != 0
+                && u32::from_le_bytes(desc[4..8].try_into().unwrap()) == 1 => {
+                Some((cpu, *res, *desc))
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Read the raw 8 x u32 Scarlett guest descriptor at `gpu + slot*32`.
+/// Returns `None` if all bytes are zero or slot is out of range.
+pub(crate) fn scarlett_guest_slot_words(gpu: u64, slot: usize) -> Option<[u32; 8]> {
+    let cpu = scarlett_cpu_slot(gpu, slot)?;
+    let words: [u32; 8] = unsafe { (cpu as *const [u32; 8]).read_unaligned() };
+    if words.iter().all(|&w| w == 0) {
+        return None;
+    }
+    Some(words)
+}
+
+pub(crate) fn scarlett_guest_table(list: usize, param: u32, slots: usize) -> Option<Vec<[u32; 8]>> {
+    let (cpu, size) = with(|s| {
+        let gpu = *s.tables.get(&(list, false))?.get(param as usize)?;
+        let h = s.heaps.iter().find(|h| h.inc == 32 && h.kind == Some(0)
+            && gpu.checked_sub(h.gpu).is_some_and(|off| off < h.count as u64 * 32))?;
+        let offset = (gpu - h.gpu) as usize;
+        let start = h.cpu.checked_add(offset)?;
+        Some((start, slots.min(h.count - offset / 32)))
+    })?;
+    if !crate::heap_wrap::scarlett_shader_visible_cpu_range(cpu, size as u32) {
+        return None;
+    }
+    Some((0..size).map(|i| unsafe {
+        ((cpu + i * 32) as *const [u32; 8]).read_unaligned()
+    }).collect())
+}
+
+pub(crate) fn table_write_history(list: usize, param: u32) -> Option<String> {
+    if !history_on() { return None; }
+    with(|s| {
+        let gpu = *s.tables.get(&(list, false))?.get(param as usize)?;
+        let h = s.heaps.iter().find(|h| h.inc != 0 && gpu.checked_sub(h.gpu).is_some_and(|off| off < (h.count * h.inc) as u64))?;
+        let off = (gpu - h.gpu) as usize;
+        let cpu = h.cpu.checked_add(off)?;
+        let writes = s.write_history.get(&cpu).cloned().unwrap_or_default();
+        Some(format!("table[{param}]+0 cpu={cpu:#x} gpu={gpu:#x} index={} increment={} observed API writes: {writes:?} (direct CPU writes are not intercepted)", off / h.inc, h.inc))
+    })
+}
+
+pub(crate) fn guest_table_neighbors(list: usize, param: usize) -> Vec<String> {
+    let Some((base, first, count)) = with(|s| {
+        let gpu = *s.tables.get(&(list, false))?.get(param)?;
+        let h = s.heaps.iter().find(|h| h.inc == 32 && h.kind == Some(0) && gpu.checked_sub(h.gpu).is_some_and(|o| o < h.count as u64 * 32))?;
+        let off = gpu.checked_sub(h.gpu)? as usize;
+        (off % 32 == 0).then_some((h.cpu, off / 32, h.count))
+    }) else { return Vec::new() };
+    (-2isize..=3).filter_map(|delta| {
+        let index = first.checked_add_signed(delta)?;
+        if index >= count { return None; }
+        let cpu = base.checked_add(index.checked_mul(32)?)?;
+        if !crate::heap_wrap::scarlett_shader_visible_cpu_range(cpu, 1) { return None; }
+        let words = unsafe { (cpu as *const [u32; 8]).read_unaligned() };
+        let source = guest_cbv_source(&words);
+        Some(format!("guest table[{param}]{delta:+} index={index} cpu={cpu:#x} words={words:08x?} matching temporary CBV={source:x?}; byte match is not proof of copying"))
+    }).collect()
+}
+
+pub(crate) fn neighbor_probe_wanted(h: u64) -> bool {
+    if !history_on() {
+        return false;
+    }
+    let vs = crate::passcap::neighbor_probe_vs();
+    let ps = crate::passcap::probe_hashes();
+    if !vs.is_empty() {
+        vs.contains(&h)
+    } else if !ps.is_empty() {
+        ps.contains(&h)
+    } else {
+        false
+    }
+}
+
+pub(crate) fn neighbor_history_state() -> &'static str {
+    if history_on() { "on" } else { "off" }
 }
 
 pub fn table_count(list: usize, compute: bool) -> usize {
