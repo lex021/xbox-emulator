@@ -436,8 +436,8 @@ unsafe extern "system" fn update_monitor(_t: This, m: usize) {
     });
 }
 
-unsafe extern "system" fn unregister_progress(_t: This, m: usize, token: u64, _wait: bool) -> bool {
-    PROGRESS.unregister(Some(m), token)
+unsafe extern "system" fn unregister_progress(_t: This, m: usize, token: u64, wait: bool) -> bool {
+    PROGRESS.unregister(Some(m), token, wait)
 }
 
 unsafe extern "system" fn register_progress_v2(_t: This, m: usize, ctx: *mut c_void, cb: usize, token: *mut u64) -> i32 {
@@ -451,8 +451,8 @@ unsafe extern "system" fn register_installed(_t: This, queue: usize, ctx: *mut c
     INSTALLED.register(0, queue, ctx, cb, token)
 }
 
-unsafe extern "system" fn unregister_installed(_t: This, token: u64, _wait: bool) -> bool {
-    INSTALLED.unregister(None, token)
+unsafe extern "system" fn unregister_installed(_t: This, token: u64, wait: bool) -> bool {
+    INSTALLED.unregister(None, token, wait)
 }
 
 pub fn user_locale() -> String {

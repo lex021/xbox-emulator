@@ -364,6 +364,7 @@ pub struct Cap {
     pub tmp: usize,
     pub pitch: usize,
     pub total: u64,
+    pub depth: usize,
 }
 
 unsafe impl Send for Cap {}
@@ -391,6 +392,47 @@ fn barrier_sub0(res: usize, before: u32, after: u32) -> [u64; 4] {
 
 fn barrier_sub(res: usize, sub: u32, before: u32, after: u32) -> [u64; 4] {
     [0, res as u64, ((before as u64) << 32) | sub as u64, after as u64]
+}
+
+pub fn grid3d_on() -> bool {
+    static M: OnceLock<bool> = OnceLock::new();
+    *M.get_or_init(|| std::env::var("TOMBOX_PASSCAP_3D").map(|v| v.trim() == "1").unwrap_or(false))
+}
+
+pub fn cb_bytes() -> usize {
+    static M: OnceLock<usize> = OnceLock::new();
+    *M.get_or_init(|| std::env::var("TOMBOX_PASSCAP_CB_BYTES").ok().and_then(|v| v.trim().parse::<usize>().ok()).map(|v| v.clamp(256, 65536) & !63).unwrap_or(1024))
+}
+
+pub fn grid3d_text(data: &[u8], pitch: usize, w: usize, h: usize, depth: usize, fmt: u32) -> String {
+    if fmt != 17 && fmt != 15 {
+        return format!("3D {w}x{h}x{depth} format {fmt}: only R32G32_UINT light grids are decoded");
+    }
+    let (mut a, mut b, mut off) = (Vec::with_capacity(w * h * depth), Vec::with_capacity(w * h * depth), 0u32);
+    for z in 0..depth {
+        for y in 0..h {
+            let row = (z * h + y) * pitch;
+            for x in 0..w {
+                let o = row + x * 8;
+                let Some(t) = data.get(o..o + 8) else { continue };
+                let x0 = u32::from_le_bytes([t[0], t[1], t[2], t[3]]);
+                let y0 = u32::from_le_bytes([t[4], t[5], t[6], t[7]]);
+                off = off.max(x0);
+                a.push(y0 & 0xffff);
+                b.push(y0 >> 16);
+            }
+        }
+    }
+    let n = a.len().max(1);
+    let st = |v: &mut Vec<u32>| -> String {
+        let mean = v.iter().map(|&x| x as f64).sum::<f64>() / n as f64;
+        let nz = v.iter().filter(|&&x| x != 0).count();
+        let big = v.iter().filter(|&&x| x > 256).count();
+        v.sort_unstable();
+        let p = |q: f64| v.get(((v.len().max(1) - 1) as f64 * q) as usize).copied().unwrap_or(0);
+        format!("max {} p99 {} p50 {} mean {mean:.2} nonzero {:.3} over256 {big}", v.last().copied().unwrap_or(0), p(0.99), p(0.5), nz as f64 / n as f64)
+    };
+    format!("light grid {w}x{h}x{depth} ({} texels): count lo16 {} | count hi16 {} | offset max {off}", a.len(), st(&mut a), st(&mut b))
 }
 
 pub fn mips_on() -> bool {
@@ -444,7 +486,7 @@ pub unsafe fn inject_mip(dev: usize, list: usize, res: usize, state: u32, slot: 
     if mip > 0 && (samples > 1 || mip >= mips.max(1)) {
         return Err(format!("{label}: mip {mip} not capturable (samples {samples}, mips {mips})"));
     }
-    if dim != 3 {
+    if dim != 3 && !(dim == 4 && mip == 0 && samples <= 1 && grid3d_on()) {
         return Err(format!("{label}: dimension {dim} is not a 2D texture"));
     }
     if w == 0 || h == 0 {
@@ -480,6 +522,7 @@ pub unsafe fn inject_mip(dev: usize, list: usize, res: usize, state: u32, slot: 
         return Err(format!("{label}: budget exhausted ({} MB left)", budget_left >> 20));
     }
     let pitch = u32::from_le_bytes(fp[0x18..0x1c].try_into().unwrap()) as usize;
+    let fdepth = (u32::from_le_bytes(fp[0x14..0x18].try_into().unwrap()) as usize).max(1);
     let rb = committed(dev, 3, &buffer_desc(total), ST_COPY_DEST).map_err(|hr| format!("{label}: readback buffer hr={hr:#010x}"))?;
     let (src, tmp) = if samples > 1 {
         let tmp = match committed(dev, 1, &cd, ST_RESOLVE_DEST) {
@@ -519,7 +562,7 @@ pub unsafe fn inject_mip(dev: usize, list: usize, res: usize, state: u32, slot: 
         list_call_barrier(list, &[barrier_sub(res, mip, ST_COPY_SOURCE, state)]);
     }
     let read_fmt = u32::from_le_bytes(fp[0x08..0x0c].try_into().unwrap());
-    Ok(Cap { idx: 0, slot: slot.to_string(), res, label, w, h, fmt, read_fmt, samples, state, state_src: "caller", rb, tmp, pitch, total: total + tmp_bytes })
+    Ok(Cap { idx: 0, slot: slot.to_string(), res, label, w, h, fmt, read_fmt, samples, state, state_src: "caller", rb, tmp, pitch, total: total + tmp_bytes, depth: if dim == 4 { fdepth } else { 1 } })
 }
 
 pub fn decode_kind(fmt: u32, read_fmt: u32) -> Option<(usize, bool, usize, &'static str)> {
@@ -531,7 +574,7 @@ pub unsafe fn read_cap(c: &Cap) -> Option<Vec<u8>> {
     if call!(c.rb, 8, fn(u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut p) < 0 || p.is_null() {
         return None;
     }
-    let v = core::slice::from_raw_parts(p, c.total.min((c.pitch * c.h) as u64) as usize).to_vec();
+    let v = core::slice::from_raw_parts(p, c.total.min((c.pitch * c.h * c.depth.max(1)) as u64) as usize).to_vec();
     call!(c.rb, 9, fn(u32, *const c_void) -> (), 0, core::ptr::null());
     Some(v)
 }
@@ -889,7 +932,7 @@ unsafe fn probe_draw(g: &mut G, list: *mut c_void, k: usize, h: u64) {
         if let Some(shot) = g.shot.as_mut() {
             shot.cpu_pending.push((k, *va, format!("probe PS {h:016x} root[{i}] title va={va:#x}")));
         }
-        match crate::bindtrace::read_va(*va, 1024) {
+        match crate::bindtrace::read_va(*va, cb_bytes()) {
             Some(bytes) => {
                 let w: Vec<String> = bytes.chunks_exact(4).map(|x| format!("{:08x}", u32::from_le_bytes(x.try_into().unwrap()))).collect();
                 for (r, c) in w.chunks(16).enumerate() {
@@ -924,8 +967,9 @@ unsafe fn probe_draw(g: &mut G, list: *mut c_void, k: usize, h: u64) {
     let mut srvs: Vec<usize> = Vec::new();
     for part in b.split("SRV res 0x").skip(1) {
         let hex: String = part.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+        let is3d = grid3d_on() && part.lines().next().is_some_and(|l| l.contains(" dim=8 "));
         if let Ok(r) = usize::from_str_radix(&hex, 16) {
-            if r != 0 && !srvs.contains(&r) && srvs.len() < 8 {
+            if r != 0 && !srvs.contains(&r) && (srvs.len() < 8 || (is3d && srvs.len() < 12)) {
                 srvs.push(r);
             }
         }
@@ -1594,7 +1638,7 @@ pub fn note_submit(queue: usize, real: &[*mut c_void]) {
         let mut keep = Vec::new();
         for (lk, va, label) in core::mem::take(&mut shot.cpu_pending) {
             if keys.iter().any(|&x| x == lk || key(x as *mut c_void) == lk) {
-                let text = match unsafe { crate::bindtrace::read_va(va, 1024) } {
+                let text = match unsafe { crate::bindtrace::read_va(va, cb_bytes()) } {
                     Some(bytes) => bytes.chunks_exact(4).map(|x| format!("{:08x}", u32::from_le_bytes(x.try_into().unwrap()))).collect::<Vec<_>>().chunks(16).enumerate().map(|(r, c)| format!("  dw[{:3}..] {}", r * 16, c.join(" "))).collect::<Vec<_>>().join("\n"),
                     None => "  not an upload-heap buffer bindtrace can map".to_string(),
                 };
@@ -1862,6 +1906,7 @@ fn write_shot(sh: Shot, gpu_done: bool, waited: Vec<(usize, bool)>, raw: bool) {
             unsafe { read_cap(c) }
         };
         let text = match (res, decode_kind(c.fmt, c.read_fmt)) {
+            (Some(data), _) if c.depth > 1 => (Stats::default(), grid3d_text(&data, c.pitch, c.w, c.h, c.depth, if c.fmt == 0 { c.read_fmt } else { c.fmt })),
             (None, _) => (Stats::default(), if gpu_done { "readback Map failed".to_string() } else { "GPU fence wait timed out; not read".to_string() }),
             (Some(data), None) => {
                 if raw {

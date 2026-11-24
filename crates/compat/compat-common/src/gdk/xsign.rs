@@ -115,6 +115,7 @@ pub fn sign(method: &str, url: &str, authorization: &str, body: &[u8]) -> Result
     sign_at(filetime_now(), method, url, authorization, body)
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;

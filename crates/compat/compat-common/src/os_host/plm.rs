@@ -275,6 +275,12 @@ fn start_watcher() {
                             constrained = v;
                         }
                         signal_local(k, v);
+                    } else if let Some(signed_in) = crate::gdk::user::parse_user_command(line) {
+                        if signed_in {
+                            crate::gdk::user::sign_in();
+                        } else {
+                            crate::gdk::user::sign_out();
+                        }
                     }
                 }
             }

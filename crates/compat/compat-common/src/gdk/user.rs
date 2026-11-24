@@ -1,6 +1,8 @@
 use super::xasync::{self, Payload};
-use super::{log, next_token, put_str, put_wstr, Guid, Iface, This, E_INVALIDARG, S_OK};
+use super::{log, put_str, put_wstr, Guid, Iface, This, E_INVALIDARG, S_OK};
 use core::ffi::c_void;
+use super::events::Registry;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
 pub const CLSID: Guid = Guid::parse("01acd177-91f9-4763-a38e-ccbb55ce32e0");
@@ -193,7 +195,7 @@ unsafe extern "system" fn get_state(_t: This, u: usize, out: *mut u32) -> i32 {
     if u == 0 || out.is_null() {
         return E_INVALIDARG;
     }
-    *out = 0;
+    *out = STATE.load(Ordering::Acquire);
     S_OK
 }
 
@@ -300,16 +302,109 @@ unsafe extern "system" fn resolve_issue_async(_t: This, _u: usize, url: *const u
     xasync::run(block, OP_RESOLVE_ISSUE, Payload::status(S_OK))
 }
 
-pub unsafe extern "system" fn register_event(_t: This, _queue: usize, _ctx: *mut c_void, _cb: *const c_void, token: *mut u64) -> i32 {
-    if token.is_null() {
-        return E_INVALIDARG;
-    }
-    *token = next_token();
-    S_OK
+pub const STATE_SIGNED_IN: u32 = 0;
+pub const STATE_SIGNING_OUT: u32 = 1;
+pub const STATE_SIGNED_OUT: u32 = 2;
+pub const EVENT_SIGNED_IN_AGAIN: u32 = 0;
+pub const EVENT_SIGNING_OUT: u32 = 1;
+pub const EVENT_SIGNED_OUT: u32 = 2;
+pub const EVENT_GAMERTAG: u32 = 3;
+pub const EVENT_GAMER_PICTURE: u32 = 4;
+pub const EVENT_PRIVILEGES: u32 = 5;
+
+static STATE: AtomicU32 = AtomicU32::new(STATE_SIGNED_IN);
+pub static CHANGE_EVENTS: Registry = Registry::new();
+pub static DEVICE_ASSOCIATION: Registry = Registry::new();
+pub static AUDIO_ENDPOINT: Registry = Registry::new();
+
+pub fn state() -> u32 {
+    STATE.load(Ordering::Acquire)
 }
 
-pub unsafe extern "system" fn unregister_event(_t: This, _token: u64, _wait: bool) -> bool {
+pub fn fire_change(event: u32) -> usize {
+    let n = CHANGE_EVENTS.len();
+    CHANGE_EVENTS.fire(None, move |r| unsafe {
+        let cb: unsafe extern "system" fn(*mut c_void, u64, u32) = core::mem::transmute(r.cb);
+        cb(r.ctx as *mut c_void, LOCAL_ID, event)
+    });
+    log("XUserChangeEvent", &format!("event {event} queued to {n} registration(s)"));
+    n
+}
+
+pub fn sign_out() -> bool {
+    if STATE.compare_exchange(STATE_SIGNED_IN, STATE_SIGNING_OUT, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return false;
+    }
+    fire_change(EVENT_SIGNING_OUT);
+    STATE.store(STATE_SIGNED_OUT, Ordering::Release);
+    fire_change(EVENT_SIGNED_OUT);
     true
+}
+
+pub fn sign_in() -> bool {
+    if STATE.compare_exchange(STATE_SIGNED_OUT, STATE_SIGNED_IN, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return false;
+    }
+    fire_change(EVENT_SIGNED_IN_AGAIN);
+    true
+}
+
+pub fn parse_user_command(line: &str) -> Option<bool> {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "signout" | "sign-out" => Some(false),
+        "signin" | "sign-in" => Some(true),
+        _ => None,
+    }
+}
+
+pub fn fire_device_association(device: [u8; 32], old_user: u64, new_user: u64) -> usize {
+    let n = DEVICE_ASSOCIATION.len();
+    DEVICE_ASSOCIATION.fire(None, move |r| unsafe {
+        #[repr(C)]
+        struct Change {
+            device: [u8; 32],
+            old_user: u64,
+            new_user: u64,
+        }
+        let c = Change { device, old_user, new_user };
+        let cb: unsafe extern "system" fn(*mut c_void, *const Change) = core::mem::transmute(r.cb);
+        cb(r.ctx as *mut c_void, &c)
+    });
+    n
+}
+
+pub fn fire_audio_endpoint(kind: u32, old_id: &str, new_id: &str) -> usize {
+    let n = AUDIO_ENDPOINT.len();
+    let (old_w, new_w): (Vec<u16>, Vec<u16>) = (old_id.encode_utf16().chain([0]).collect(), new_id.encode_utf16().chain([0]).collect());
+    AUDIO_ENDPOINT.fire(None, move |r| unsafe {
+        let cb: unsafe extern "system" fn(*mut c_void, u64, u32, *const u16, *const u16) = core::mem::transmute(r.cb);
+        cb(r.ctx as *mut c_void, LOCAL_ID, kind, old_w.as_ptr(), new_w.as_ptr())
+    });
+    n
+}
+
+pub unsafe extern "system" fn register_event(_t: This, queue: usize, ctx: *mut c_void, cb: *const c_void, token: *mut u64) -> i32 {
+    CHANGE_EVENTS.register(0, queue, ctx, cb as usize, token)
+}
+
+pub unsafe extern "system" fn unregister_event(_t: This, token: u64, wait: bool) -> bool {
+    CHANGE_EVENTS.unregister(None, token, wait)
+}
+
+unsafe extern "system" fn register_device_association(_t: This, queue: usize, ctx: *mut c_void, cb: *const c_void, token: *mut u64) -> i32 {
+    DEVICE_ASSOCIATION.register(0, queue, ctx, cb as usize, token)
+}
+
+unsafe extern "system" fn unregister_device_association(_t: This, token: u64, wait: bool) -> bool {
+    DEVICE_ASSOCIATION.unregister(None, token, wait)
+}
+
+unsafe extern "system" fn register_audio_endpoint(_t: This, queue: usize, ctx: *mut c_void, cb: *const c_void, token: *mut u64) -> i32 {
+    AUDIO_ENDPOINT.register(0, queue, ctx, cb as usize, token)
+}
+
+unsafe extern "system" fn unregister_audio_endpoint(_t: This, token: u64, wait: bool) -> bool {
+    AUDIO_ENDPOINT.unregister(None, token, wait)
 }
 
 unsafe extern "system" fn gamer_picture_async(_t: This, u: usize, size: u32, block: *mut c_void) -> i32 {
@@ -485,11 +580,11 @@ pub fn user_layout() -> Vec<(usize, usize)> {
 pub fn device_layout() -> Vec<(usize, usize)> {
     vec![
         (3, find_for_device as usize),
-        (4, register_event as usize),
-        (5, unregister_event as usize),
+        (4, register_device_association as usize),
+        (5, unregister_device_association as usize),
         (6, default_audio_endpoint as usize),
-        (7, register_event as usize),
-        (8, unregister_event as usize),
+        (7, register_audio_endpoint as usize),
+        (8, unregister_audio_endpoint as usize),
         (9, find_controller_async as usize),
         (10, find_controller_result as usize),
     ]

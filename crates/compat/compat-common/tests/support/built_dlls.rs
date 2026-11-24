@@ -33,8 +33,14 @@ pub fn ensure(pkgs: &[(&str, &str)]) -> PathBuf {
             }
         }
         cmd.env("CARGO_TARGET_DIR", target_dir());
-        if dir.file_name().and_then(|n| n.to_str()) == Some("release") {
-            cmd.arg("--release");
+        match dir.file_name().and_then(|n| n.to_str()) {
+            Some("release") => {
+                cmd.arg("--release");
+            }
+            Some("debug") | None => {}
+            Some(p) => {
+                cmd.arg("--profile").arg(p);
+            }
         }
         for p in &todo {
             cmd.arg("-p").arg(p);

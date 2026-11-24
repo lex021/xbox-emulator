@@ -80,7 +80,22 @@ const IID_FENCE: Guid = Guid { d1: 0x0a75_3dcf, d2: 0xc4d8, d3: 0x4b91, d4: [0xa
 const IID_LIST: Guid = Guid { d1: 0x5b16_0d0f, d2: 0xac1b, d3: 0x4185, d4: [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55] };
 type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
 
+struct SubRec {
+    ty: u32,
+    queue: usize,
+    s0: u32,
+    s1: u32,
+    lists: Vec<(u32, u32)>,
+    n_lists: u32,
+    missing: u32,
+    cpu: [i64; 4],
+}
+
 struct State {
+    closed: HashMap<usize, (u32, u32, bool)>,
+    subs: Vec<SubRec>,
+    sub_open: HashMap<usize, SubRec>,
+    calib: HashMap<usize, (u32, Vec<crate::gpuprof_tl::Calib>)>,
     heap: usize,
     cheap: usize,
     rb: usize,
@@ -149,6 +164,10 @@ fn windows_on() -> bool {
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let s = g.get_or_insert_with(|| State {
+        closed: HashMap::new(),
+        subs: Vec::new(),
+        sub_open: HashMap::new(),
+        calib: HashMap::new(),
         heap: 0,
         cheap: 0,
         rb: 0,
@@ -305,8 +324,8 @@ unsafe fn ensure_on_device(s: &mut State, dev: *mut c_void) -> bool {
     true
 }
 
-unsafe fn stamp(list: *mut c_void, kind: u8) {
-    unsafe { stamp_ev(list, None, kind, true) };
+unsafe fn stamp(list: *mut c_void, kind: u8) -> Option<u32> {
+    unsafe { stamp_ev(list, None, kind, true) }
 }
 
 fn heap_for(s: &State, ty: u32) -> usize {
@@ -314,25 +333,49 @@ fn heap_for(s: &State, ty: u32) -> usize {
     if h == usize::MAX { 0 } else { h }
 }
 
-unsafe fn stamp_ev(list: *mut c_void, tag: Option<u8>, kind: u8, count: bool) {
+static ARGS: Mutex<Option<HashMap<u32, [u32; 5]>>> = Mutex::new(None);
+
+fn note_args(list: *mut c_void, slot: Option<u32>, args: [u32; 5]) {
+    let (Some(slot), Some(t)) = (slot, crate::passcap::ps_ms_target()) else { return };
+    let hit = with(|s| s.lists.get(&(list as usize)).and_then(|r| r.label).is_some_and(|l| !l.compute && l.b == t));
+    if hit {
+        let mut g = ARGS.lock().unwrap_or_else(|e| e.into_inner());
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.len() < 65536 {
+            m.insert(slot, args);
+        }
+    }
+}
+
+fn args_text(kind: u8, a: Option<[u32; 5]>) -> String {
+    match (kind, a) {
+        (_, None) => String::new(),
+        (0, Some(a)) => format!(" | draw vertices={} instances={} first_vertex={} first_instance={}", a[0], a[1], a[2], a[3]),
+        (1, Some(a)) => format!(" | drawidx indices={} instances={} first_index={} base_vertex={} first_instance={}", a[0], a[1], a[2], a[3] as i32, a[4]),
+        (3, Some(a)) => format!(" | indirect max_commands={} arg_offset={:#x} count_buffer={}", a[0], a[1], if a[2] != 0 { "yes" } else { "no" }),
+        (_, Some(a)) => format!(" | args {a:?}"),
+    }
+}
+
+unsafe fn stamp_ev(list: *mut c_void, tag: Option<u8>, kind: u8, count: bool) -> Option<u32> {
     if !ARMED.load(Ordering::Relaxed) {
-        return;
+        return None;
     }
     let ty = unsafe { crate::fill::list_type(list) };
     if !stampable(ty) {
-        return;
+        return None;
     }
     with(|s| {
         if !unsafe { ensure_resources(s, list) } {
-            return;
+            return None;
         }
         let heap = heap_for(s, ty);
         if heap == 0 {
-            return;
+            return None;
         }
         let slot = SLOT.fetch_add(1, Ordering::Relaxed);
         if slot >= SLOTS {
-            return;
+            return None;
         }
         let end: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) = unsafe { core::mem::transmute(real(53)) };
         unsafe { end(list, heap as *mut c_void, QUERY_TIMESTAMP, slot) };
@@ -347,7 +390,8 @@ unsafe fn stamp_ev(list: *mut c_void, tag: Option<u8>, kind: u8, count: bool) {
             None => (r.label.unwrap_or(Label { a: 0, b: 0, compute: r.last_kind == 2 }), r.last_kind),
         };
         r.evs.push(Ev { slot, label, kind, count, frame: FRAME_IX.load(Ordering::Relaxed) });
-    });
+        Some(slot)
+    })
 }
 
 unsafe fn vt_at(obj: usize, i: usize) -> usize {
@@ -491,29 +535,71 @@ unsafe fn submit_stamp(queue: *mut c_void, exec: ExecFn, ty: u32) -> Option<u32>
     Some(slot)
 }
 
-pub unsafe fn ecl_begin(queue: *mut c_void, exec: ExecFn) {
+pub unsafe fn ecl_begin(queue: *mut c_void, exec: ExecFn, lists: &[*mut c_void], enter: i64) {
     if !ARMED.load(Ordering::Relaxed) || queue.is_null() || !enabled() {
         return;
     }
     let ty = unsafe { crate::gpuprof_q::queue_type(queue) };
-    if let Some(s0) = unsafe { submit_stamp(queue, exec, ty) } {
+    let need = with(|s| !s.calib.contains_key(&(queue as usize)));
+    if need {
+        let c = unsafe { crate::gpuprof_tl::calibrate(queue) };
         with(|s| {
-            s.open.insert(queue as usize, (ty, s0));
+            s.calib.entry(queue as usize).or_insert((ty, Vec::new())).1.extend(c);
         });
     }
+    let mut rec = with(|s| {
+        let mut r = SubRec { ty, queue: queue as usize, s0: 0, s1: 0, lists: Vec::new(), n_lists: lists.len() as u32, missing: 0, cpu: [enter, 0, 0, 0] };
+        for l in lists {
+            match s.closed.get(&(*l as usize)) {
+                Some(&(a, b, true)) => r.lists.push((a, b)),
+                _ => r.missing += 1,
+            }
+        }
+        r
+    });
+    rec.cpu[1] = crate::frame::qpc();
+    if let Some(s0) = unsafe { submit_stamp(queue, exec, ty) } {
+        rec.s0 = s0;
+        with(|s| {
+            s.open.insert(queue as usize, (ty, s0));
+            s.sub_open.insert(queue as usize, rec);
+        });
+    }
+}
+
+pub fn ecl_exit(queue: *mut c_void) {
+    if !enabled() {
+        return;
+    }
+    let t = crate::frame::qpc();
+    with(|s| {
+        if let Some(r) = s.subs.iter_mut().rev().find(|r| r.queue == queue as usize) {
+            if r.cpu[3] == 0 {
+                r.cpu[3] = t;
+            }
+        }
+    });
 }
 
 pub unsafe fn ecl_end(queue: *mut c_void, exec: ExecFn) {
     if !enabled() {
         return;
     }
-    let open = with(|s| s.open.remove(&(queue as usize)));
-    let Some((ty, s0)) = open else { return };
+    let post = crate::frame::qpc();
+    let open = with(|s| (s.open.remove(&(queue as usize)), s.sub_open.remove(&(queue as usize))));
+    let (Some((ty, s0)), rec) = open else { return };
     if !ARMED.load(Ordering::Relaxed) {
         return;
     }
     if let Some(s1) = unsafe { submit_stamp(queue, exec, ty) } {
-        with(|s| s.spans.push(Span { ty, s0, s1 }));
+        with(|s| {
+            s.spans.push(Span { ty, s0, s1 });
+            if let Some(mut r) = rec {
+                r.s1 = s1;
+                r.cpu[2] = post;
+                s.subs.push(r);
+            }
+        });
     }
 }
 
@@ -584,7 +670,31 @@ unsafe extern "system" fn op_clear_dsv(this: *mut c_void, h: usize, flags: u32, 
     unsafe { f(this, h, flags, depth, stencil, n, rects) }
 }
 
+static COMMON: Mutex<[u64; 4]> = Mutex::new([0; 4]);
+
+pub fn common_count(b: &[u8], title: bool, c: &mut [u64; 4]) {
+    for e in b.chunks_exact(32) {
+        let w = |o: usize| u32::from_le_bytes([e[o], e[o + 1], e[o + 2], e[o + 3]]);
+        if w(0) != 0 {
+            continue;
+        }
+        let k = if title { 0 } else { 2 };
+        c[k] += (w(20) == 0) as u64;
+        c[k + 1] += (w(24) == 0) as u64;
+    }
+}
+
+fn common_text(c: &[u64; 4], nf: u64) -> String {
+    let f = |v: u64| v as f64 / nf.max(1) as f64;
+    format!("COMMON-state transitions per frame (implicit promotion and decay are not visible to the API): title from COMMON {:.1}, to COMMON {:.1} | emulator from COMMON {:.1}, to COMMON {:.1}", f(c[0]), f(c[1]), f(c[2]), f(c[3]))
+}
+
 unsafe extern "system" fn real_barrier(this: *mut c_void, n: u32, b: *const u8) {
+    if ARMED.load(Ordering::Relaxed) && !b.is_null() && n > 0 && n < 65536 {
+        let title = IN_TITLE_BARRIER.with(|c| c.get());
+        let sl = unsafe { core::slice::from_raw_parts(b, n as usize * 32) };
+        common_count(sl, title, &mut COMMON.lock().unwrap_or_else(|e| e.into_inner()));
+    }
     if ARMED.load(Ordering::Relaxed) && !IN_TITLE_BARRIER.with(|c| c.get()) {
         EMU_BARRIER_CALLS.fetch_add(1, Ordering::Relaxed);
         EMU_BARRIER_COUNT.fetch_add(n, Ordering::Relaxed);
@@ -697,6 +807,7 @@ unsafe fn close_list(list: *mut c_void) {
             unsafe { core::mem::transmute(real(54)) };
         unsafe { end(list, heap as *mut c_void, QUERY_TIMESTAMP, slot) };
         evs.push(Ev { slot, label: Label { a: 0, b: 0, compute: false }, kind: KIND_CLOSE, count: false, frame: FRAME_IX.load(Ordering::Relaxed) });
+        s.closed.insert(list as usize, (evs[0].slot, slot, evs.len() >= 2));
         let mut slots: Vec<u32> = evs.iter().map(|e| e.slot).collect();
         slots.sort_unstable();
         let mut i = 0;
@@ -734,7 +845,11 @@ unsafe fn report(s: &mut State) {
     let ts = |slot: u32| unsafe { core::ptr::read_unaligned((p as *const u64).add(slot as usize)) };
     let freq = crate::timestamp::freq();
     let tick_ms = if freq != 0 { 1000.0 / freq as f64 } else { 0.0 };
-    let max_ticks = if freq != 0 { freq / 10 } else { u64::MAX };
+    let max_ticks = if freq != 0 { freq.saturating_mul(2) } else { u64::MAX };
+    let args = ARGS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let mut longest: Vec<(u64, u8, Label, u32, u32)> = Vec::new();
+    let mut rejected: HashMap<String, u64> = HashMap::new();
+    let mut fast_samples = 0u32;
     let mut agg: HashMap<(u64, u64, bool, u8), (u64, u64)> = HashMap::new();
     let mut per_frame: HashMap<u32, u64> = HashMap::new();
     let mut by_frame: HashMap<(u32, u64, u64, bool, u8), u64> = HashMap::new();
@@ -747,13 +862,25 @@ unsafe fn report(s: &mut State) {
             let (t0, t1) = (ts(w[0].slot), ts(w[1].slot));
             if t0 != 0 && t1 >= t0 && w[0].kind <= 1 && !w[0].label.compute && crate::passcap::ps_ms_target() == Some(w[0].label.b) {
                 let ms = (t1 - t0) as f64 * tick_ms;
+                let at = args_text(w[0].kind, args.get(&w[0].slot).copied());
                 if crate::passcap::note_slow_call(w[0].label.b, ms, w[0].frame) {
-                    record("d3d12_xs", "gpuprof", &format!("ps_ms call: PS {:016x} {ms:.2} ms at present #{} (firstuse frame numbering)", w[0].label.b, s.win_start + w[0].frame as u64 + 1));
+                    record("d3d12_xs", "gpuprof", &format!("ps_ms call: PS {:016x} {ms:.2} ms at present #{} (firstuse frame numbering){at}", w[0].label.b, s.win_start + w[0].frame as u64 + 1));
+                } else if ms < 5.0 && fast_samples < 4 {
+                    fast_samples += 1;
+                    record("d3d12_xs", "gpuprof", &format!("ps_ms fast call sample: PS {:016x} {ms:.2} ms at present #{}{at}", w[0].label.b, s.win_start + w[0].frame as u64 + 1));
                 }
             }
             if t0 == 0 || t1 < t0 || t1 - t0 > max_ticks {
                 bad += 1;
+                let who = if w[0].kind == KIND_PASS { tag_name(w[0].label.a).to_string() } else if w[0].kind >= KIND_OP0 { op_name(w[0].kind).to_string() } else { name(&w[0].label) };
+                let why = if t0 == 0 || t1 == 0 { "unresolved" } else if t1 < t0 { "negative" } else { "over 2 s" };
+                *rejected.entry(format!("{why} {who}")).or_default() += 1;
                 continue;
+            }
+            if (t1 - t0) as f64 * tick_ms > 20.0 {
+                longest.push((t1 - t0, w[0].kind, w[0].label, w[0].frame, w[0].slot));
+                longest.sort_by(|a, b| b.0.cmp(&a.0));
+                longest.truncate(8);
             }
             lo = lo.min(t0);
             hi = hi.max(t1);
@@ -784,6 +911,26 @@ unsafe fn report(s: &mut State) {
         q.0 += t1 - t0;
         q.1 += 1;
     }
+    let qfreq = crate::gpuprof_q::freqs();
+    let mut tl: Vec<crate::gpuprof_tl::SubT> = Vec::new();
+    for r in &s.subs {
+        let (h, t) = (ts(r.s0), ts(r.s1));
+        if h == 0 || t < h {
+            continue;
+        }
+        let mut st = crate::gpuprof_tl::SubT { ty: r.ty, queue: r.queue, head: h, tail: t, lists: Vec::new(), n_lists: r.n_lists, missing: r.missing, cpu: r.cpu, head_qpc: None };
+        for &(a, b) in &r.lists {
+            let (ta, tb) = (ts(a), ts(b));
+            if ta == 0 || tb < ta {
+                st.missing += 1;
+            } else {
+                st.lists.push((ta, tb));
+            }
+        }
+        let gf = qfreq.iter().find(|e| e.0 == r.ty).map_or(freq, |e| e.1);
+        st.head_qpc = s.calib.get(&r.queue).and_then(|c| crate::gpuprof_tl::gpu_to_qpc(&c.1, gf, crate::frame::qpf(), h));
+        tl.push(st);
+    }
     unsafe { unmap(s.rb as *mut c_void, 0, core::ptr::null()) };
     let covered = union_ticks(&mut iv);
     let mut rows: Vec<_> = agg.into_iter().collect();
@@ -796,10 +943,15 @@ unsafe fn report(s: &mut State) {
         "[gpuprof] window {}: {nf} frames, {n} timed events ({bad} rejected), freq={freq} Hz | summed GPU {:.3} ms/frame, wall span {:.3} ms/frame\n",
         s.reports, per(total), span);
     out.push_str(&format!("[gpuprof]   passes: {}\n", pass_summary(&rows, &per, nf)));
+    out.push_str(&format!("[gpuprof]   {}\n", longest_text(&longest, &rejected, tick_ms, &args)));
     let (i0, i1) = *INJ.lock().unwrap_or_else(|e| e.into_inner());
     out.push_str(&format!("[gpuprof]   {}\n", inject_text(&i0, &i1, nf)));
     out.push_str(&format!("[gpuprof]   {}\n", ops_summary(&rows, &per, nf, EMU_BARRIER_CALLS.load(Ordering::Relaxed), EMU_BARRIER_COUNT.load(Ordering::Relaxed))));
     out.push_str(&format!("[gpuprof]   {}\n", queue_summary(&ecl_q, &list_q, ecl_bad, &per, nf, if hi > lo { hi - lo } else { 0 }, covered)));
+    for l in crate::gpuprof_tl::analyse(&mut tl, tick_ms, crate::frame::qpf(), nf).lines() {
+        out.push_str(&format!("[gpuprof]   {l}\n"));
+    }
+    out.push_str(&format!("[gpuprof]   {}\n", common_text(&COMMON.lock().unwrap_or_else(|e| e.into_inner()), nf)));
     out.push_str(&format!("[gpuprof]   {}\n", crate::gpuprof_q::freq_note(&crate::gpuprof_q::freqs(), freq)));
     out.push_str(&format!("[gpuprof]   {}\n", crate::gpuprof_q::report_line()));
     if let Some((wf, wt, med)) = worst_frame(&per_frame) {
@@ -821,6 +973,17 @@ unsafe fn report(s: &mut State) {
             per(*t), *t as f64 * 100.0 / total.max(1) as f64, *c as f64 / nf as f64));
     }
     record("d3d12_xs", "gpuprof", &out);
+}
+
+fn longest_text(longest: &[(u64, u8, Label, u32, u32)], rejected: &HashMap<String, u64>, tick_ms: f64, args: &HashMap<u32, [u32; 5]>) -> String {
+    let l: Vec<String> = longest.iter().map(|(t, kind, label, frame, slot)| {
+        let who = if *kind == KIND_PASS { tag_name(label.a).to_string() } else if *kind >= KIND_OP0 { op_name(*kind).to_string() } else { name(label) };
+        format!("{:.2} ms frame {frame} {who}{}", *t as f64 * tick_ms, args_text(*kind, args.get(slot).copied()))
+    }).collect();
+    let mut r: Vec<(&String, &u64)> = rejected.iter().collect();
+    r.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    let r: Vec<String> = r.iter().take(8).map(|(k, n)| format!("{k} x{n}")).collect();
+    format!("longest single events (>20 ms): {} | rejected intervals: {}", if l.is_empty() { "none".to_string() } else { l.join("; ") }, if r.is_empty() { "none".to_string() } else { r.join(", ") })
 }
 
 fn union_ticks(iv: &mut Vec<(u64, u64)>) -> u64 {
@@ -913,6 +1076,14 @@ pub fn on_present() {
             if s.presents >= start + frames() {
                 ARMED.store(false, Ordering::Relaxed);
                 crate::gpuprof_q::disarm();
+                let qs: Vec<usize> = s.calib.keys().copied().collect();
+                for q in qs {
+                    if let Some(c) = unsafe { crate::gpuprof_tl::calibrate(q as *mut c_void) } {
+                        if let Some(e) = s.calib.get_mut(&q) {
+                            e.1.push(c);
+                        }
+                    }
+                }
                 INJ.lock().unwrap_or_else(|e| e.into_inner()).1 = crate::inject::totals();
                 s.window = None;
                 s.finalize_at = Some(s.presents + SETTLE);
@@ -934,6 +1105,11 @@ pub fn on_present() {
             s.done_ty.clear();
             s.spans.clear();
             s.open.clear();
+            s.closed.clear();
+            s.subs.clear();
+            s.sub_open.clear();
+            s.calib.clear();
+            *COMMON.lock().unwrap_or_else(|e| e.into_inner()) = [0; 4];
             unsafe { sweep_retired(s) };
             SLOT.store(0, Ordering::Relaxed);
             FRAME_IX.store(0, Ordering::Relaxed);
@@ -979,13 +1155,15 @@ unsafe extern "system" fn h_set_pso(this: *mut c_void, pso: *mut c_void) {
 }
 
 unsafe extern "system" fn h_draw(this: *mut c_void, a: u32, b: u32, c: u32, d: u32) {
-    unsafe { stamp(this, 0) };
+    let slot = unsafe { stamp(this, 0) };
+    note_args(this, slot, [a, b, c, d, 0]);
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32) = unsafe { core::mem::transmute(next(12)) };
     unsafe { f(this, a, b, c, d) }
 }
 
 unsafe extern "system" fn h_draw_indexed(this: *mut c_void, a: u32, b: u32, c: u32, d: i32, e: u32) {
-    unsafe { stamp(this, 1) };
+    let slot = unsafe { stamp(this, 1) };
+    note_args(this, slot, [a, b, c, d as u32, e]);
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32) = unsafe { core::mem::transmute(next(13)) };
     unsafe { f(this, a, b, c, d, e) }
 }
@@ -997,7 +1175,8 @@ unsafe extern "system" fn h_dispatch(this: *mut c_void, a: u32, b: u32, c: u32) 
 }
 
 unsafe extern "system" fn h_indirect(this: *mut c_void, sig: *mut c_void, n: u32, buf: *mut c_void, off: u64, cbuf: *mut c_void, coff: u64) {
-    unsafe { stamp(this, 3) };
+    let slot = unsafe { stamp(this, 3) };
+    note_args(this, slot, [n, off as u32, (!cbuf.is_null()) as u32, 0, 0]);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u64, *mut c_void, u64) = unsafe { core::mem::transmute(next(59)) };
     unsafe { f(this, sig, n, buf, off, cbuf, coff) }
 }
@@ -1105,6 +1284,32 @@ mod tests {
 
     unsafe extern "system" fn rec_dsv(_t: *mut c_void, h: usize, flags: u32, depth: f32, stencil: u8, n: u32, rects: *const c_void) {
         SEEN.lock().unwrap().extend([h as u64, flags as u64, depth.to_bits() as u64, stencil as u64, n as u64, rects as u64]);
+    }
+
+    #[test]
+    fn common_count_splits_title_and_emulator_transitions() {
+        let mut b = vec![0u8; 96];
+        b[24..28].copy_from_slice(&4u32.to_le_bytes());
+        b[32 + 20..32 + 24].copy_from_slice(&0x80u32.to_le_bytes());
+        b[64..68].copy_from_slice(&1u32.to_le_bytes());
+        let mut c = [0u64; 4];
+        common_count(&b, true, &mut c);
+        common_count(&b[..32], false, &mut c);
+        assert_eq!(c, [1, 1, 1, 0]);
+        assert!(common_text(&c, 2).contains("title from COMMON 0.5, to COMMON 0.5 | emulator from COMMON 0.5, to COMMON 0.0"));
+    }
+
+    #[test]
+    fn longest_events_and_rejections_are_named() {
+        let l = Label { a: 1, b: 0xb014f6a0dce8314d, compute: false };
+        let mut args = HashMap::new();
+        args.insert(7u32, [36u32, 1, 0, 0, 0]);
+        let mut rej = HashMap::new();
+        rej.insert("over 2 s vs=0000000000000001 ps=b014f6a0dce8314d".to_string(), 2u64);
+        let s = longest_text(&[(250_000_000, 1, l, 3, 7)], &rej, 1e-6, &args);
+        assert_eq!(s, "longest single events (>20 ms): 250.00 ms frame 3 vs=0000000000000001 ps=b014f6a0dce8314d | drawidx indices=36 instances=1 first_index=0 base_vertex=0 first_instance=0 | rejected intervals: over 2 s vs=0000000000000001 ps=b014f6a0dce8314d x2");
+        assert_eq!(longest_text(&[], &HashMap::new(), 1.0, &HashMap::new()), "longest single events (>20 ms): none | rejected intervals: none");
+        assert_eq!(args_text(3, Some([4, 0x40, 1, 0, 0])), " | indirect max_commands=4 arg_offset=0x40 count_buffer=yes");
     }
 
     #[test]

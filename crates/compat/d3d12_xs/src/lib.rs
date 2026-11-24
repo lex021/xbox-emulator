@@ -42,6 +42,7 @@ mod blendclamp;
 mod blend_probe;
 mod gpuprof;
 mod gpuprof_q;
+mod gpuprof_tl;
 mod va_census;
 mod firstuse;
 mod inject;

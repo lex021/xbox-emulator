@@ -405,3 +405,21 @@ fn passcap_ps_draw_trigger_logic() {
     assert!(!ps_draw_due(true, 99.0, tg, SLOW_MAX_SHOTS, 60.0));
     assert!(!ps_draw_due(true, 99.0, None, 0, 0.0));
 }
+
+#[test]
+fn grid3d_text_reports_light_counts() {
+    let (w, h, d, pitch) = (2usize, 1usize, 2usize, 256usize);
+    let mut data = vec![0u8; pitch * h * d];
+    let put = |data: &mut Vec<u8>, z: usize, x: usize, off: u32, y: u32| {
+        let o = z * h * pitch + x * 8;
+        data[o..o + 4].copy_from_slice(&off.to_le_bytes());
+        data[o + 4..o + 8].copy_from_slice(&y.to_le_bytes());
+    };
+    put(&mut data, 0, 0, 5, 3 | (1 << 16));
+    put(&mut data, 1, 1, 9, 300);
+    let s = grid3d_text(&data, pitch, w, h, d, 17);
+    assert!(s.starts_with("light grid 2x1x2 (4 texels): count lo16 max 300 "), "{s}");
+    assert!(s.contains("over256 1 | count hi16 max 1 "), "{s}");
+    assert!(s.ends_with("offset max 9"), "{s}");
+    assert!(grid3d_text(&data, pitch, w, h, d, 28).contains("only R32G32_UINT"));
+}

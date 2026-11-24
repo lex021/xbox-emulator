@@ -274,8 +274,8 @@ unsafe extern "system" fn register_port(_t: This, queue: usize, ctx: *mut c_void
     PORT_CHANGED.register(0, queue, ctx, cb, token)
 }
 
-unsafe extern "system" fn unregister_port(_t: This, token: u64, _wait: bool) -> bool {
-    PORT_CHANGED.unregister(None, token)
+unsafe extern "system" fn unregister_port(_t: This, token: u64, wait: bool) -> bool {
+    PORT_CHANGED.unregister(None, token, wait)
 }
 
 pub fn notify_connectivity_changed() {
@@ -319,8 +319,8 @@ unsafe extern "system" fn register_hint(_t: This, queue: usize, ctx: *mut c_void
     hr
 }
 
-unsafe extern "system" fn unregister_hint(_t: This, token: u64, _wait: bool) -> bool {
-    HINT_CHANGED.unregister(None, token)
+unsafe extern "system" fn unregister_hint(_t: This, token: u64, wait: bool) -> bool {
+    HINT_CHANGED.unregister(None, token, wait)
 }
 
 pub const IID_V2: Guid = Guid::parse("bf2346b2-39af-4658-b5ea-44713c7e83b3");

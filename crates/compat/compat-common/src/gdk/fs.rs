@@ -187,13 +187,28 @@ const TABLE: &[Row] = &[
     ("MoveFileWithProgressW", K::W, &[0, 1], 5),
     ("ReplaceFileW", K::W, &[0, 1, 2], 6),
     ("CopyFile2", K::W, &[0, 1], 3),
+    ("CreateFileA", K::A, &[0], 7),
+    ("DeleteFileA", K::A, &[0], 1),
+    ("CreateDirectoryA", K::A, &[0], 2),
+    ("FindFirstFileExA", K::A, &[0], 6),
+    ("SetFileAttributesA", K::A, &[0], 2),
+    ("_mkdir", K::A, &[0], 1),
+    ("_open", K::A, &[0], 3),
+    ("_access", K::A, &[0], 2),
+    ("_stat64", K::A, &[0], 2),
+    ("rename", K::A, &[0, 1], 2),
+    ("_wopen", K::W, &[0], 3),
+    ("_wstat64", K::W, &[0], 2),
+    ("_wfopen_s", K::W, &[1], 3),
+    ("_wremove", K::W, &[0], 1),
+    ("_wrename", K::W, &[0, 1], 2),
 ];
 
-static ORIG: [AtomicUsize; 29] = [const { AtomicUsize::new(0) }; 29];
+static ORIG: [AtomicUsize; 44] = [const { AtomicUsize::new(0) }; 44];
 
 macro_rules! hooks {
     ($($i:tt $n:tt),*) => {
-        fn hook_table() -> [usize; 29] {
+        fn hook_table() -> [usize; 44] {
             [$(hook_fn!($i $n)),*]
         }
     };
@@ -209,7 +224,7 @@ macro_rules! hook_fn {
     ($i:tt 7) => {{ unsafe extern "system" fn h(a: usize, b: usize, c: usize, d: usize, e: usize, f: usize, g: usize) -> usize { run($i, vec![a, b, c, d, e, f, g]) } h as usize }};
 }
 
-hooks!(0 7, 1 6, 2 2, 3 1, 4 3, 5 2, 6 2, 7 1, 8 1, 9 4, 10 1, 11 3, 12 2, 13 3, 14 2, 15 3, 16 1, 17 3, 18 1, 19 3, 20 2, 21 3, 22 1, 23 1, 24 5, 25 6, 26 5, 27 6, 28 3);
+hooks!(0 7, 1 6, 2 2, 3 1, 4 3, 5 2, 6 2, 7 1, 8 1, 9 4, 10 1, 11 3, 12 2, 13 3, 14 2, 15 3, 16 1, 17 3, 18 1, 19 3, 20 2, 21 3, 22 1, 23 1, 24 5, 25 6, 26 5, 27 6, 28 3, 29 7, 30 1, 31 2, 32 6, 33 2, 34 1, 35 3, 36 2, 37 2, 38 2, 39 3, 40 2, 41 3, 42 1, 43 2);
 
 pub fn targets() -> Vec<(&'static str, usize, &'static AtomicUsize)> {
     if game_drive().is_none() && !trace_on() && !super::xcrd_paths::enabled() {

@@ -741,8 +741,8 @@ unsafe extern "system" fn register_changed(_t: This, owner: usize, queue: usize,
     LICENSE_CHANGED.register(owner, queue, ctx, cb, token)
 }
 
-unsafe extern "system" fn unregister_changed(_t: This, owner: usize, token: u64, _wait: bool) -> bool {
-    LICENSE_CHANGED.unregister(Some(owner), token)
+unsafe extern "system" fn unregister_changed(_t: This, owner: usize, token: u64, wait: bool) -> bool {
+    LICENSE_CHANGED.unregister(Some(owner), token, wait)
 }
 
 unsafe extern "system" fn register_lost(_t: This, license: usize, queue: usize, ctx: *mut c_void, cb: usize, token: *mut u64) -> i32 {
@@ -752,8 +752,8 @@ unsafe extern "system" fn register_lost(_t: This, license: usize, queue: usize, 
     LICENSE_LOST.register(license, queue, ctx, cb, token)
 }
 
-unsafe extern "system" fn unregister_lost(_t: This, license: usize, token: u64, _wait: bool) -> bool {
-    LICENSE_LOST.unregister(Some(license), token)
+unsafe extern "system" fn unregister_lost(_t: This, license: usize, token: u64, wait: bool) -> bool {
+    LICENSE_LOST.unregister(Some(license), token, wait)
 }
 
 unsafe extern "system" fn is_availability_purchasable(_t: This, a: *const u8) -> bool {

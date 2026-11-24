@@ -964,6 +964,7 @@ qlow!((l8,8),(l9,9),(l10,10),(l11,11),(l12,12),(l13,13),(l14,14),(l15,15),(l16,1
 /// (see cmdlist_wrap); translate them to the real lists before submitting.
 unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const *mut c_void) {
     let _ours = crate::gpuprof_q::ours_scope();
+    let enter = if crate::gpuprof::enabled() { crate::frame::qpc() } else { 0 };
     let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) =
         core::mem::transmute(REAL_QVT[10].load(Ordering::Relaxed));
     if lists.is_null() || n == 0 {
@@ -1007,7 +1008,7 @@ unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const
     crate::hang_cap::note_exec(queue, &title, &real);
     crate::placed_offset::before_submit(queue, &real, f as usize, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)));
     trace("before title submit");
-    crate::gpuprof::ecl_begin(queue, f);
+    crate::gpuprof::ecl_begin(queue, f, &real, enter);
     let signal = crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed));
     let wait = crate::hang_cap::wait_fn(REAL_QVT[15].load(Ordering::Relaxed));
     if !serial || !unsafe { diagnostic_serial_submit(queue, &real, f, signal, wait) } {
@@ -1028,6 +1029,7 @@ unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const
     crate::cl2_state::note_executed(queue, &real);
     crate::cl2_state::after_execute(queue, &split);
     crate::ts99::after_execute(queue, &real);
+    crate::gpuprof::ecl_exit(queue);
 }
 
 unsafe fn diagnostic_serial_submit(

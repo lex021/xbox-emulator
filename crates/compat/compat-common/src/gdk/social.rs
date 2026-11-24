@@ -214,6 +214,6 @@ pub unsafe extern "system" fn register_invite(_t: super::This, queue: usize, ctx
     hr
 }
 
-pub unsafe extern "system" fn unregister_invite(_t: super::This, token: u64, _wait: bool) -> bool {
-    INVITES.unregister(None, token)
+pub unsafe extern "system" fn unregister_invite(_t: super::This, token: u64, wait: bool) -> bool {
+    INVITES.unregister(None, token, wait)
 }

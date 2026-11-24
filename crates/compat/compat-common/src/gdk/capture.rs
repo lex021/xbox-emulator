@@ -53,8 +53,8 @@ unsafe extern "system" fn register_broadcast(_t: This, queue: usize, ctx: *mut c
     BROADCAST_CHANGED.register(0, queue, ctx, cb, token)
 }
 
-unsafe extern "system" fn unregister_broadcast(_t: This, token: u64, _wait: bool) -> bool {
-    BROADCAST_CHANGED.unregister(None, token)
+unsafe extern "system" fn unregister_broadcast(_t: This, token: u64, wait: bool) -> bool {
+    BROADCAST_CHANGED.unregister(None, token, wait)
 }
 
 fn metadata_quota() -> u64 {
@@ -162,8 +162,8 @@ unsafe extern "system" fn register_purged(_t: This, queue: usize, ctx: *mut c_vo
     METADATA_PURGED.register(0, queue, ctx, cb, token)
 }
 
-unsafe extern "system" fn unregister_purged(_t: This, token: u64, _wait: bool) -> bool {
-    METADATA_PURGED.unregister(None, token)
+unsafe extern "system" fn unregister_purged(_t: This, token: u64, wait: bool) -> bool {
+    METADATA_PURGED.unregister(None, token, wait)
 }
 
 fn grab() -> Option<super::win::Image> {
