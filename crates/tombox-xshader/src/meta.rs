@@ -256,6 +256,7 @@ pub struct StaticSampler {
 pub const SCARLETT_PACKED_TABLE_SLOTS: u32 = 7;
 pub const SCARLETT_PACKED_SRV_REGISTER: u32 = 32;
 pub const SCARLETT_PACKED_CBV_REGISTER: u32 = 16;
+pub const SCARLETT_MEDIA_UAV_SLOT: u32 = 4;
 
 pub fn scarlett_packed_graphics_table(root: &RootSig) -> bool {
     let [table, constants] = root.params.as_slice() else { return false };
@@ -321,8 +322,13 @@ pub(crate) fn scarlett_fssm_table_kind(
         {
             continue;
         }
-        let next = source & 0xff;
-        if !matches!(next, 0 | 2) || kind.is_some_and(|previous| previous != next) {
+        let next = match source & 0xff {
+            0 => 0,
+            2 => 2,
+            3 => 1,
+            _ => return None,
+        };
+        if kind.is_some_and(|previous| previous != next) {
             return None;
         }
         kind = Some(next);

@@ -3,13 +3,18 @@ use crate::meta::RootParamKind;
 
 impl Emitter<'_> {
     pub(super) fn scarlett_packed_table_kind(&self, table: u8, off: u32) -> Option<u32> {
-        let slots = crate::meta::scarlett_graphics_table_slots(self.ex.root_sig.as_ref()?)?;
+        let root = self.ex.root_sig.as_ref()?;
+        let slots = crate::meta::scarlett_graphics_table_slots(root)?;
         if table != 8 || !matches!(self.ex.stage, crate::Stage::Vertex | crate::Stage::Pixel)
             || off / 32 >= slots
         {
             return None;
         }
-        crate::meta::scarlett_fssm_table_kind(&self.ex.fssm, table, off)
+        let kind = crate::meta::scarlett_fssm_table_kind(&self.ex.fssm, table, off)?;
+        if kind == 1 && !(off / 32 == crate::meta::SCARLETT_MEDIA_UAV_SLOT && crate::meta::scarlett_media_table(root)) {
+            return None;
+        }
+        Some(kind)
     }
 
     pub(super) fn scarlett_media_sampler(&self, at: usize, descriptor: [Option<u32>; 4]) -> Option<u32> {

@@ -1570,10 +1570,10 @@ impl<'a> Emitter<'a> {
         let fallback = off / stride;
         if stride == 32 {
             if let Some(kind) = self.scarlett_packed_table_kind(table, off) {
-                let base = if kind == 0 {
-                    crate::meta::SCARLETT_PACKED_SRV_REGISTER
-                } else {
-                    crate::meta::SCARLETT_PACKED_CBV_REGISTER
+                let base = match kind {
+                    0 => crate::meta::SCARLETT_PACKED_SRV_REGISTER,
+                    1 => 0,
+                    _ => crate::meta::SCARLETT_PACKED_CBV_REGISTER,
                 };
                 return (1 << 16) | (base + fallback);
             }

@@ -176,7 +176,7 @@ pub fn patch_rts0_with(b: &mut [u8], roots: bool) -> Result<RsPatch, String> {
 fn expand_scarlett_graphics_table(blob: &[u8]) -> Option<Vec<u8>> {
     use tombox_xshader::meta::{
         scarlett_graphics_table_slots, scarlett_media_table, SCARLETT_MEDIA_SAMPLERS,
-        SCARLETT_PACKED_CBV_REGISTER, SCARLETT_PACKED_SRV_REGISTER,
+        SCARLETT_MEDIA_UAV_SLOT, SCARLETT_PACKED_CBV_REGISTER, SCARLETT_PACKED_SRV_REGISTER,
     };
     let (offset, length) = crate::console_slots_mesh::rts0_range(blob)?;
     let rts = blob.get(offset..offset.checked_add(length)?)?;
@@ -188,7 +188,7 @@ fn expand_scarlett_graphics_table(blob: &[u8]) -> Option<Vec<u8>> {
     let ranges = rd(rts, table + 4).ok()? as usize;
     let mut expanded = rts.to_vec();
     let num_ranges = rd(rts, table).ok()?;
-    wr(&mut expanded, table, num_ranges + 2);
+    wr(&mut expanded, table, num_ranges + 2 + u32::from(media));
     wr(&mut expanded, table + 4, length as u32);
     expanded.extend_from_slice(rts.get(ranges..ranges + num_ranges as usize * 24)?);
     // Different pipeline stages use the same slots with their declared type.
@@ -199,6 +199,9 @@ fn expand_scarlett_graphics_table(blob: &[u8]) -> Option<Vec<u8>> {
         }
     }
     if media {
+        for word in [1, 1, SCARLETT_MEDIA_UAV_SLOT, 1, 1, SCARLETT_MEDIA_UAV_SLOT] {
+            expanded.extend_from_slice(&word.to_le_bytes());
+        }
         let sampler_offset = expanded.len() as u32;
         wr(&mut expanded, 12, SCARLETT_MEDIA_SAMPLERS.len() as u32);
         wr(&mut expanded, 16, sampler_offset);
